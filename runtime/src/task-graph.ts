@@ -6,10 +6,12 @@ import type { TaskGraphActor } from "./generated/TaskGraphActor.js";
 import type { TaskGraphConversation } from "./generated/TaskGraphConversation.js";
 import type { TaskGraphJoinPolicy } from "./generated/TaskGraphJoinPolicy.js";
 import type { TaskGraphNode } from "./generated/TaskGraphNode.js";
+import type { TaskGraphSidechat } from "./generated/TaskGraphSidechat.js";
 import type { TaskGraphSnapshot } from "./generated/TaskGraphSnapshot.js";
 import type { TaskGraphState } from "./generated/TaskGraphState.js";
 import { buildActiveWork } from "./active-work.js";
 import { firstMeaningfulLine, piToolPresentation, toolPresentationSummary } from "./message-presentation.js";
+import type { SidechatStore } from "./sidechats.js";
 import { TaskError, type TaskStore } from "./tasks.js";
 import { watchDerived } from "./watch-derived.js";
 
@@ -120,28 +122,40 @@ function extractToolInfo(liveDocs: ReadonlyMap<string, Readonly<LiveState>>, ins
   return { names, summaries };
 }
 
-async function currentActors(tasks: TaskStore, nodes: readonly NativeNode[]): Promise<Map<string, TaskGraphActor>> {
+async function currentActors(
+  tasks: TaskStore,
+  nodes: readonly NativeNode[],
+  sidechats?: SidechatStore,
+): Promise<{ actors: Map<string, TaskGraphActor>; sidechatActors: Map<string, TaskGraphSidechat> }> {
   const actors = new Map<string, TaskGraphActor>();
+  const sidechatActors = new Map<string, TaskGraphSidechat>();
   for (const native of new Set(nodes.flatMap((node) => [node.conversationId, ...node.conversations]))) {
     const id = native.toString();
     if (native === ROOT_CONVERSATION_ID) { actors.set(id, { type: "main" }); continue; }
     const owner = await tasks.findOwner(id);
-    if (owner === undefined) { actors.set(id, { type: "other" }); continue; }
+    if (owner === undefined) {
+      const sidechat = await sidechats?.get(id);
+      actors.set(id, { type: "other" });
+      if (sidechat !== undefined) {
+        sidechatActors.set(id, { slug: sidechat.slug, title: sidechat.title });
+      }
+      continue;
+    }
     const { task, agent } = owner, parent: TaskGraphActor = { type: "task", task_id: task.id, title: task.title };
     if (agent === undefined) { actors.set(id, parent); continue; }
     actors.set(id, { type: "agent", task_id: task.id, agent_id: agent.id, title: agent.title, parent_conversation_id: task.conversation_id });
     actors.set(task.conversation_id, parent);
   }
-  return actors;
+  return { actors, sidechatActors };
 }
 
-export async function readTaskGraph(tasks: TaskStore): Promise<TaskGraphSnapshot> {
+export async function readTaskGraph(tasks: TaskStore, sidechats?: SidechatStore): Promise<TaskGraphSnapshot> {
   const live = await liveFrame(tasks);
   const listed = shallowestFirst(live, TASK_GRAPH_NODE_LIMIT);
-  const [liveDocs, inspected, actors, records] = await Promise.all([
+  const [liveDocs, inspected, { actors, sidechatActors }, records] = await Promise.all([
     readLiveDocs(tasks, listed),
     tasks.session.inspect(BACKGROUND_CONTEXT),
-    currentActors(tasks, listed),
+    currentActors(tasks, listed, sidechats),
     tasks.list(),
   ]);
   const inspections = new Map(inspected.tasks.map((entry) => [Number(entry.record.id), entry]));
@@ -164,9 +178,12 @@ export async function readTaskGraph(tasks: TaskStore): Promise<TaskGraphSnapshot
   const snapshot: TaskGraphSnapshot = {
     nodes,
     conversations: [...actors].sort(([left], [right]) => Number(left) - Number(right))
-      .map(([conversation_id, actor]): TaskGraphConversation => ({ conversation_id, actor })),
+      .map(([conversation_id, actor]): TaskGraphConversation => {
+        const sidechat = sidechatActors.get(conversation_id);
+        return { conversation_id, actor, ...(sidechat === undefined ? {} : { sidechat }) };
+      }),
     omitted: live.length - listed.length,
-    work: buildActiveWork(nodes, records, actors),
+    work: buildActiveWork(nodes, records, actors, sidechatActors),
   };
   if (Buffer.byteLength(JSON.stringify(snapshot)) > TASK_GRAPH_BYTE_LIMIT) {
     throw new TaskError("The task graph is too large to send; read one task with tasks read");
@@ -182,9 +199,10 @@ export async function watchTaskGraph(
   tasks: TaskStore,
   emit: (graph: TaskGraphSnapshot) => void,
   failed: (error: unknown) => void,
+  sidechats?: SidechatStore,
 ): Promise<() => Promise<void>> {
   return watchDerived({
-    read: () => readTaskGraph(tasks),
+    read: () => readTaskGraph(tasks, sidechats),
     identity: shownToWatchers,
     subscribe: async (schedule) => {
       const graphObs = await tasks.session.observeTaskGraph({
@@ -196,7 +214,7 @@ export async function watchTaskGraph(
           const relevant = publication.changes.some((change) => {
             if (change.type === "task") return true;
             if (change.type !== "document") return false;
-            if (change.record.kind.startsWith("agent.task")) return true;
+            if (change.record.kind.startsWith("agent.task") || change.record.kind.startsWith("agent.sidechat")) return true;
             if (change.record.kind === LiveDoc.definition.kind) {
               return change.kind !== "change" || change.ops.length === 0 || change.ops.some((op) => {
                 const path = op[1];

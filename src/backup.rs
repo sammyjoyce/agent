@@ -259,6 +259,7 @@ pub fn held_after_restore(command: &RuntimeCommand) -> Option<&'static str> {
         | RuntimeCommand::Chat { .. }
         | RuntimeCommand::AttachMain
         | RuntimeCommand::ObserveMain { .. }
+        | RuntimeCommand::ObserveSidechat { .. }
         | RuntimeCommand::AttachConversation { .. }
         | RuntimeCommand::ConfigureCoordinator { .. }
         | RuntimeCommand::RegisterNode { .. }
@@ -268,6 +269,7 @@ pub fn held_after_restore(command: &RuntimeCommand) -> Option<&'static str> {
         | RuntimeCommand::SubmitInput { .. }
         | RuntimeCommand::DetachWorker
         | RuntimeCommand::DetachMain
+        | RuntimeCommand::DetachSidechat
         | RuntimeCommand::DetachConversation
         | RuntimeCommand::Interrupt
         | RuntimeCommand::HostReply { .. }
@@ -300,6 +302,10 @@ pub fn held_after_restore(command: &RuntimeCommand) -> Option<&'static str> {
         | RuntimeCommand::ListTasks
         | RuntimeCommand::ReadTaskGraph
         | RuntimeCommand::ListConversations { .. }
+        | RuntimeCommand::ListSidechats { .. }
+        | RuntimeCommand::CreateSidechat { .. }
+        | RuntimeCommand::UpdateSidechat { .. }
+        | RuntimeCommand::SidechatInput { .. }
         | RuntimeCommand::ConversationInput { .. }
         | RuntimeCommand::ConversationInterrupt { .. }
         | RuntimeCommand::ListResources

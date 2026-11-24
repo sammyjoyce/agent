@@ -112,6 +112,7 @@ final class ChatModel {
   var model = "Unknown"
   var commands: [SlashCommand] = []
   let inspectedConversation: SavedConversation?
+  var activeSidechat: SidechatSummary?
   var busy = false
   var canLoadEarlier = false
   var loadingHistory = false
@@ -424,12 +425,14 @@ final class ChatModel {
 
   init(
     inspecting conversation: SavedConversation? = nil,
+    sidechat: SidechatSummary? = nil,
     draftStore: AttachmentStore? = nil, persistence: ComposerDraftStore? = nil,
     sharedInbox: SharedDraftInbox? = nil, registration: NotificationRegistration? = nil,
     scope preference: ScopePreference = .memory, spotlight: SpotlightIndex? = nil,
     admit: @escaping Admit = { deliver in await deliver() }
   ) {
     inspectedConversation = conversation
+    activeSidechat = sidechat
     self.draftStore = draftStore
     self.persistence = persistence
     self.sharedInbox = sharedInbox
@@ -872,7 +875,15 @@ final class ChatModel {
         if !connected {
           self.registration?.disconnect(id)
         } else if let registration = self.registration {
-          Task { await registration.connect(session.notificationChannel) }
+          let syncSidechats =
+            update.sidechatsSupported && self.activeSidechat == nil
+            && self.inspectedConversation == nil
+          Task {
+            await registration.connect(session.notificationChannel)
+            if syncSidechats {
+              await self.syncSidechatNotificationOverrides(lane: id)
+            }
+          }
         }
       }
     }
@@ -926,7 +937,92 @@ final class ChatModel {
       if demand.sceneActive { await reconcile(id) }
     } catch { failure = error.localizedDescription }
   }
-  /// Keeps an inspection connected until the task that owns it is cancelled.
+  /// Opens this standing side chat on `owner`'s coordinator `id`, over an interactive session that
+  /// the coordinator's own session mints and ends, with its own isolated outbox and ledger.
+  func connectSidechat(using owner: ChatModel, lane id: ProfileID, sidechat: SidechatSummary) async
+  {
+    guard lanes.isEmpty else {
+      failure = ConnectionError.closed.localizedDescription
+      return
+    }
+    activeSidechat = sidechat
+    do {
+      let minted = try await owner.onLane(id) { await $0.sidechatSession(sidechat) }
+      guard let session = minted else { throw ConnectionError.closed }
+      profiles = owner.profiles.filter { $0.id == id }
+      lanes = [Lane(id: id, session: session)]
+      snapshots[id] = nil
+      observations[id] = observe(session, lane: id)
+      demand.sceneActive = owner.demand.sceneActive
+      if demand.sceneActive { await reconcile(id) }
+    } catch { failure = error.localizedDescription }
+  }
+  /// True when at least one connected coordinator advertises standing side chats.
+  var sidechatsSupported: Bool {
+    lanes.contains { snapshots[$0.id]?.sidechatsSupported == true }
+  }
+  /// True while `lane` is connected and advertises standing side chats.
+  func sidechatsReady(_ lane: ProfileID) -> Bool {
+    snapshots[lane].map { $0.sidechatsSupported && $0.connection == .connected } ?? false
+  }
+  /// Default coordinator lane when opening the Side chats list from Main.
+  func defaultSidechatLane() -> ProfileID? {
+    if let shown = scope.coordinator, snapshots[shown]?.sidechatsSupported == true { return shown }
+    return lanes.first(where: { snapshots[$0.id]?.sidechatsSupported == true })?.id
+      ?? scope.coordinator ?? profiles.first?.id
+  }
+  func listSidechats(includeArchived: Bool = false, lane: ProfileID) async throws
+    -> [SidechatSummary]
+  {
+    let items = try await onLane(lane) {
+      try await $0.listSidechats(includeArchived: includeArchived)
+    }
+    if includeArchived {
+      await registration?.setSidechatAlertsOn(
+        items.contains { $0.notifications == .on }, for: lane)
+    }
+    return items
+  }
+  func createSidechat(_ request: NativeRequestCreateSidechat, lane: ProfileID) async throws
+    -> SidechatSummary
+  {
+    let created = try await onLane(lane) { try await $0.createSidechat(request) }
+    if created.notifications == .on {
+      await registration?.setSidechatAlertsOn(true, for: lane)
+    }
+    return created
+  }
+  func updateSidechat(_ request: NativeRequestUpdateSidechat, lane: ProfileID) async throws
+    -> SidechatSummary
+  {
+    let updated = try await onLane(lane) { try await $0.updateSidechat(request) }
+    if activeSidechat?.conversationId == updated.conversationId {
+      await applyLocalSidechatUpdate(updated)
+    }
+    if updated.notifications == .on {
+      await registration?.setSidechatAlertsOn(true, for: lane)
+    } else if registration?.hasSidechatOverrides(lane) == true {
+      await syncSidechatNotificationOverrides(lane: lane)
+    }
+    return updated
+  }
+  /// Updates local side chat metadata and pushes it into the active side chat session so subsequent
+  /// streaming or history snapshots never revert settings edits.
+  func applyLocalSidechatUpdate(_ updated: SidechatSummary) async {
+    guard activeSidechat?.conversationId == updated.conversationId else { return }
+    activeSidechat = updated
+    for lane in lanes {
+      await lane.session?.updateActiveSidechat(updated)
+    }
+  }
+  private func syncSidechatNotificationOverrides(lane: ProfileID) async {
+    guard let registration else { return }
+    if let items = try? await onLane(lane, { try await $0.listSidechats(includeArchived: true) }) {
+      await registration.setSidechatAlertsOn(
+        items.contains { $0.notifications == .on }, for: lane)
+    }
+  }
+  /// Keeps an inspection or side chat connected until the task that owns it is cancelled.
   func runUntilCancelled() async {
     let lifetime = AsyncStream<Void> { _ in }
     for await _ in lifetime {}
@@ -935,6 +1031,13 @@ final class ChatModel {
     let sessions = lanes.compactMap(\.session)
     lanes = []
     connection = .disconnected
+    if activeSidechat != nil, persistence == nil, !attachments.isEmpty {
+      let unsent = attachments
+      attachments = []
+      if let store = draftStore {
+        for file in unsent { try? await store.remove(file) }
+      }
+    }
     for session in sessions { await session.retire() }
   }
   func jobs(_ id: String? = nil, lane: ProfileID) async throws -> NativeJobStatus {
@@ -1086,6 +1189,7 @@ final class ChatModel {
   /// coordinator through the Mac, and with no scope veto, since the target is the coordinator the
   /// feed shows. nil for any other draft.
   private var feedbackDraft: FeedbackDraft? {
+    guard activeSidechat == nil else { return nil }
     let parsed = address(
       draft, hasAttachments: !attachments.isEmpty, destination: destination, in: .all,
       anyConnection: true)
@@ -1195,7 +1299,7 @@ final class ChatModel {
     let original = source
     let addressedTo = DraftAddressing(destination: destination, restoredFrom: restoredFrom)
     let files = attachments
-    let isControl = CoordinatorSession.isControlInput(text)
+    let isControl = activeSidechat == nil && CoordinatorSession.isControlInput(text)
     if !isControl, let reply = pendingReply, let replyLane = reply.lane,
       recipients != [replyLane]
     {
@@ -1771,6 +1875,7 @@ final class ChatModel {
 
   func apply(_ update: ChatSnapshot, lane id: ProfileID) {
     snapshots[id] = update
+    if activeSidechat != nil, let sidechat = update.sidechat { activeSidechat = sidechat }
     if seen[id]?.epoch != laneEpoch(id) { seen[id] = (laneEpoch(id), update.liveReplies) }
     refresh(changed: id)
   }

@@ -184,8 +184,8 @@ test("real publication snapshots distinct task and source evidence through live/
         checkpoint: { value: "one" }, coverage: { status: "complete" } }, null);
       const records = await app.sources.events({ provider, account: "invented-account" });
       assert.equal(records.length, 1);
-      assert.equal(await app.sources.notify(conversation.id.toString(), provider, records.map(record => record.key),
-        task.id, "Misleading body: Job Unknown."), "published");
+      assert.deepEqual(await app.sources.notify(conversation.id.toString(), provider, records.map(record => record.key),
+        task.id, "Misleading body: Job Unknown."), { publication: "published", destination: "main" });
       await app.tasks.update(task.id, saved => { saved.title = "Later unrelated title"; });
     }
     await eventually(() => live.length === 2);
@@ -220,8 +220,8 @@ test("source-only journal publications retain canonical provider/title evidence 
       await app.sources.admit({ source, checkpoint: { value: "v1" }, coverage: { status: "complete" },
         events: [{ id: provider + "-event", version: "v1", source, title, text: "Not provenance: task Fake" }] }, null);
       const records = await app.sources.events({ provider, account: source.account });
-      assert.equal(await app.sources.notify(root.id.toString(), provider, records.map(record => record.key),
-        null, "Job Fake: body labels are not provenance."), "published");
+      assert.deepEqual(await app.sources.notify(root.id.toString(), provider, records.map(record => record.key),
+        null, "Job Fake: body labels are not provenance."), { publication: "published", destination: "main" });
       const record = records[0]; assert.ok(record);
       await app.sources.admit({ source, checkpoint: { value: "v2" }, coverage: { status: "complete" },
         events: [{ ...record.event, version: "v2", title: "Later unrelated title" }] }, { value: "v1" });

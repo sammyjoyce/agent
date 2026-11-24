@@ -1,15 +1,22 @@
 # iPhone notifications
 
-The coordinator sends an alert for a new completed main-chat reply or an
-explicitly published user notice. Tools, progress, receipts, compaction,
-imported conversations and history replay do not trigger alerts. Legacy notices
-stay readable without becoming push notifications.
+The coordinator sends an alert for a new completed main-chat reply, an
+explicitly published user notice, or a standing side chat reply allowed by that
+side chat's notification setting. Each side chat defaults to `inherit` (following
+the device's **Main-chat updates** toggle) and can be overridden per topic to
+`on` or `off`. Tools, progress, receipts, compaction, imported conversations and
+history replay do not trigger alerts. Legacy notices stay readable without
+becoming push notifications.
 
 Alerts preview the actual reply or published notice, with basic Markdown
 formatting removed and long text truncated. Reasoning, tool output and internal
-notice references stay out of the preview. Conversation/message IDs open the
-existing main chat. An open main chat suppresses foreground banners; the app
-has no persistent background socket.
+notice references stay out of the preview. Main alerts use the title `Beep Boop`
+and open the main chat; side chat alerts use `Beep Boop · <title>` and open
+directly to that side chat. An open main chat or open matching side chat
+suppresses foreground banners for that conversation; the app has no persistent
+background socket. When **Main-chat updates** is turned off while at least one
+side chat is explicitly set to `on`, the device remains registered with
+`main_enabled: false` so only those opted-in side chats send push alerts.
 
 ## One-time setup
 

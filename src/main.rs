@@ -35,8 +35,9 @@ use agent_cli::{
     protocol::{
         AuthStatus, ConversationChange, ConversationSettings, CoordinatorBootstrap,
         CoordinatorSettings, HostDelivery, HostResult, ImportPhase, ImportProgress, InputMode,
-        MainInputContext, RuntimeCommand, RuntimeEventKind, SavedConversation, SearchMode, TaskId,
-        TranscriptAnnotation, TranscriptClassification, WorkerLaunch, WorkerRef,
+        MainInputContext, RuntimeCommand, RuntimeEventKind, SavedConversation, SearchMode,
+        SidechatNotificationPreference, SidechatSummary, TaskId, TranscriptAnnotation,
+        TranscriptClassification, WorkerLaunch, WorkerRef,
     },
     rex::{BlockId, RexClient, SessionId},
     runtime::{
@@ -128,8 +129,16 @@ enum Action {
     },
     Chat {
         prompt: Option<String>,
+        /// Open or send to a standing topic side chat by slug or conversation ID.
+        #[arg(long, value_name = "SLUG_OR_ID", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        sidechat: Option<String>,
         #[command(flatten)]
         selection: ModelArgs,
+    },
+    /// Manage standing topic side chats.
+    Sidechats {
+        #[command(subcommand)]
+        command: SidechatsAction,
     },
     /// Search and read stored task conversations.
     Tasks {
@@ -266,6 +275,61 @@ impl ModelArgs {
         selection.validate()?;
         Ok(selection)
     }
+}
+
+#[derive(Subcommand)]
+enum SidechatsAction {
+    /// List standing topic side chats (pinned first, then recently updated).
+    List {
+        /// Include archived side chats.
+        #[arg(long)]
+        archived: bool,
+    },
+    /// Create a fresh standing topic side chat.
+    Create {
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        title: String,
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        slug: Option<String>,
+        #[arg(long)]
+        charter: Option<String>,
+        /// Wall this side chat off from cross-chat search and retrieval.
+        #[arg(long)]
+        isolated: bool,
+        /// Per-sidechat push notification setting (inherit, on, off).
+        #[arg(long, value_enum)]
+        notifications: Option<SidechatNotificationPreference>,
+        /// Initial handoff context to seed the new side chat.
+        #[arg(long)]
+        handoff: Option<String>,
+    },
+    /// Update a standing side chat's metadata, charter, isolation, or notifications.
+    Update {
+        #[arg(value_name = "SLUG_OR_ID", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        sidechat: String,
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        title: Option<String>,
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        slug: Option<String>,
+        #[arg(long, conflicts_with = "unpin")]
+        pin: bool,
+        #[arg(long, conflicts_with = "pin")]
+        unpin: bool,
+        #[arg(long, conflicts_with = "unarchive")]
+        archive: bool,
+        #[arg(long, conflicts_with = "archive")]
+        unarchive: bool,
+        #[arg(long, conflicts_with = "clear_charter")]
+        charter: Option<String>,
+        #[arg(long, conflicts_with = "charter")]
+        clear_charter: bool,
+        #[arg(long, conflicts_with = "shared")]
+        isolated: bool,
+        #[arg(long, conflicts_with = "isolated")]
+        shared: bool,
+        #[arg(long, value_enum)]
+        notifications: Option<SidechatNotificationPreference>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -668,6 +732,7 @@ async fn run(mut arguments: Arguments) -> Result<()> {
     let rex = RexClient::for_process(arguments.rex_server.as_deref())?;
     let action = arguments.command.take().unwrap_or(Action::Chat {
         prompt: None,
+        sidechat: None,
         selection: ModelArgs::default(),
     });
     let mut chatgpt = None;
@@ -1087,7 +1152,7 @@ async fn run(mut arguments: Arguments) -> Result<()> {
         Action::Login => RuntimeCommand::Login,
         Action::Status => RuntimeCommand::Status,
         Action::Usage => RuntimeCommand::Usage {
-            provider: conversation_settings(client, None, None, false)
+            provider: conversation_settings(client, None, None, None, false)
                 .await?
                 .model
                 .provider,
@@ -1125,6 +1190,69 @@ async fn run(mut arguments: Arguments) -> Result<()> {
             ResourcesAction::List => RuntimeCommand::ListResources,
             ResourcesAction::Collect => RuntimeCommand::CollectResources {
                 host_id: rex.whoami().await?.host_id.to_string(),
+            },
+        },
+        Action::Sidechats { command } => match command {
+            SidechatsAction::List { archived } => RuntimeCommand::ListSidechats {
+                include_archived: archived,
+            },
+            SidechatsAction::Create {
+                title,
+                slug,
+                charter,
+                isolated,
+                notifications,
+                handoff,
+            } => RuntimeCommand::CreateSidechat {
+                title,
+                slug,
+                charter,
+                isolated: isolated.then_some(true),
+                notifications,
+                seed: None,
+                handoff,
+            },
+            SidechatsAction::Update {
+                sidechat,
+                title,
+                slug,
+                pin,
+                unpin,
+                archive,
+                unarchive,
+                charter,
+                clear_charter,
+                isolated,
+                shared,
+                notifications,
+            } => RuntimeCommand::UpdateSidechat {
+                conversation_id: sidechat,
+                title,
+                slug,
+                pinned: if pin {
+                    Some(true)
+                } else if unpin {
+                    Some(false)
+                } else {
+                    None
+                },
+                archived: if archive {
+                    Some(true)
+                } else if unarchive {
+                    Some(false)
+                } else {
+                    None
+                },
+                charter,
+                clear_charter: clear_charter.then_some(true),
+                isolated: if isolated {
+                    Some(true)
+                } else if shared {
+                    Some(false)
+                } else {
+                    None
+                },
+                notifications,
             },
         },
         Action::Tasks { command } => match command {
@@ -1227,9 +1355,14 @@ async fn run(mut arguments: Arguments) -> Result<()> {
         },
         Action::Chat {
             prompt: Some(input),
+            sidechat,
             selection,
         } => {
             let model = selected_model(selection, client).await?;
+            let resolved_sidechat = match sidechat {
+                Some(target) => Some(chat_view::resolve_sidechat(client, &target).await?),
+                None => None,
+            };
             if let Some(command) = ChatCommand::parse(&input) {
                 let command = command?;
                 match command {
@@ -1246,38 +1379,93 @@ async fn run(mut arguments: Arguments) -> Result<()> {
                             ChatStart {
                                 model,
                                 prompt: Some(format!("/resume {}", query.join(" "))),
+                                sidechat: None,
                             },
                         )
                         .await;
                     }
-                    ChatCommand::History => {
-                        return request(
+                    ChatCommand::Sidechat { target } if use_tui(&arguments) => {
+                        let resolved = match target {
+                            Some(slug_or_id) => {
+                                Some(chat_view::resolve_sidechat(client, &slug_or_id).await?)
+                            }
+                            None => None,
+                        };
+                        return chat_tui(
                             &arguments,
                             client,
-                            RuntimeCommand::ReadHistory {
+                            &cwd,
+                            ChatStart {
+                                model,
+                                prompt: resolved.is_none().then(|| "/sidechat".into()),
+                                sidechat: resolved,
+                            },
+                        )
+                        .await;
+                    }
+                    ChatCommand::Main => {
+                        if use_tui(&arguments) {
+                            return chat_tui(
+                                &arguments,
+                                client,
+                                &cwd,
+                                ChatStart {
+                                    model,
+                                    prompt: None,
+                                    sidechat: None,
+                                },
+                            )
+                            .await;
+                        }
+                        return Ok(());
+                    }
+                    ChatCommand::History => {
+                        let history_command = match resolved_sidechat {
+                            Some(sc) => RuntimeCommand::ReadConversation {
+                                conversation_id: sc.conversation_id,
+                                cursor: None,
+                            },
+                            None => RuntimeCommand::ReadHistory {
                                 task_id: None,
                                 agent_id: None,
                                 cursor: None,
                             },
-                        )
-                        .await
-                        .map(|_| ());
+                        };
+                        return request(&arguments, client, history_command)
+                            .await
+                            .map(|_| ());
                     }
                     ChatCommand::Feedback { .. } => {}
                     command => {
-                        if !matches!(command, ChatCommand::Machines | ChatCommand::Worktrees)
-                            && let Some(model) = model
+                        let target_conversation_id = resolved_sidechat
+                            .as_ref()
+                            .map(|sc| sc.conversation_id.clone());
+                        if !matches!(
+                            command,
+                            ChatCommand::Machines
+                                | ChatCommand::Worktrees
+                                | ChatCommand::Sidechat { .. }
+                                | ChatCommand::Resume { .. }
+                        ) && let Some(model) = model
                         {
                             conversation_settings(
                                 client,
                                 None,
+                                target_conversation_id.clone(),
                                 Some(ConversationChange::SetSelection { model }),
                                 false,
                             )
                             .await?;
                         }
-                        return local_command_plain(client, &command, None, &cwd, arguments.json)
-                            .await;
+                        return local_command_plain(
+                            client,
+                            &command,
+                            None,
+                            target_conversation_id,
+                            &cwd,
+                            arguments.json,
+                        )
+                        .await;
                     }
                 }
             }
@@ -1289,17 +1477,68 @@ async fn run(mut arguments: Arguments) -> Result<()> {
                     ChatStart {
                         model,
                         prompt: Some(input),
+                        sidechat: resolved_sidechat,
                     },
                 )
                 .await;
             }
-            chat_command(&rex, &terminal, input, model, &cwd).await?
+            if let Some(resolved) = resolved_sidechat {
+                if let Some(model) = model {
+                    let settings = conversation_settings(
+                        client,
+                        None,
+                        Some(resolved.conversation_id.clone()),
+                        Some(ConversationChange::SetSelection { model }),
+                        false,
+                    )
+                    .await?;
+                    if arguments.json {
+                        display(&RuntimeEventKind::ConversationSettings { settings }, true)?;
+                    }
+                }
+                let context = main_input_context(&rex, &cwd).await?;
+                RuntimeCommand::SidechatInput {
+                    origin: Some(agent_cli::protocol::InputOrigin::Cli),
+                    conversation_id: resolved.conversation_id,
+                    input_id: uuid::Uuid::new_v4().to_string(),
+                    input,
+                    mode: InputMode::FollowUp,
+                    context: Some(context),
+                    attachments: None,
+                    reply_to: None,
+                }
+            } else {
+                chat_command(&rex, &terminal, input, model, &cwd).await?
+            }
         }
         Action::Chat {
             prompt: None,
+            sidechat,
             selection,
         } => {
+            enum PlainTarget {
+                Main,
+                Sidechat(SidechatSummary),
+            }
+            impl PlainTarget {
+                fn conversation_id(&self) -> Option<String> {
+                    match self {
+                        Self::Main => None,
+                        Self::Sidechat(sc) => Some(sc.conversation_id.clone()),
+                    }
+                }
+                fn prompt(&self) -> String {
+                    match self {
+                        Self::Main => "Beep Boop> ".into(),
+                        Self::Sidechat(sc) => format!("Beep Boop [{}]> ", sc.slug),
+                    }
+                }
+            }
             let model = selected_model(selection, client).await?;
+            let resolved_sidechat = match sidechat {
+                Some(target) => Some(chat_view::resolve_sidechat(client, &target).await?),
+                None => None,
+            };
             if use_tui(&arguments) {
                 return chat_tui(
                     &arguments,
@@ -1308,36 +1547,68 @@ async fn run(mut arguments: Arguments) -> Result<()> {
                     ChatStart {
                         model,
                         prompt: None,
+                        sidechat: resolved_sidechat,
                     },
                 )
                 .await;
             }
-            conversation_settings(
+            let mut plain_target = match resolved_sidechat {
+                Some(sc) => PlainTarget::Sidechat(sc),
+                None => PlainTarget::Main,
+            };
+            let had_model = model.is_some();
+            let applied = conversation_settings(
                 client,
                 None,
+                plain_target.conversation_id(),
                 model.map(|model| ConversationChange::SetSelection { model }),
                 false,
             )
             .await?;
+            if arguments.json && had_model && matches!(plain_target, PlainTarget::Sidechat(_)) {
+                display(
+                    &RuntimeEventKind::ConversationSettings { settings: applied },
+                    true,
+                )?;
+            }
             let model: Option<ModelSelection> = None;
-            let _watch = watch(client, arguments.json).await?;
-            let mut history_cursor = request(
-                &arguments,
-                client,
-                RuntimeCommand::ReadHistory {
-                    task_id: None,
-                    agent_id: None,
-                    cursor: None,
-                },
-            )
-            .await?;
+            let mut _watch = if matches!(plain_target, PlainTarget::Main) {
+                Some(watch(client, arguments.json).await?)
+            } else {
+                None
+            };
+            let mut history_cursor = match &plain_target {
+                PlainTarget::Main => {
+                    request(
+                        &arguments,
+                        client,
+                        RuntimeCommand::ReadHistory {
+                            task_id: None,
+                            agent_id: None,
+                            cursor: None,
+                        },
+                    )
+                    .await?
+                }
+                PlainTarget::Sidechat(sc) => {
+                    request(
+                        &arguments,
+                        client,
+                        RuntimeCommand::ReadConversation {
+                            conversation_id: sc.conversation_id.clone(),
+                            cursor: None,
+                        },
+                    )
+                    .await?
+                }
+            };
             let mut input = BufReader::new(tokio::io::stdin()).lines();
             let mut feedback = tokio::task::JoinSet::new();
             let result = async {
                 loop {
                     if !arguments.json && std::io::stdin().is_terminal() {
                         let mut stdout = tokio::io::stdout();
-                        stdout.write_all(b"Beep Boop> ").await?;
+                        stdout.write_all(plain_target.prompt().as_bytes()).await?;
                         stdout.flush().await?;
                     }
                     let Some(line) = input.next_line().await? else {
@@ -1361,12 +1632,78 @@ async fn run(mut arguments: Arguments) -> Result<()> {
                                 continue;
                             }
                             Ok(ChatCommand::Exit) => return Ok(()),
+                            Ok(ChatCommand::Sidechat {
+                                target: Some(wanted),
+                            }) => {
+                                match chat_view::resolve_sidechat(client, &wanted).await {
+                                    Ok(sc) => {
+                                        if !arguments.json {
+                                            println!(
+                                                "Switched to side chat {} ({}).",
+                                                agent_cli::sidechats::sanitize_terminal_text(
+                                                    &sc.title
+                                                ),
+                                                agent_cli::sidechats::sanitize_terminal_text(
+                                                    &sc.slug
+                                                ),
+                                            );
+                                        }
+                                        history_cursor = request(
+                                            &arguments,
+                                            client,
+                                            RuntimeCommand::ReadConversation {
+                                                conversation_id: sc.conversation_id.clone(),
+                                                cursor: None,
+                                            },
+                                        )
+                                        .await?;
+                                        plain_target = PlainTarget::Sidechat(sc);
+                                    }
+                                    Err(error) => {
+                                        let (code, message) = json_error(&error);
+                                        emit_failure_or_stderr(
+                                            code,
+                                            message,
+                                            &format!("Local command failed: {error}"),
+                                            arguments.json,
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
+                            Ok(ChatCommand::Main) => {
+                                if matches!(plain_target, PlainTarget::Main) {
+                                    if !arguments.json {
+                                        println!("Already on the Main conversation.");
+                                    }
+                                } else {
+                                    if _watch.is_none() {
+                                        _watch = Some(watch(client, arguments.json).await?);
+                                    }
+                                    if !arguments.json {
+                                        println!("Switched to the Main conversation.");
+                                    }
+                                    plain_target = PlainTarget::Main;
+                                    history_cursor = request(
+                                        &arguments,
+                                        client,
+                                        RuntimeCommand::ReadHistory {
+                                            task_id: None,
+                                            agent_id: None,
+                                            cursor: None,
+                                        },
+                                    )
+                                    .await?;
+                                }
+                                continue;
+                            }
                             Ok(ChatCommand::History | ChatCommand::Feedback { .. }) => {}
                             Ok(command) => {
                                 if let Err(error) = local_command_plain(
                                     client,
                                     &command,
                                     None,
+                                    plain_target.conversation_id(),
                                     &cwd,
                                     arguments.json,
                                 )
@@ -1443,31 +1780,60 @@ async fn run(mut arguments: Arguments) -> Result<()> {
                                 println!("No older history.");
                             }
                         } else {
-                            history_cursor = request(
-                                &arguments,
-                                client,
-                                RuntimeCommand::ReadHistory {
+                            let history_command = match &plain_target {
+                                PlainTarget::Main => RuntimeCommand::ReadHistory {
                                     task_id: None,
                                     agent_id: None,
                                     cursor: history_cursor,
                                 },
-                            )
-                            .await?;
+                                PlainTarget::Sidechat(sc) => RuntimeCommand::ReadConversation {
+                                    conversation_id: sc.conversation_id.clone(),
+                                    cursor: history_cursor,
+                                },
+                            };
+                            history_cursor = request(&arguments, client, history_command).await?;
                         }
                         continue;
                     }
                     if !line.trim().is_empty() {
-                        let command =
-                            chat_command(&rex, &terminal, line, model.clone(), &cwd).await?;
-                        request_presented(
-                            &arguments,
-                            client,
-                            command,
-                            None,
-                            PlainNoticeRoute::Watch,
-                            None,
-                        )
-                        .await?;
+                        match &plain_target {
+                            PlainTarget::Main => {
+                                let command =
+                                    chat_command(&rex, &terminal, line, model.clone(), &cwd)
+                                        .await?;
+                                request_presented(
+                                    &arguments,
+                                    client,
+                                    command,
+                                    None,
+                                    PlainNoticeRoute::Watch,
+                                    None,
+                                )
+                                .await?;
+                            }
+                            PlainTarget::Sidechat(sc) => {
+                                let context = main_input_context(&rex, &cwd).await?;
+                                let command = RuntimeCommand::SidechatInput {
+                                    origin: Some(agent_cli::protocol::InputOrigin::Cli),
+                                    conversation_id: sc.conversation_id.clone(),
+                                    input_id: uuid::Uuid::new_v4().to_string(),
+                                    input: line,
+                                    mode: InputMode::FollowUp,
+                                    context: Some(context),
+                                    attachments: None,
+                                    reply_to: None,
+                                };
+                                request_presented(
+                                    &arguments,
+                                    client,
+                                    command,
+                                    None,
+                                    PlainNoticeRoute::Direct,
+                                    None,
+                                )
+                                .await?;
+                            }
+                        }
                     }
                 }
             }
@@ -1649,6 +2015,7 @@ fn use_tui(arguments: &Arguments) -> bool {
 struct ChatStart {
     model: Option<ModelSelection>,
     prompt: Option<String>,
+    sidechat: Option<SidechatSummary>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2488,6 +2855,7 @@ async fn finish_controls(admissions: &mut tokio::task::JoinSet<()>) {
 async fn conversation_settings(
     client: ClientContext<'_>,
     target: Option<(TaskId, Option<String>)>,
+    conversation_id: Option<String>,
     change: Option<ConversationChange>,
     catalog: bool,
 ) -> Result<ConversationSettings> {
@@ -2497,7 +2865,7 @@ async fn conversation_settings(
         RuntimeCommand::ConversationSettings {
             task_id,
             agent_id,
-            conversation_id: None,
+            conversation_id,
             change,
             catalog,
         },
@@ -2569,10 +2937,21 @@ async fn local_settings(
     client: ClientContext<'_>,
     command: &ChatCommand,
     target: Option<(TaskId, Option<String>)>,
+    conversation_id: Option<String>,
 ) -> Result<ConversationSettings> {
-    let request = command
+    let mut request = command
         .settings(target)
         .context("This command does not change conversation settings")?;
+    if let (
+        Some(conversation_id),
+        RuntimeCommand::ConversationSettings {
+            conversation_id: selected,
+            ..
+        },
+    ) = (conversation_id, &mut request)
+    {
+        *selected = Some(conversation_id);
+    }
     exchange(client, request)
         .await?
         .into_iter()
@@ -2725,28 +3104,7 @@ fn local_command_from_ui(
                 return handle.notice(inventory.format(SystemTime::now()));
             }
             let info = handle.info().await?;
-            let settings = if let Some(conversation_id) = selected {
-                let mut request = command
-                    .settings(target)
-                    .context("This command does not change conversation settings")?;
-                if let RuntimeCommand::ConversationSettings {
-                    conversation_id: selected,
-                    ..
-                } = &mut request
-                {
-                    *selected = Some(conversation_id);
-                }
-                exchange(client, request)
-                    .await?
-                    .into_iter()
-                    .find_map(|event| match event {
-                        RuntimeEventKind::ConversationSettings { settings } => Some(settings),
-                        _ => None,
-                    })
-                    .context("The coordinator returned no conversation settings")?
-            } else {
-                local_settings(client, &command, target).await?
-            };
+            let settings = local_settings(client, &command, target, selected).await?;
             let mut text = settings_text(&command, &settings, &info, coordinator.as_deref());
             let provider = settings.model.provider;
             let conversation_id = settings.conversation_id.clone();
@@ -2875,9 +3233,24 @@ async fn local_command_plain(
     client: ClientContext<'_>,
     command: &ChatCommand,
     target: Option<(TaskId, Option<String>)>,
+    conversation_id: Option<String>,
     cwd: &Path,
     json: bool,
 ) -> Result<()> {
+    if let ChatCommand::Sidechat { target } = command {
+        let items = match target {
+            Some(wanted) => vec![chat_view::resolve_sidechat(client, wanted).await?],
+            None => chat_view::list_sidechats(client, false).await?,
+        };
+        display(&RuntimeEventKind::Sidechats { items }, json)?;
+        return Ok(());
+    }
+    if matches!(command, ChatCommand::Main) {
+        if !json {
+            println!("Already on the Main conversation.");
+        }
+        return Ok(());
+    }
     if let ChatCommand::Resume { query } = command {
         let items = chat_view::choices(client, query.join(" ")).await?;
         if json {
@@ -2896,11 +3269,12 @@ async fn local_command_plain(
         }
         return Ok(());
     }
+    let goal_target = conversation_id.clone().map_or_else(
+        || agent_cli::protocol::GoalTarget::from(target.clone()),
+        |conversation_id| agent_cli::protocol::GoalTarget::Conversation { conversation_id },
+    );
     let goal = command
-        .goal(
-            agent_cli::protocol::GoalTarget::from(target.clone()),
-            uuid::Uuid::new_v4(),
-        )
+        .goal(goal_target, uuid::Uuid::new_v4())
         .transpose()?;
     if let Some(request) = goal.or_else(|| command.request()) {
         for event in exchange(client, request).await? {
@@ -2917,7 +3291,7 @@ async fn local_command_plain(
         }
         return Ok(());
     }
-    let settings = local_settings(client, command, target).await?;
+    let settings = local_settings(client, command, target, conversation_id).await?;
     let quota = if matches!(command, ChatCommand::Status) {
         Some(conversation_usage(client, settings.model.provider).await)
     } else {
@@ -2988,6 +3362,38 @@ enum PlainNoticeRoute {
     Watch,
 }
 
+async fn handle_tui_command(
+    client: ClientContext<'_>,
+    ui: &mut UiSession,
+    fallback_target: Option<(TaskId, Option<String>)>,
+    command: ChatCommand,
+) -> Result<()> {
+    match command {
+        ChatCommand::Resume { query } => {
+            if let Err(error) = chat_view::resume(client, ui, query.join(" ")).await {
+                ui.handle.notice(error.to_string())?;
+            }
+        }
+        ChatCommand::Sidechat { target } => {
+            if let Err(error) = chat_view::open_sidechat(client, ui, target).await {
+                ui.handle.notice(error.to_string())?;
+            }
+        }
+        ChatCommand::Main => {
+            if let Err(error) = chat_view::open_main(client, ui).await {
+                ui.handle.notice(error.to_string())?;
+            }
+        }
+        command => {
+            let target = ui.selected.as_ref().map_or(fallback_target, |item| {
+                item.task_id.clone().map(|id| (id, item.agent_id.clone()))
+            });
+            local_command_from_ui(client, ui, target, command);
+        }
+    }
+    Ok(())
+}
+
 async fn chat_tui(
     _arguments: &Arguments,
     client: ClientContext<'_>,
@@ -2995,23 +3401,34 @@ async fn chat_tui(
     start: ChatStart,
 ) -> Result<()> {
     let directory = client.directory;
+    let initial_sidechat = start.sidechat;
     let resuming = start.prompt.as_ref().is_some_and(|prompt| {
         matches!(
             ChatCommand::parse(prompt),
-            Some(Ok(ChatCommand::Resume { .. }))
+            Some(Ok(ChatCommand::Resume { .. } | ChatCommand::Sidechat { .. }))
         )
     });
-    let resumed_model = if resuming { start.model.clone() } else { None };
+    let deferred_model = if resuming || initial_sidechat.is_some() {
+        start.model.clone()
+    } else {
+        None
+    };
     let mut initial_prompt = start.prompt;
+    let initial_title = initial_sidechat
+        .as_ref()
+        .map(|sc| format!("{} ({})", sc.title, sc.slug))
+        .unwrap_or_else(|| "Main agent".into());
     let (handle, inputs, guard) =
-        Tui::connecting("Main agent".into(), cwd.to_string_lossy().into_owned())?;
+        Tui::connecting(initial_title, cwd.to_string_lossy().into_owned())?;
     handle.observation(agent_cli::tui::ObservationState::Connecting)?;
     let mut ui = UiSession::new(handle, inputs);
     let mut startup_inputs = VecDeque::new();
     let result = async {
-        let request = conversation_settings(client,
+        let request = conversation_settings(
+            client,
             None,
-            if resuming {
+            None,
+            if resuming || initial_sidechat.is_some() {
                 None
             } else {
                 start
@@ -3030,38 +3447,73 @@ async fn chat_tui(
                 }
             }
         };
-        let chief = SavedConversation {
-            conversation_id: settings.conversation_id.clone(),
-            title: "Main agent".into(),
-            updated_at: None,
-            task_id: None,
-            agent_id: None,
-            host: None,
-            source_thread_id: None,
+        let initial_target = if let Some(ref sc) = initial_sidechat {
+            chat_view::sidechat_to_saved(sc)
+        } else {
+            SavedConversation {
+                conversation_id: settings.conversation_id.clone(),
+                title: "Main agent".into(),
+                updated_at: None,
+                task_id: None,
+                agent_id: None,
+                host: None,
+                source_thread_id: None,
+            }
         };
         ui.handle
             .event(RuntimeEventKind::ConversationSettings { settings })?;
-        chat_view::open(client, &mut ui, chief).await?;
+        chat_view::open(client, &mut ui, initial_target).await?;
         let _task_graph = watch_task_graph(client, ui.handle.clone());
+        if let Some(sc) = &initial_sidechat
+            && let Some(model) = deferred_model.clone()
+        {
+            let settings = conversation_settings(
+                client,
+                None,
+                Some(sc.conversation_id.clone()),
+                Some(ConversationChange::SetSelection { model }),
+                false,
+            )
+            .await?;
+            ui.handle
+                .event(RuntimeEventKind::ConversationSettings { settings })?;
+        }
         if let Some(prompt) = initial_prompt.clone() {
             if let Some(Ok(ChatCommand::Resume { query })) = ChatCommand::parse(&prompt) {
                 if chat_view::resume(client, &mut ui, query.join(" ")).await?
-                    && let Some(model) = resumed_model
+                    && let Some(model) = deferred_model
                     && let Some(selected) = &ui.selected
                 {
-                    for event in exchange(client,
-                        RuntimeCommand::ConversationSettings {
-                            task_id: selected.task_id.clone(),
-                            agent_id: selected.agent_id.clone(),
-                            conversation_id: Some(selected.conversation_id.clone()),
-                            change: Some(ConversationChange::SetSelection { model }),
-                            catalog: false,
-                        },
+                    let target = selected
+                        .task_id
+                        .clone()
+                        .map(|id| (id, selected.agent_id.clone()));
+                    let settings = conversation_settings(
+                        client,
+                        target,
+                        Some(selected.conversation_id.clone()),
+                        Some(ConversationChange::SetSelection { model }),
+                        false,
                     )
-                    .await?
-                    {
-                        ui.handle.event(event)?;
-                    }
+                    .await?;
+                    ui.handle
+                        .event(RuntimeEventKind::ConversationSettings { settings })?;
+                }
+            } else if let Some(Ok(ChatCommand::Sidechat { target })) = ChatCommand::parse(&prompt) {
+                if chat_view::open_sidechat(client, &mut ui, target).await?
+                    && let Some(model) = deferred_model
+                    && let Some(selected) = &ui.selected
+                {
+                    let settings = conversation_settings(
+                        client,
+                        None,
+                        Some(selected.conversation_id.clone()),
+                        Some(ConversationChange::SetSelection { model }),
+                        false,
+                    )
+                    .await?;
+                    ui.handle
+                        .event(RuntimeEventKind::ConversationSettings { settings })?;
                 }
             } else {
                 selected_input(client, &mut ui, prompt.into(), InputMode::Steer, cwd.to_owned())?;
@@ -3080,20 +3532,8 @@ async fn chat_tui(
                 TuiInput::Queue(text) => {
                     selected_input(client, &mut ui, text, InputMode::FollowUp, cwd.to_owned())?
                 }
-                TuiInput::Command(ChatCommand::Resume { query }) => {
-                    if let Err(error) = chat_view::resume(client, &mut ui, query.join(" ")).await {
-                        ui.handle.notice(error.to_string())?;
-                    }
-                }
                 TuiInput::Command(command) => {
-                    let target = ui.selected.as_ref().and_then(|item| {
-                        item.task_id.clone().map(|id| (id, item.agent_id.clone()))
-                    });
-                    local_command_from_ui(client,
-                        &mut ui,
-                        target,
-                        command,
-                    );
+                    handle_tui_command(client, &mut ui, None, command).await?;
                 }
                 TuiInput::Feedback(description) => {
                     let target = ui.selected.as_ref().and_then(|item| {
@@ -3210,12 +3650,16 @@ fn tool_details_from_ui(
     let Some(request) = request else {
         return;
     };
-    let target = ui.selected.as_ref().map_or(fallback, |selected| {
-        selected
-            .task_id
-            .clone()
-            .map(|task| (task, selected.agent_id.clone()))
-    });
+    let (target, conversation_id) = match ui.selected.as_ref() {
+        Some(selected) => {
+            if let Some(task) = selected.task_id.clone() {
+                (Some((task, selected.agent_id.clone())), None)
+            } else {
+                (None, Some(selected.conversation_id.clone()))
+            }
+        }
+        None => (fallback, None),
+    };
     let config = client.config.clone();
     let coordinator = client.coordinator.map(str::to_owned);
     let script = client.script.to_owned();
@@ -3233,7 +3677,7 @@ fn tool_details_from_ui(
             rex: &rex,
             terminal: &terminal,
         };
-        let details = read_tool_details(client, &request, target)
+        let details = read_tool_details_in(client, &request, target, conversation_id)
             .await
             .map_err(|error| error.to_string());
         let _ = handle.tool_details(request, details);
@@ -3245,10 +3689,22 @@ async fn read_tool_details(
     request: &agent_cli::tui::activity::ToolDetailRequest,
     target: Option<(agent_cli::protocol::TaskId, Option<String>)>,
 ) -> Result<agent_cli::native::ToolDetails> {
+    read_tool_details_in(client, request, target, None).await
+}
+
+async fn read_tool_details_in(
+    client: ClientContext<'_>,
+    request: &agent_cli::tui::activity::ToolDetailRequest,
+    target: Option<(agent_cli::protocol::TaskId, Option<String>)>,
+    conversation_id: Option<String>,
+) -> Result<agent_cli::native::ToolDetails> {
     let (task_id, agent_id) = target.map_or((None, None), |(task, agent)| (Some(task), agent));
     let events = tokio::time::timeout(
         Duration::from_secs(30),
-        exchange(client, request.command(task_id, agent_id)),
+        exchange(
+            client,
+            request.command_in(task_id, agent_id, conversation_id),
+        ),
     )
     .await
     .context("Tool details timed out; expand the tool to retry.")??;
@@ -4094,12 +4550,7 @@ async fn request_presented(
                     }
                     TuiInput::Command(command) => {
                         if let Some(ui) = presentation.as_mut().and_then(|view| view.session.as_deref_mut()) {
-                            if let ChatCommand::Resume{query}=command {
-                                if let Err(error)=chat_view::resume(client,ui,query.join(" ")).await {ui.handle.notice(error.to_string())?;}
-                            } else {
-                                let target=ui.selected.as_ref().map_or_else(||history_target.clone(),|item|item.task_id.clone().map(|id|(id,item.agent_id.clone())));
-                                local_command_from_ui(client, ui, target, command);
-                            }
+                            handle_tui_command(client, ui, history_target.clone(), command).await?;
                         }
                     }
                     TuiInput::Interrupt => {
@@ -4164,7 +4615,7 @@ async fn request_presented(
                             Ok(ChatCommand::History | ChatCommand::Feedback { .. }) => {}
                             Ok(command) => {
                                 let cwd = feedback_settings.as_ref().map(|(_, cwd)| Path::new(cwd)).unwrap_or_else(|| Path::new("."));
-                                if let Err(error) = local_command_plain(client, &command, history_target.clone(), cwd, arguments.json).await {
+                                if let Err(error) = local_command_plain(client, &command, history_target.clone(), None, cwd, arguments.json).await {
                                     let (code, message) = json_error(&error);
                                     emit_failure_or_stderr(
                                         code,
@@ -4617,6 +5068,18 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
                 println!("{}  {}", task.id, task.title);
             }
         }
+        RuntimeEventKind::Sidechat { sidechat } => {
+            println!("{}", format_sidechat_line(sidechat));
+        }
+        RuntimeEventKind::Sidechats { items } => {
+            if items.is_empty() {
+                println!("No side chats.");
+            } else {
+                for item in items {
+                    println!("{}", format_sidechat_line(item));
+                }
+            }
+        }
         RuntimeEventKind::Resources { resources } => {
             println!("{}", agent_cli::resources::format_inventory(resources));
         }
@@ -4659,6 +5122,49 @@ fn display(event: &RuntimeEventKind, json: bool) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+fn format_sidechat_line(summary: &SidechatSummary) -> String {
+    let mut badges = Vec::new();
+    if summary.pinned {
+        badges.push("pinned");
+    }
+    if summary.archived_at.is_some() {
+        badges.push("archived");
+    }
+    if summary.isolated {
+        badges.push("isolated");
+    }
+    match summary.notifications {
+        SidechatNotificationPreference::Inherit => {}
+        SidechatNotificationPreference::On => badges.push("alerts:on"),
+        SidechatNotificationPreference::Off => badges.push("alerts:off"),
+    }
+    let suffix = if badges.is_empty() {
+        String::new()
+    } else {
+        format!("  [{}]", badges.join(", "))
+    };
+    format!(
+        "{}  {}  {}{}",
+        agent_cli::sidechats::sanitize_terminal_text(&summary.conversation_id),
+        agent_cli::sidechats::sanitize_terminal_text(&summary.slug),
+        agent_cli::sidechats::sanitize_terminal_text(&summary.title),
+        suffix
+    )
+}
+
+async fn main_input_context(rex: &RexClient, cwd: &Path) -> Result<MainInputContext> {
+    Ok(MainInputContext {
+        instructions: instructions::project(cwd)?,
+        origin_host_id: rex
+            .whoami()
+            .await
+            .ok()
+            .map(|identity| identity.host_id.to_string()),
+        cwd: cwd.to_string_lossy().into_owned(),
+        hosts: Vec::new(),
+    })
 }
 
 fn import_phase(phase: &ImportPhase) -> u8 {
@@ -4935,7 +5441,7 @@ mod tests {
                 let command: RuntimeCommand =
                     serde_json::from_slice(&reader.next_frame().await.unwrap().unwrap()).unwrap();
                 assert!(
-                    matches!(command, RuntimeCommand::ReadToolDetails { entry_id, call_id, task_id, agent_id } if entry_id == "42" && call_id == "call-example" && task_id.is_some() == scoped && agent_id.as_deref() == scoped.then_some("delegate-example"))
+                    matches!(command, RuntimeCommand::ReadToolDetails { entry_id, call_id, task_id, agent_id, .. } if entry_id == "42" && call_id == "call-example" && task_id.is_some() == scoped && agent_id.as_deref() == scoped.then_some("delegate-example"))
                 );
                 let details = if recorded {
                     ToolDetails::Available {
@@ -6365,6 +6871,89 @@ esac
             }
         }
     }
+    #[test]
+    fn cli_parses_sidechats_subcommands_and_chat_sidechat_flag() {
+        use crate::SidechatsAction;
+        use agent_cli::protocol::SidechatNotificationPreference;
+        let parsed = Arguments::try_parse_from([
+            "beep-boop",
+            "sidechats",
+            "create",
+            "Morning Brief",
+            "--slug",
+            "morning-brief",
+            "--charter",
+            "Daily summary",
+            "--isolated",
+            "--notifications",
+            "on",
+            "--handoff",
+            "Initial context",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Action::Sidechats {
+                command: SidechatsAction::Create {
+                    title,
+                    slug: Some(slug),
+                    charter: Some(charter),
+                    isolated: true,
+                    notifications: Some(SidechatNotificationPreference::On),
+                    handoff: Some(handoff),
+                }
+            }) if title == "Morning Brief" && slug == "morning-brief" && charter == "Daily summary" && handoff == "Initial context"
+        ));
+
+        let updated = Arguments::try_parse_from([
+            "beep-boop",
+            "sidechats",
+            "update",
+            "morning-brief",
+            "--pin",
+            "--archive",
+            "--clear-charter",
+            "--shared",
+            "--notifications",
+            "off",
+        ])
+        .unwrap();
+        assert!(matches!(
+            updated.command,
+            Some(Action::Sidechats {
+                command: SidechatsAction::Update {
+                    sidechat,
+                    pin: true,
+                    unpin: false,
+                    archive: true,
+                    unarchive: false,
+                    clear_charter: true,
+                    isolated: false,
+                    shared: true,
+                    notifications: Some(SidechatNotificationPreference::Off),
+                    ..
+                }
+            }) if sidechat == "morning-brief"
+        ));
+
+        let chat = Arguments::try_parse_from([
+            "beep-boop",
+            "chat",
+            "--sidechat",
+            "morning-brief",
+            "What changed overnight?",
+        ])
+        .unwrap();
+        assert!(matches!(
+            chat.command,
+            Some(Action::Chat {
+                prompt: Some(prompt),
+                sidechat: Some(sidechat),
+                ..
+            }) if prompt == "What changed overnight?" && sidechat == "morning-brief"
+        ));
+    }
+
     #[tokio::test]
     async fn native_usage_failure_preserves_its_code_without_provider_content() {
         use agent_cli::protocol::{ErrorCode, RuntimeCommand, RuntimeEventKind};

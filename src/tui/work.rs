@@ -351,6 +351,12 @@ fn render_work_item(item: &ActiveWorkItem, now_ms: u64, lines: &mut Vec<Line<'st
     if item.is_job {
         header.push(Span::styled(" [Job]", Style::default().fg(Color::Cyan)));
     }
+    if let Some(slug) = &item.sidechat_slug {
+        header.push(Span::styled(
+            format!(" [Side chat: {slug}]"),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
     if let Some(host) = &item.host {
         header.push(Span::styled(format!(" @{host}"), dim));
     }
@@ -475,6 +481,7 @@ mod tests {
                     status: ActiveWorkStatus::Running,
                     host: Some("workstation".into()),
                     is_job: false,
+                    sidechat_slug: None,
                     detail: Some("exec: cargo test".into()),
                     started_at: Some(now_ms - 90_000),
                     tools: Some(vec!["exec: cargo test".into()]),
@@ -496,6 +503,7 @@ mod tests {
                     status: ActiveWorkStatus::WaitingOwner,
                     host: None,
                     is_job: false,
+                    sidechat_slug: None,
                     detail: Some("Approve release v2".into()),
                     started_at: Some(now_ms - 15_000),
                     tools: None,
@@ -509,6 +517,7 @@ mod tests {
                     status: ActiveWorkStatus::WaitingExternal,
                     host: None,
                     is_job: true,
+                    sidechat_slug: Some("morning-brief".into()),
                     detail: Some("Waiting on mail sync".into()),
                     started_at: Some(now_ms - 7_200_000),
                     tools: None,
@@ -562,6 +571,10 @@ mod tests {
         assert!(rendered.contains("Needs you"), "{rendered}");
         assert!(rendered.contains("[Job]"), "{rendered}");
         assert!(
+            rendered.contains("[Side chat: morning-brief]"),
+            "{rendered}"
+        );
+        assert!(
             rendered.contains("+3 additional nested tasks omitted"),
             "{rendered}"
         );
@@ -583,6 +596,7 @@ mod tests {
                 status: ActiveWorkStatus::Running,
                 host: None,
                 is_job: false,
+                sidechat_slug: None,
                 detail: None,
                 started_at: None,
                 tools: None,

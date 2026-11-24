@@ -2561,7 +2561,7 @@
           ]
         },
         {
-          "description": "Main-only local controls. Never submits a composer input.",
+          "description": "Main or sidechat local controls. Never submits a composer input.",
           "type": "object",
           "properties": {
             "catalog": {
@@ -2578,6 +2578,12 @@
                 }
               ]
             },
+            "conversation_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "type": {
               "type": "string",
               "const": "settings"
@@ -2591,6 +2597,252 @@
         {
           "type": "object",
           "properties": {
+            "include_archived": {
+              "type": "boolean",
+              "default": false
+            },
+            "type": {
+              "type": "string",
+              "const": "list_sidechats"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "charter": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "handoff": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "isolated": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "notifications": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SidechatNotificationPreference"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "seed": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReplyReference"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "slug": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "title": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "create_sidechat"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "title"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "archived": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "charter": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "clear_charter": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "conversation_id": {
+              "type": "string"
+            },
+            "isolated": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "notifications": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SidechatNotificationPreference"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "pinned": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "slug": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "update_sidechat"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "conversation_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "input_ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "observe_sidechat"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "conversation_id",
+            "input_ids"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "attachments": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "$ref": "#/$defs/AttachmentRef"
+              }
+            },
+            "conversation_id": {
+              "type": "string"
+            },
+            "input_id": {
+              "type": "string"
+            },
+            "mode": {
+              "$ref": "#/$defs/InputMode"
+            },
+            "origin": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/InputOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reply_to": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReplyReference"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "sidechat_input"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "conversation_id",
+            "input_id",
+            "text",
+            "mode"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "sidechat_interrupt"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "conversation_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "agent_id": {
               "type": [
                 "string",
@@ -2599,6 +2851,12 @@
             },
             "call_id": {
               "type": "string"
+            },
+            "conversation_id": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "entry_id": {
               "type": "string"
@@ -2791,6 +3049,13 @@
           "properties": {
             "installation_id": {
               "type": "string"
+            },
+            "main_enabled": {
+              "description": "When `Some(false)`, keeps the token registered for sidechats with\nexplicit `on` alerts while muting Main and `inherit` sidechats.",
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "token": {
               "type": "string"
@@ -4002,6 +4267,257 @@
           ]
         },
         {
+          "description": "List standing topic side chats (pinned first, then recently updated).",
+          "type": "object",
+          "properties": {
+            "include_archived": {
+              "type": "boolean",
+              "default": false
+            },
+            "type": {
+              "type": "string",
+              "const": "list_sidechats"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "Create a fresh standing topic side chat (never a Pi conversation fork).",
+          "type": "object",
+          "properties": {
+            "charter": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "handoff": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "isolated": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "notifications": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SidechatNotificationPreference"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "seed": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReplyReference"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "slug": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "title": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "create_sidechat"
+            }
+          },
+          "required": [
+            "type",
+            "title"
+          ]
+        },
+        {
+          "description": "Update metadata, pin state, archive state, charter, isolation, or alerts on a side chat.",
+          "type": "object",
+          "properties": {
+            "archived": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "charter": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "clear_charter": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "conversation_id": {
+              "type": "string"
+            },
+            "isolated": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "notifications": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SidechatNotificationPreference"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "pinned": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "slug": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "update_sidechat"
+            }
+          },
+          "required": [
+            "type",
+            "conversation_id"
+          ]
+        },
+        {
+          "description": "Long-lived, snapshot-to-live observation of a standing side chat.",
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "input_ids": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "observe_sidechat"
+            }
+          },
+          "required": [
+            "type",
+            "conversation_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "detach_sidechat"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "Admit a message into a standing side chat using durable request identity.",
+          "type": "object",
+          "properties": {
+            "attachments": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "$ref": "#/$defs/AttachmentRef"
+              }
+            },
+            "context": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/MainInputContext"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "conversation_id": {
+              "type": "string"
+            },
+            "input": {
+              "type": "string"
+            },
+            "input_id": {
+              "type": "string"
+            },
+            "mode": {
+              "$ref": "#/$defs/InputMode"
+            },
+            "origin": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/InputOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reply_to": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReplyReference"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "sidechat_input"
+            }
+          },
+          "required": [
+            "type",
+            "conversation_id",
+            "input_id",
+            "input",
+            "mode"
+          ]
+        },
+        {
           "description": "Observe a saved conversation without claiming its execution.",
           "type": "object",
           "properties": {
@@ -4210,6 +4726,12 @@
             },
             "call_id": {
               "type": "string"
+            },
+            "conversation_id": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "entry_id": {
               "type": "string"
@@ -4726,6 +5248,13 @@
         "cwd": {
           "type": "string"
         },
+        "delivery_sidechat": {
+          "description": "Optional target side chat (by slug or conversation ID) where job\nbriefings and updates land instead of Main.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "id": {
           "$ref": "#/$defs/JobId"
         },
@@ -4768,6 +5297,26 @@
       "enum": [
         "semantic",
         "keyword"
+      ]
+    },
+    "SidechatNotificationPreference": {
+      "description": "Per-sidechat APNs push notification override.",
+      "oneOf": [
+        {
+          "description": "Follow the device's Main chat notification preference.",
+          "type": "string",
+          "const": "inherit"
+        },
+        {
+          "description": "Always push alerts for this side chat while the device has push permission.",
+          "type": "string",
+          "const": "on"
+        },
+        {
+          "description": "Suppress push alerts for this side chat even when Main alerts are enabled.",
+          "type": "string",
+          "const": "off"
+        }
       ]
     },
     "SourceBatch": {

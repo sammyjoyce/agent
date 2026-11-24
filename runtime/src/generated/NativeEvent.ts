@@ -11,6 +11,7 @@ import type { NativeJobStatus } from "./NativeJobStatus.js";
 import type { NativeSettingsSnapshot } from "./NativeSettingsSnapshot.js";
 import type { NotificationStatus } from "./NotificationStatus.js";
 import type { SavedConversation } from "./SavedConversation.js";
+import type { SidechatSummary } from "./SidechatSummary.js";
 import type { SlashCommand } from "./SlashCommand.js";
 import type { SourceState } from "./SourceState.js";
 import type { TaskGraphSnapshot } from "./TaskGraphSnapshot.js";
@@ -24,7 +25,7 @@ input_origins?: boolean,
 /**
  * The origins a submit may carry on this connection. Missing: use `input_origins`.
  */
-accepted_input_origins?: Array<string>, conversation_settings?: boolean, work_inspection?: boolean, active_work?: boolean, dreams?: boolean, working?: boolean, conversation_id: string, model: string, } | { "type": "task_graph", graph: TaskGraphSnapshot, } | { "type": "history", messages: Array<HistoryMessage>, next_cursor: string | null, page_complete: boolean, } | { "type": "sources", sources: Array<SourceState>, } | { "type": "conversations", items: Array<SavedConversation>, next_cursor: string | null, } | { "type": "working", working: boolean, } | { "type": "tool_details", details: ToolDetails, } | { "type": "message", message: HistoryMessage, } | { "type": "answer", entry_id: string | null, text: string, } | { "type": "text_delta", text: string, } | { "type": "activity", activity: ModelActivity, } | { "type": "accepted", input_id: string, work?: InputWorkState, } | { "type": "placed", input_id: string, entry_id: string, } | { "type": "rejected", input_id: string, message: string, } | { "type": "notice", text: string,
+accepted_input_origins?: Array<string>, conversation_settings?: boolean, work_inspection?: boolean, active_work?: boolean, dreams?: boolean, sidechats?: boolean, sidechat?: SidechatSummary, working?: boolean, conversation_id: string, model: string, } | { "type": "task_graph", graph: TaskGraphSnapshot, } | { "type": "history", messages: Array<HistoryMessage>, next_cursor: string | null, page_complete: boolean, } | { "type": "sources", sources: Array<SourceState>, } | { "type": "conversations", items: Array<SavedConversation>, next_cursor: string | null, } | { "type": "sidechat", sidechat: SidechatSummary, } | { "type": "sidechats", items: Array<SidechatSummary>, } | { "type": "working", working: boolean, } | { "type": "tool_details", details: ToolDetails, } | { "type": "message", message: HistoryMessage, } | { "type": "answer", entry_id: string | null, text: string, } | { "type": "text_delta", text: string, } | { "type": "activity", activity: ModelActivity, } | { "type": "accepted", input_id: string, work?: InputWorkState, } | { "type": "placed", input_id: string, entry_id: string, } | { "type": "rejected", input_id: string, message: string, } | { "type": "notice", text: string,
 /**
  * Additive to the legacy notice shape, so older observers still decode it.
  */

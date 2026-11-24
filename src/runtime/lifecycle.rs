@@ -6,6 +6,7 @@ use crate::protocol::{HostCommand, RuntimeCommand};
 pub enum View {
     Main,
     MainObserver,
+    Sidechat,
     Conversation,
     TaskGraph,
 }
@@ -33,6 +34,7 @@ impl RequestLifecycle {
             },
             RuntimeCommand::AttachMain => Self::View(View::Main),
             RuntimeCommand::ObserveMain { .. } => Self::View(View::MainObserver),
+            RuntimeCommand::ObserveSidechat { .. } => Self::View(View::Sidechat),
             RuntimeCommand::AttachConversation { .. } => Self::View(View::Conversation),
             RuntimeCommand::WatchTaskGraph => Self::View(View::TaskGraph),
             RuntimeCommand::RunBackground { .. } => Self::Background,
@@ -45,6 +47,7 @@ impl RequestLifecycle {
             | RuntimeCommand::SubmitInput { .. }
             | RuntimeCommand::DetachWorker
             | RuntimeCommand::DetachMain
+            | RuntimeCommand::DetachSidechat
             | RuntimeCommand::DetachConversation
             | RuntimeCommand::DetachTaskGraph
             | RuntimeCommand::Interrupt
@@ -75,6 +78,10 @@ impl RequestLifecycle {
             | RuntimeCommand::ListTasks
             | RuntimeCommand::ReadTaskGraph
             | RuntimeCommand::ListConversations { .. }
+            | RuntimeCommand::ListSidechats { .. }
+            | RuntimeCommand::CreateSidechat { .. }
+            | RuntimeCommand::UpdateSidechat { .. }
+            | RuntimeCommand::SidechatInput { .. }
             | RuntimeCommand::ConversationInput { .. }
             | RuntimeCommand::ConversationInterrupt { .. }
             | RuntimeCommand::ListResources
@@ -154,6 +161,7 @@ impl RequestLifecycle {
         match self {
             Self::Worker { interactive: true } => Some(RuntimeCommand::DetachWorker),
             Self::View(View::Main | View::MainObserver) => Some(RuntimeCommand::DetachMain),
+            Self::View(View::Sidechat) => Some(RuntimeCommand::DetachSidechat),
             Self::View(View::Conversation) => Some(RuntimeCommand::DetachConversation),
             Self::View(View::TaskGraph) => Some(RuntimeCommand::DetachTaskGraph),
             _ => None,

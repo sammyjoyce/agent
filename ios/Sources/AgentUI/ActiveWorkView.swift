@@ -81,7 +81,8 @@ struct ActiveWorkStrip: View {
       .padding(.horizontal, 16)
       .padding(.vertical, 8)
       .frame(maxWidth: .infinity, alignment: .leading)
-      .background(.background)
+      .contentShape(Rectangle())
+      .background(.background, ignoresSafeAreaEdges: [])
     }
     .buttonStyle(.plain)
     .overlay(alignment: .bottom) { Divider() }
@@ -101,6 +102,7 @@ extension ActiveWorkStatus {
 
 struct ActiveWorkSheet: View {
   let model: ChatModel
+  var openSidechat: ((ProfileID, String) -> Void)? = nil
   @Environment(\.dismiss) private var dismiss
   @State private var inspection: ActiveWorkInspectionTarget?
 
@@ -120,20 +122,24 @@ struct ActiveWorkSheet: View {
           if !runningItems.isEmpty {
             Section("Running") {
               ForEach(runningItems) { row in
-                ActiveWorkRowButtons(row: row, showLaneName: model.namesLanes) {
-                  lane, conversation in
-                  inspection = ActiveWorkInspectionTarget(lane: lane, conversation: conversation)
-                }
+                ActiveWorkRowButtons(
+                  row: row, showLaneName: model.namesLanes,
+                  openSidechat: openSidechat,
+                  inspect: { lane, conversation in
+                    inspection = ActiveWorkInspectionTarget(lane: lane, conversation: conversation)
+                  })
               }
             }
           }
           if !waitingItems.isEmpty {
             Section("Waiting") {
               ForEach(waitingItems) { row in
-                ActiveWorkRowButtons(row: row, showLaneName: model.namesLanes) {
-                  lane, conversation in
-                  inspection = ActiveWorkInspectionTarget(lane: lane, conversation: conversation)
-                }
+                ActiveWorkRowButtons(
+                  row: row, showLaneName: model.namesLanes,
+                  openSidechat: openSidechat,
+                  inspect: { lane, conversation in
+                    inspection = ActiveWorkInspectionTarget(lane: lane, conversation: conversation)
+                  })
               }
             }
           }
@@ -168,11 +174,16 @@ struct ActiveWorkSheet: View {
 private struct ActiveWorkRowButtons: View {
   let row: ActiveWorkRow
   let showLaneName: Bool
+  let openSidechat: ((ProfileID, String) -> Void)?
   let inspect: (ProfileID, SavedConversation) -> Void
 
   var body: some View {
     Button {
-      inspect(row.lane, row.inspectionTarget)
+      if row.item.sidechatSlug != nil, let openSidechat {
+        openSidechat(row.lane, row.item.conversationId)
+      } else {
+        inspect(row.lane, row.inspectionTarget)
+      }
     } label: {
       HStack(spacing: 8) {
         ActiveWorkRowContent(row: row, showLaneName: showLaneName)
@@ -236,7 +247,13 @@ private struct ActiveWorkRowContent: View {
           Text(row.item.title)
             .font(.subheadline.weight(.medium))
             .lineLimit(1)
-          if row.item.isJob {
+          if row.item.sidechatSlug != nil {
+            Text("Side chat")
+              .font(.caption2.weight(.semibold))
+              .padding(.horizontal, 5)
+              .padding(.vertical, 1)
+              .background(.secondary.opacity(0.15), in: Capsule())
+          } else if row.item.isJob {
             Text("Job")
               .font(.caption2.weight(.semibold))
               .padding(.horizontal, 5)

@@ -107,6 +107,7 @@ enum Update {
     ChooseConversation {
         choices: Vec<SavedConversation>,
         query: String,
+        sidechats: bool,
         reply: tokio::sync::oneshot::Sender<Option<String>>,
     },
     ResetConversation(TuiInfo),
@@ -211,10 +212,26 @@ impl TuiHandle {
         choices: Vec<SavedConversation>,
         initial_query: String,
     ) -> Result<Option<String>> {
+        self.choose_with_kind(choices, initial_query, false).await
+    }
+    pub async fn choose_sidechat(
+        &self,
+        choices: Vec<SavedConversation>,
+        initial_query: String,
+    ) -> Result<Option<String>> {
+        self.choose_with_kind(choices, initial_query, true).await
+    }
+    async fn choose_with_kind(
+        &self,
+        choices: Vec<SavedConversation>,
+        initial_query: String,
+        sidechats: bool,
+    ) -> Result<Option<String>> {
         let (reply, selection) = tokio::sync::oneshot::channel();
         self.send(Update::ChooseConversation {
             choices,
             query: initial_query,
+            sidechats,
             reply,
         })?;
         selection.await.context("The conversation picker closed")
@@ -1646,12 +1663,20 @@ impl State {
         &mut self,
         choices: Vec<SavedConversation>,
         query: String,
+        sidechats: bool,
         reply: tokio::sync::oneshot::Sender<Option<String>>,
     ) {
-        self.picker = Some(ConversationPicker::new(choices, query, reply));
+        let labels = if sidechats {
+            conversations::PickerLabels::SIDECHATS
+        } else {
+            conversations::PickerLabels::CONVERSATIONS
+        };
+        self.picker = Some(ConversationPicker::new(choices, query, labels, reply));
         self.changed = true;
     }
     fn reset_conversation(&mut self, info: TuiInfo) {
+        // The task graph watch is coordinator-wide and emits only on change,
+        // so switching conversations must keep the last work snapshot and stream state intact.
         let snapshot = self.work.take_snapshot();
         let stream = self.work.stream();
         *self = Self::new(info);
@@ -3055,9 +3080,10 @@ fn run(
                 Ok(Update::ChooseConversation {
                     choices,
                     query,
+                    sidechats,
                     reply,
                 }) => {
-                    state.choose_conversation(choices, query, reply);
+                    state.choose_conversation(choices, query, sidechats, reply);
                 }
                 Ok(Update::ResetConversation(info)) => {
                     screen.reset()?;
@@ -3514,7 +3540,7 @@ mod tests {
         view.input(Event::Paste("Keep this unsent draft".into()));
         view.working(true);
         let (reply, mut selected) = tokio::sync::oneshot::channel();
-        view.choose_conversation(Vec::new(), String::new(), reply);
+        view.choose_conversation(Vec::new(), String::new(), false, reply);
         assert_eq!(view.input(key(KeyCode::Esc, KeyModifiers::NONE)), None);
         assert!(view.picker.is_none());
         assert!(view.working);
@@ -6550,6 +6576,7 @@ mod tests {
                         summary: String::new(),
                         model: None,
                         scheduled_run: None,
+                        delivery_conversation_id: None,
                         state: TaskState::Open,
                         worker: WorkerState::Unassigned,
                         sources: vec![],
@@ -6599,6 +6626,7 @@ mod tests {
                         summary: String::new(),
                         model: None,
                         scheduled_run: None,
+                        delivery_conversation_id: None,
                         state: TaskState::Waiting {
                             actor: "user".into(),
                             next_check: None,
@@ -6732,6 +6760,7 @@ mod tests {
                 status: crate::protocol::ActiveWorkStatus::Running,
                 host: None,
                 is_job: false,
+                sidechat_slug: None,
                 detail: None,
                 started_at: None,
                 tools: None,
@@ -6817,6 +6846,7 @@ mod tests {
                         status: crate::protocol::ActiveWorkStatus::Running,
                         host: Some("workstation".into()),
                         is_job: false,
+                        sidechat_slug: None,
                         detail: Some("exec: rg --files".into()),
                         started_at: None,
                         tools: Some(vec!["exec: rg --files".into()]),
@@ -6830,6 +6860,7 @@ mod tests {
                         status: crate::protocol::ActiveWorkStatus::WaitingOwner,
                         host: None,
                         is_job: false,
+                        sidechat_slug: None,
                         detail: Some("Confirm merge".into()),
                         started_at: None,
                         tools: None,
@@ -6861,5 +6892,52 @@ mod tests {
                 .is_none()
         );
         assert!(!view.work.is_open());
+    }
+
+    #[test]
+    fn reset_conversation_preserves_work_panel_snapshot_for_running_sidechat() {
+        let mut view = State::new(TuiInfo {
+            title: "Demo Car".into(),
+            model: Some(ModelSelection::default()),
+            cwd: "/workspace".into(),
+        });
+        view.event(RuntimeEventKind::TaskGraph {
+            graph: crate::protocol::TaskGraphSnapshot {
+                nodes: vec![],
+                conversations: vec![],
+                omitted: 0,
+                work: vec![crate::protocol::ActiveWorkItem {
+                    id: "sidechat:42".into(),
+                    task_id: None,
+                    conversation_id: "42".into(),
+                    title: "Demo Car".into(),
+                    status: crate::protocol::ActiveWorkStatus::Running,
+                    host: None,
+                    is_job: false,
+                    sidechat_slug: Some("car".into()),
+                    detail: Some("exec: rg".into()),
+                    started_at: None,
+                    tools: Some(vec!["exec: rg".into()]),
+                    children: None,
+                }],
+            },
+        });
+        view.work.open();
+        view.reset_conversation(TuiInfo {
+            title: "Main agent".into(),
+            model: Some(ModelSelection::default()),
+            cwd: "/workspace".into(),
+        });
+        assert!(!view.work.is_open());
+        let footer: String = view
+            .work
+            .footer_spans()
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect();
+        assert!(footer.contains("1 running (Ctrl+G)"), "{footer}");
+        view.work.open();
+        let screen = rendered(&mut view, 100, 20);
+        assert!(screen.contains("[Side chat: car]"), "{screen}");
     }
 }

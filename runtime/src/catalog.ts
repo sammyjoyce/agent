@@ -3,6 +3,7 @@ import { ROOT_CONVERSATION_ID, type CommitObservation, type Cursor, type EntryRe
 import type { SavedConversation } from "./generated/SavedConversation.js";
 import type { HistoryThread } from "./generated/HistoryThread.js";
 import type { TaskStore } from "./tasks.js";
+import type { SidechatStore } from "./sidechats.js";
 import { HistoryStore, ImportedThreadEntry } from "./history.js";
 
 type Anchor = { conversation_id: string; updated_at: number | null; exact: boolean };
@@ -48,7 +49,8 @@ export class ConversationCatalog {
   private loading: Promise<void> | undefined;
   private readonly commits: CommitObservation;
   private readonly unsubscribeClose: () => void;
-  constructor(private readonly session: Harness, private readonly histories: HistoryStore, private readonly tasks: TaskStore) {
+  constructor(private readonly session: Harness, private readonly histories: HistoryStore, private readonly tasks: TaskStore,
+    private readonly sidechats?: SidechatStore) {
     this.commits = session.observeCommits({ advance: (publication) => {
       for (const change of publication.changes) {
         if (change.type === "conversation" && change.value.id === ROOT_CONVERSATION_ID) this.root = true;
@@ -95,6 +97,7 @@ export class ConversationCatalog {
     const owner = only === undefined ? undefined : await this.tasks.findOwner(only);
     const tasks = only === undefined ? await this.tasks.list() : owner === undefined ? [] : [owner.task];
     for (const task of tasks) {
+      if (only === undefined && await this.tasks.isIsolatedTask(task)) continue;
       for (const actor of [task, ...task.agents]) {
         if (only !== undefined && actor.conversation_id !== only) continue;
         const saved = items.get(actor.conversation_id);
@@ -114,6 +117,8 @@ export class ConversationCatalog {
       for (const entry of tail.items) updated_at = latest(updated_at, messageTime(entry));
       return { conversation_id: id, title: "Main agent", updated_at, source_thread_id: null, task_id: null, agent_id: null, host: null };
     }
+    const sidechat = await this.sidechats?.get(id);
+    if (sidechat !== undefined) return this.sidechats?.savedConversation(sidechat);
     const saved = await this.histories.byConversation(id), items = new Map<string, SavedConversation>();
     if (saved !== undefined) items.set(id, imported(id, saved.thread));
     await this.includeTasks(items, id);
@@ -124,12 +129,21 @@ export class ConversationCatalog {
     const search = key(query), after = cursor === null ? undefined : decode(cursor, search);
     await this.seed();
     const items = new Map(this.imported);
+    const sidechatSlugs = new Map<string, string>();
     if (this.root) items.set(ROOT_CONVERSATION_ID.toString(), { conversation_id: ROOT_CONVERSATION_ID.toString(), title: "Main agent",
       updated_at: this.rootUpdatedAt, source_thread_id: null, task_id: null, agent_id: null, host: null });
+    if (this.sidechats !== undefined) {
+      for (const sidechat of await this.sidechats.list(true)) {
+        if (sidechat.isolated) continue;
+        items.set(sidechat.conversation_id, this.sidechats.savedConversation(sidechat));
+        sidechatSlugs.set(sidechat.conversation_id, sidechat.slug);
+      }
+    }
     await this.includeTasks(items);
     const matches: Candidate[] = [];
     for (const item of items.values()) {
-      const identities = [item.conversation_id, item.agent_id, item.source_thread_id,
+      const slug = sidechatSlugs.get(item.conversation_id);
+      const identities = [item.conversation_id, item.agent_id, item.source_thread_id, slug ?? null,
         ...(item.agent_id === null ? [item.task_id] : [])].filter((id) => id !== null).map(key);
       const identifiers = [...identities, ...(item.task_id === null ? [] : [key(item.task_id)])];
       const exact = search.length > 0 && identities.includes(search);

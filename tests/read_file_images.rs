@@ -124,6 +124,7 @@ fn job(id: &str, prompt: &str, directory: &Path, model: ModelSelection) -> Sched
         model,
         timezone: "Etc/UTC".to_owned().try_into().unwrap(),
         cwd: directory.to_string_lossy().into_owned(),
+        delivery_sidechat: None,
         revision: "fixture".into(),
         schedules: vec![JobSchedule {
             id: "daily".to_owned().try_into().unwrap(),

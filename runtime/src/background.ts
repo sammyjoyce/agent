@@ -73,6 +73,7 @@ function occurrenceId(value: BackgroundTriggerKey, scheduledAt: number): string 
 function revision(job: ScheduledJob, schedule: JobSchedule): string {
   return createHash("sha256").update(JSON.stringify([job.id, job.title, job.prompt,
     job.model.provider, job.model.model_id, job.model.reasoning, job.model.fast, job.timezone, job.cwd,
+    job.delivery_sidechat ?? null,
     schedule.id, schedule.recurrence, schedule.focus, schedule.prompt])).digest("hex");
 }
 function selectedSchedule(job: ScheduledJob, request: Extract<RuntimeCommand, { type: "run_job" }>): JobSchedule {

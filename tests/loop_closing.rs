@@ -600,6 +600,7 @@ fn job(world: &World, standing: &Standing) -> ScheduledJob {
         model: ModelSelection::default(),
         timezone: "Etc/UTC".to_owned().try_into().unwrap(),
         cwd: world.host.to_string_lossy().into_owned(),
+        delivery_sidechat: None,
         revision: "fixture".into(),
         schedules: vec![JobSchedule {
             id: "daily".to_owned().try_into().unwrap(),
@@ -1444,7 +1445,7 @@ const DECOY_ROLE: &str = "decoy";
 const TRIAGE_ROLE: &str = "triage";
 const MAIN_ROLE: &str = "main";
 const ANY_NUMBER: RangeInclusive<usize> = 0..=usize::MAX;
-const KNOWN_DOCUMENTS: [&str; 34] = [
+const KNOWN_DOCUMENTS: [&str; 40] = [
     "agent.background",
     "agent.compaction.parts",
     "agent.delegation.receipts",
@@ -1455,6 +1456,11 @@ const KNOWN_DOCUMENTS: [&str; 34] = [
     "agent.notice_lineage",
     "agent.notifications",
     "agent.resources",
+    "agent.sidechat.directory",
+    "agent.sidechat.membership",
+    "agent.sidechat.notice_context.held",
+    "agent.sidechat.pages",
+    "agent.sidechat.records",
     "agent.source.control",
     "agent.source.event.directory",
     "agent.source.event.membership",
@@ -1464,6 +1470,7 @@ const KNOWN_DOCUMENTS: [&str; 34] = [
     "agent.source.related",
     "agent.task.directory",
     "agent.task.membership",
+    "agent.task.owner_wait",
     "agent.task.owners",
     "agent.task.pages",
     "agent.task.records",

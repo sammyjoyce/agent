@@ -186,6 +186,27 @@ host follows.
 
 ## Tasks and execution
 
+Standing **side chats** are fresh, ownerless Pi conversations (never conversation
+forks) dedicated to ongoing topics alongside the main conversation. Each side
+chat keeps a keyed metadata record (`agent.sidechat`) with a unique slug, title,
+optional standing charter instructions, pinned/archived state, optional retrieval
+isolation (`isolated`), optional seed reference/handoff note, and a per-topic
+push-notification preference (`inherit`, `on` or `off`). By default a side chat
+shares hybrid search and catalog visibility with Main and tasks; setting
+`isolated = true` is a search and catalog boundary only — it excludes the side
+chat, its delegated tasks, and their child agents from cross-conversation search
+and the conversation catalog and purges its indexed chunks. Direct transcript
+reads by ID (`read_task`), listing the side chat's title, charter, and seed
+(`list_sidechats`), switching isolation off from another chat
+(`update_sidechat`), and normal owner client access and push notifications remain
+allowed. Tasks delegated from a side chat record `delivery_conversation_id` so
+routine worker updates and `notify_user` land back in that side chat
+(auto-unarchiving it when needed), while blocking questions waiting on the owner
+(`waiting` with `target: "owner"`) and calls with `escalate_to_main` are passed
+up to Main. Scheduled jobs may likewise set `delivery_sidechat` to route output
+into a standing topic, automatically unarchiving an archived target or falling
+back to Main with a warning if the target no longer exists.
+
 Task metadata and source-event bodies live in independently keyed Pi documents.
 Small directories and indexes locate owners and related versions. Startup
 migrates legacy records in resumable batches before accepting work, retaining

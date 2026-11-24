@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { AttachmentStore, AttachmentError, validateInput } from "./attachments.js";
 import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { createRegistry, Harness, ROOT_CONVERSATION_ID, type Conversation, type Storage, type Submission } from "@earendil-works/pi-durable";
+import { AssistantEntry, createRegistry, Harness, ROOT_CONVERSATION_ID, type Conversation, type Storage, type Submission } from "@earendil-works/pi-durable";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import type { RuntimeRequest } from "./generated/RuntimeRequest.js";
 import type { RuntimeEvent } from "./generated/RuntimeEvent.js";
@@ -34,9 +34,11 @@ import { createGoalTools, GoalStore } from "./goals.js";
 import { applyToolSurfaces, createToolDiscovery, createToolsets, TOOL_SURFACES, withActorPolicies, type ToolDiscovery, type Toolsets } from "./toolsets.js";
 import { createSourceTools, SourceJournal } from "./sources.js";
 import { createResourceTools, ResourceStore } from "./resources.js";
+import { createSidechatTools, sidechatInstructions, SidechatStore } from "./sidechats.js";
 import { BrowserStore, createBrowserTools } from "./browser.js";
 import { activity, history, toolDetails } from "./transcript.js";
 import type { SearchMode } from "./generated/SearchMode.js";
+import type { SidechatSummary } from "./generated/SidechatSummary.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import { conversationSettings } from "./settings.js";
 import { createInputOrigins, INPUT_ORIGIN_CAPABILITIES } from "./input_origin.js";
@@ -105,6 +107,8 @@ function emit(id: number, event: RuntimeEventKind): void {
   if (event.type !== "done") {
     const observer = mainObservers.get(id);
     if (observer !== undefined) { observer.publish(event); return; }
+    const sidechatObserver = sidechatObservers.get(id);
+    if (sidechatObserver !== undefined) { sidechatObserver.observation.publish(event); return; }
     if (conversationViews.publish(id, event)) return;
   }
   writeEvent(id, event);
@@ -118,25 +122,33 @@ function encodeEvent(id: number, event: RuntimeEventKind): { event: RuntimeEvent
     message: "The response exceeds the protocol size limit. Saved state is retained." };
   return { event: failure, wire: JSON.stringify({ version: VERSION, id, event: failure } satisfies RuntimeEvent) + "\n" };
 }
+function publishToObservers(conversationId: string, event: RuntimeEventKind): void {
+  if (conversationId === ROOT_CONVERSATION_ID.toString()) {
+    for (const observer of mainObservers.values()) observer.publish(event);
+  } else {
+    for (const observer of sidechatObservers.values()) {
+      if (observer.conversationId === conversationId) observer.observation.publish(event);
+    }
+  }
+}
 function writeEvent(id: number, event: RuntimeEventKind): void {
-  const write = event.type !== "text_delta" || mainObservers.has(id);
+  const write = event.type !== "text_delta" || mainObservers.has(id) || sidechatObservers.has(id);
   const encoded = encodeEvent(id, event);
   if (encoded.event !== event) {
     // End only the view that cannot receive its snapshot; model execution and
     // durable inputs retain their existing owner.
-    mainObservers.get(id)?.close(); taskGraphObservers.get(id)?.close(); conversationViews.detach(id); mainViews.get(id)?.finish();
+    mainObservers.get(id)?.close(); taskGraphObservers.get(id)?.close(); sidechatObservers.get(id)?.observation.close(); conversationViews.detach(id); mainViews.get(id)?.finish();
   }
   event = encoded.event;
-  if (event.type === "main_ready" || event.type === "task_ready" || event.type === "conversation_ready" || event.type === "worker_ready" || event.type === "done") admissions.delete(id);
-  // Text deltas are an ObserveMain opt-in. Existing Chat clients deserialize a
-  // closed event enum and must keep receiving their original canonical wire.
+  if (event.type === "main_ready" || event.type === "sidechat_ready" || event.type === "task_ready" || event.type === "conversation_ready" || event.type === "worker_ready" || event.type === "done") admissions.delete(id);
+  // Text deltas are an ObserveMain/ObserveSidechat opt-in. Existing Chat clients
+  // deserialize a closed event enum and must keep receiving their original canonical wire.
   if (write) process.stdout.write(encoded.wire);
-  if (mainTurns.has(id)) {
-    for (const observer of mainObservers.values()) {
-      const update = event.type === "done" ? { type: "worker_idle" } satisfies RuntimeEventKind : event;
-      if (["main_ready", "text_delta", "activity", "message", "answer", "input_accepted", "input_placed", "input_rejected", "interrupted", "failure", "conversation_settings", "worker_idle"].includes(update.type)) {
-        observer.publish(update);
-      }
+  const turn = activeTurns.get(id);
+  if (turn !== undefined) {
+    const update = event.type === "done" ? { type: "worker_idle" } satisfies RuntimeEventKind : event;
+    if (["main_ready", "sidechat_ready", "text_delta", "activity", "message", "answer", "input_accepted", "input_placed", "input_rejected", "interrupted", "failure", "conversation_settings", "worker_idle"].includes(update.type)) {
+      publishToObservers(turn.conversationId, update);
     }
   }
   for (const [viewId, view] of mainViews) {
@@ -179,7 +191,7 @@ function backgroundCall(command: import("./generated/HostCommand.js").HostComman
   return hostRequests.call(backgroundOwner, command, signal);
 }
 
-type Application = TriageApplication & { stopInputDelivery(): void; harness: Harness; tasks: TaskStore; resources: ResourceStore; notifications: Notifications;
+type Application = TriageApplication & { stopInputDelivery(): void; harness: Harness; tasks: TaskStore; sidechats: SidechatStore; resources: ResourceStore; notifications: Notifications;
   histories: HistoryStore; catalog: ConversationCatalog; attachments: AttachmentStore; feedback: FeedbackStore; repairs: FeedbackDispatcher; background: BackgroundScheduler;
   telemetry: DiagnosticsTelemetry; startup: StartupDiagnostics; discovery: ToolDiscovery; serviceExecution: ActorExecution; goals: GoalStore };
 async function openApplication(): Promise<Application> {
@@ -194,24 +206,28 @@ async function openApplication(): Promise<Application> {
   } catch (error) { await telemetry.close(); throw error; }
   const discovery = createToolDiscovery();
   try { return await startup.run("application_recovery", async () => {
-  const notifications = new Notifications(harness, registry, notificationConfig(), undefined, effectGate(ownership));
+  const sidechats = new SidechatStore(harness);
+  const notifications = new Notifications(harness, registry, notificationConfig(), undefined, effectGate(ownership), sidechats);
   const tasks = new TaskStore(harness, inference);
+  tasks.useSidechats(sidechats);
   await startup.run("task_migration", () => tasks.prepare());
   const files = retainedFiles();
   const attachments = new AttachmentStore(files); tasks.useAttachments(attachments);
   const environment = new CoordinatorEnvironment(harness); environment.useLiveGuidance(); tasks.useEnvironment(environment);
   const assets = join(state, "history", "assets");
   const histories = new HistoryStore(harness, assets); tasks.useHistory(histories);
-  const catalog = new ConversationCatalog(harness, histories, tasks);
+  const catalog = new ConversationCatalog(harness, histories, tasks, sidechats);
   const imports = new HistoryImports(harness, histories, files);
-  const retrieval = new Retrieval(harness, histories, tasks, join(state, "search.sqlite"));
+  const retrieval = new Retrieval(harness, histories, tasks, join(state, "search.sqlite"), sidechats);
   const feedback = new FeedbackStore(files, tasks);
   const repairs = new FeedbackDispatcher(feedback, tasks, environment);
   const executions = new Executions();
   await executions.prepareRecovery(harness);
   const sources = new SourceJournal(harness, tasks, executions);
+  sources.useSidechats(sidechats);
   await startup.run("source_migration", () => sources.prepare());
   const tools = createAppTools(tasks, executions);
+  const sidechatTools = createSidechatTools(sidechats, tasks, harness, executions);
   const guidance = createGuidance(executions); registry.install(guidance);
   const inputOrigins = createInputOrigins(harness); registry.install(inputOrigins);
   const sourceTools = createSourceTools(sources, executions);
@@ -224,25 +240,25 @@ async function openApplication(): Promise<Application> {
   registry.install(tools.legacy);
   registry.install(tools.worker);
   registry.install(tools.agent);
+  registry.install(sidechatTools);
   registry.install(sourceTools.main);
   registry.install(sourceTools.worker);
   registry.install(resourceTools.main);
   registry.install(resourceTools.worker);
   registry.install(browserTools);
   const stopInputDelivery = watchInputDelivery(harness, (conversationId, event) => {
-    let mirroredToMain = false;
+    let mirroredToObservers = false;
     for (const [id, conversation] of activeConversations) {
       if (conversation.id.toString() !== conversationId || ending.has(id)) continue;
       emit(id, event);
-      mirroredToMain ||= mainTurns.has(id);
+      const turn = activeTurns.get(id);
+      mirroredToObservers ||= turn !== undefined && turn.conversationId === conversationId;
     }
-    // A recovered generation can outlive its transport owner. Native main
-    // observers still need its terminal receipts, exactly once per commit.
-    if (conversationId === ROOT_CONVERSATION_ID.toString() && !mirroredToMain) {
-      for (const observer of mainObservers.values()) observer.publish(event);
-    }
+    // A recovered generation can outlive its transport owner. Native observers
+    // still need its terminal receipts, exactly once per commit.
+    if (!mirroredToObservers) publishToObservers(conversationId, event);
   });
-  const core = { stopInputDelivery, harness, tasks, environment, executions, sources, resources, histories, catalog, imports, retrieval, attachments, feedback, repairs, notifications, telemetry };
+  const core = { stopInputDelivery, harness, tasks, sidechats, environment, executions, sources, resources, histories, catalog, imports, retrieval, attachments, feedback, repairs, notifications, telemetry };
   const background = new BackgroundScheduler(harness, registry, tasks, {
     ready: waitForBackground,
     async plan(cadence, after, now, signal) {
@@ -286,13 +302,13 @@ async function openApplication(): Promise<Application> {
       signal.throwIfAborted(); await retrieval.sync((command) => backgroundCall(command, signal), false, signal);
     },
     jobActor: (job) => openJobActor(job, tasks),
-    async runJob(occurrence, signal, actor) { await runScheduled(occurrence, signal, { session: harness, tasks, sources }, actor); },
+    async runJob(occurrence, signal, actor) { await runScheduled(occurrence, signal, { session: harness, tasks, sources, sidechats }, actor); },
   });
   const jobTools = createJobTools(background, executions); registry.install(jobTools);
   const goals = new GoalStore(harness, tasks, environment);
   const goalTools = createGoalTools(goals, executions); registry.install(goalTools);
   const responsePolicy = createMainResponsePolicy(harness); registry.install(responsePolicy);
-  const { toolsets, installed } = applyToolSurfaces(withActorPolicies(createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools, goalTools }),
+  const { toolsets, installed } = applyToolSurfaces(withActorPolicies(createToolsets({ guidance, tools, sidechatTools, sourceTools, resourceTools, browserTools, jobTools, goalTools }),
     { responsePolicy, inputOrigins }), TOOL_SURFACES, discovery);
   for (const extension of installed) registry.install(extension);
   const dreams = createDreamsTools(harness, tasks, executions); registry.install(dreams);
@@ -326,8 +342,17 @@ const MAIN_CAPABILITIES = {
   ...INPUT_ORIGIN_CAPABILITIES,
   conversation_settings: true,
   active_work: true,
+  sidechats: true,
 } as const;
-let mainQueue = Promise.resolve();
+const conversationQueues = new Map<string, Promise<void>>();
+function enqueueConversationTurn<T>(conversationId: string, action: () => Promise<T>): Promise<T> {
+  const prior = conversationQueues.get(conversationId) ?? Promise.resolve();
+  const next = prior.then(action);
+  const tail = next.then(() => {}, () => {});
+  conversationQueues.set(conversationId, tail);
+  void tail.finally(() => { if (conversationQueues.get(conversationId) === tail) conversationQueues.delete(conversationId); });
+  return next;
+}
 const activeConversations = new Map<number, import("@earendil-works/pi-durable").Conversation>();
 const conversationViews = new ConversationViews(async () => ({ ...await app(), inference }),
   (request, conversation) => {
@@ -346,33 +371,40 @@ type TurnInput = {
   attachments?: AttachmentRef[];
   reply_to?: ReplyReference;
 };
-type MainTurn = { conversation?: Conversation; accepting: boolean; admissions: number; wake?: () => void;
+type ConversationTurn = { conversationId: string; kind: "main" | "sidechat"; conversation?: Conversation; accepting: boolean; admissions: number; wake?: () => void;
   info?: Extract<RuntimeEventKind, { type: "main_ready" }>;
   ready: Promise<boolean>; start(ready: boolean): void; inputs: { input_id?: string; submission: Submission }[] };
-function mainTurn(): MainTurn {
+function conversationTurn(conversationId: string, kind: "main" | "sidechat"): ConversationTurn {
   let start = (_ready: boolean) => {};
   const ready = new Promise<boolean>((resolve) => { start = resolve; });
-  return { ready, start, accepting: true, admissions: 0, inputs: [] };
+  return { conversationId, kind, ready, start, accepting: true, admissions: 0, inputs: [] };
 }
-function trackMainInput(turn: MainTurn, input: MainTurn["inputs"][number]): void {
+function trackTurnInput(turn: ConversationTurn, input: ConversationTurn["inputs"][number]): void {
   if (!turn.inputs.some((owned) => owned.submission.id === input.submission.id)) turn.inputs.push(input);
 }
 /** Reclaim native handles without changing their queued modes or placement.
  * A commit can precede its admitting sender's registration, so deduplicate by ID.
  */
-async function retainMainInputs(harness: Harness, root: Conversation, turn: MainTurn): Promise<void> {
+async function retainTurnInputs(harness: Harness, conversation: Conversation, turn: ConversationTurn): Promise<void> {
   for (const saved of (await harness.inspect(BACKGROUND_CONTEXT)).submissions) {
-    if (saved.conversationId !== root.id || saved.type !== "input" || saved.status !== "queued" && saved.status !== "placed" ||
+    if (saved.conversationId !== conversation.id || saved.type !== "input" || saved.status !== "queued" && saved.status !== "placed" ||
         turn.inputs.some((owned) => owned.submission.id === saved.id)) continue;
     const submission = await harness.submission(saved.id, BACKGROUND_CONTEXT);
     if (submission === undefined) throw new TaskError("An unfinished saved input could not be recovered; its original is retained");
-    trackMainInput(turn, { submission, ...(saved.requestId === undefined ? {} : { input_id: saved.requestId }) });
+    trackTurnInput(turn, { submission, ...(saved.requestId === undefined ? {} : { input_id: saved.requestId }) });
   }
 }
-const mainTurns = new Map<number, MainTurn>();
+const activeTurns = new Map<number, ConversationTurn>();
+function acceptingTurnFor(conversationId: string): number | undefined {
+  return [...activeTurns].find(([owner, turn]) => turn.conversationId === conversationId && turn.accepting && !ending.has(owner))?.[0];
+}
+function liveTurnFor(conversationId: string): [number, ConversationTurn] | undefined {
+  return [...activeTurns].find(([owner, turn]) => turn.conversationId === conversationId && !ending.has(owner));
+}
 const mainViews = new Map<number, { owner: number; live: boolean; finish(): void }>();
 const mainObservers = new Map<number, Observation>();
 const taskGraphObservers = new Map<number, Observation>();
+const sidechatObservers = new Map<number, { conversationId: string; observation: Observation }>();
 const inputControls = new Map<number, Set<Promise<void>>>();
 const ending = new Set<number>();
 
@@ -409,12 +441,14 @@ function observeTaskGraph(
   id: number,
   observer: Observation,
   tasks: TaskStore,
+  sidechats: SidechatStore,
   errorMessage: string,
 ): Promise<() => Promise<void>> {
   return watchTaskGraph(
     tasks,
     (graph) => observer.publish({ type: "task_graph", graph }),
     () => failure(id, "internal", errorMessage),
+    sidechats,
   );
 }
 
@@ -423,18 +457,18 @@ function submitInput(id: number, input: TurnInput, responseId = id): Promise<voi
     emit(responseId, { type: "input_rejected", input_id: input.input_id, message: "The turn ended before admission; retry this input." });
     return Promise.resolve();
   }
-  const worker = workers.get(id), main = mainTurns.get(id);
-  if (main !== undefined) main.admissions += 1;
+  const worker = workers.get(id), turn = activeTurns.get(id);
+  if (turn !== undefined) turn.admissions += 1;
   const operations = inputControls.get(id) ?? new Set<Promise<void>>(); inputControls.set(id, operations);
   const operation = (async () => {
     validateInput(input.input, input.attachments);
-    if (main !== undefined && !await main.ready) throw new TaskError("The turn could not start; this input was not accepted");
+    if (turn !== undefined && !await turn.ready) throw new TaskError("The turn could not start; this input was not accepted");
     const stopping = interrupts.get(id); await stopping;
     if (worker !== undefined) {
       if (worker.controller.signal.aborted) throw new TaskError("This worker is detaching");
       await (await app()).tasks.input(worker.command, input.input, input.input_id, input.mode, input.attachments, input.origin);
     } else {
-      if (main === undefined || !main.accepting || main.conversation === undefined) throw new TaskError("The turn has finished; this input was not accepted");
+      if (turn === undefined || !turn.accepting || turn.conversation === undefined) throw new TaskError("The turn has finished; this input was not accepted");
       if (interrupts.get(id) === stopping) {
         interrupts.delete(id); interrupted.delete(id); hostRequests.resumeRequest(id);
       }
@@ -442,23 +476,23 @@ function submitInput(id: number, input: TurnInput, responseId = id): Promise<voi
       const prepared = await application.attachments.input({
         text: input.input,
         ...(input.attachments === undefined ? {} : { attachments: input.attachments }),
-        call: application.executions.get(main.conversation.id.toString()).call,
+        call: application.executions.get(turn.conversation.id.toString()).call,
         ...(input.origin === undefined ? {} : { origin: input.origin }),
-        limits: application.tasks.inference.imageLimits(application.executions.model(main.conversation.id.toString())),
+        limits: application.tasks.inference.imageLimits(application.executions.model(turn.conversation.id.toString())),
         ...(input.reply_to === undefined ? {} : { replyTo: input.reply_to }),
       });
-      const conversation = main.conversation;
+      const conversation = turn.conversation;
       const submission = await application.attachments.admit(input.attachments, () => {
-        if (!main.accepting || interrupted.has(id) || interrupts.get(id) !== undefined) return undefined;
+        if (!turn.accepting || interrupted.has(id) || interrupts.get(id) !== undefined) return undefined;
         return conversation.submit({ type: "input", ...prepared, requestId: input.input_id,
           whenBusy: input.mode === "steer" ? "steer" : "followUp" }, BACKGROUND_CONTEXT);
       });
       if (submission === undefined) throw new TaskError("The turn stopped while attachments were being prepared; this input was not accepted");
-      if (!main.accepting) {
-        await main.conversation.abort(BACKGROUND_CONTEXT);
+      if (!turn.accepting) {
+        await turn.conversation.abort(BACKGROUND_CONTEXT);
         throw new TaskError("The turn ended while this input was being saved; its original is retained");
       }
-      trackMainInput(main, { input_id: input.input_id, submission });
+      trackTurnInput(turn, { input_id: input.input_id, submission });
     }
     if (responseId !== id) emit(id, { type: "input_accepted", input_id: input.input_id });
     emit(responseId, { type: "input_accepted", input_id: input.input_id });
@@ -466,68 +500,279 @@ function submitInput(id: number, input: TurnInput, responseId = id): Promise<voi
     emit(responseId, { type: "input_rejected", input_id: input.input_id,
       message: error instanceof TaskError ? error.message : "Input could not be saved; its draft is retained" });
   }).finally(() => {
-    if (main !== undefined) { main.admissions -= 1; main.wake?.(); }
+    if (turn !== undefined) { turn.admissions -= 1; turn.wake?.(); }
     operations.delete(operation);
   });
   operations.add(operation);
   return operation;
 }
+async function runConversationTurn(options: {
+  id: number;
+  kind: "main" | "sidechat";
+  conversationId: string;
+  sidechat?: SidechatSummary;
+  command: Extract<RuntimeCommand, { type: "chat" }>;
+  inputMode?: import("./generated/InputMode.js").InputMode;
+  reclaimedInput?: Submission;
+}): Promise<void> {
+  const { id, kind, conversationId, sidechat, command, inputMode, reclaimedInput } = options;
+  let submissionAttempted = reclaimedInput !== undefined;
+  const turnPromise = enqueueConversationTurn(conversationId, async () => {
+    if (interrupted.has(id)) { emit(id, { type: "interrupted" }); return; }
+    if (command.model !== null) await inference.preflight(command.model);
+    const application = await app();
+    const { harness, tasks, sidechats, environment, executions, toolsets } = application;
+    const conversation = kind === "main"
+      ? await harness.root(BACKGROUND_CONTEXT)
+      : await tasks.conversation(conversationId);
+    if (command.model !== null) await inference.configure(conversation, command.model, {});
+    let selected = await inference.legacy(conversation, await environment.model(null));
+    await inference.preflight(selected);
+    const hosts = await environment.hosts(command.cwd, command.origin_host_id, command.hosts);
+    const default_host = await environment.defaultHost(hosts);
+    activeConversations.set(id, conversation);
+    if (interrupted.has(id)) { emit(id, { type: "interrupted" }); return; }
+    // Recovered Pi guidance/tools need this owner before they can run.
+    // New input joins that work through Pi's steer/follow-up admission;
+    // waiting for idle here would make recovery depend on itself.
+    const release = executions.bind(conversation.id.toString(), {
+      model: selected, cwd: command.cwd, hosts, default_host, origin_host_id: command.origin_host_id,
+      ...(kind === "sidechat" ? { role: "sidechat" as const } : {}),
+      connectedHosts: () => environment.hosts(command.cwd, command.origin_host_id, command.hosts), search: searchFor(application, id),
+      project: () => hostRequests.call(id, command.origin_host_id === null
+        ? { type: "project_guidance", cwd: command.cwd }
+        : { type: "on_node", host_id: command.origin_host_id, command: { type: "project_guidance", cwd: command.cwd } }),
+      call: (operation) => hostRequests.call(id, environment.route(operation, default_host)),
+      notify: (task_id, text) => emit(id, { type: "notice", task_id, text }),
+    });
+    const stop = await activity(harness, conversation, (activity) => emit(id, { type: "activity", activity }),
+      (message) => emit(id, { type: "message", message }), (text) => emit(id, { type: "text_delta", text }));
+    const turn = activeTurns.get(id);
+    try {
+      const latestSidechat = kind === "sidechat" ? (await sidechats.get(conversationId)) ?? sidechat : undefined;
+      const skipRelated = reclaimedInput !== undefined || latestSidechat?.isolated === true;
+      const related = skipRelated ? { matches: [], gaps: [] } : await tasks.find(command.input, [], 8,
+        (query, refs, limit) => application.retrieval.snapshot(query, refs, limit), "semantic",
+        { includeSidechats: true, excludeConversationId: conversation.id.toString() });
+      if (interrupted.has(id)) { await interrupts.get(id); return; }
+      const relatedContext = related.matches.length === 0 && related.gaps.length === 0 ? "" : "\n\nRelated saved conversations and retrieval coverage (read and reuse matching work):\n" +
+        JSON.stringify(related);
+      const baseInstructions = await environment.instructions(command.instructions);
+      const roleInstructions = kind === "main"
+        ? MAIN_RESPONSE_INSTRUCTIONS
+        : latestSidechat === undefined ? "" : sidechatInstructions(latestSidechat);
+      selected = await inference.configureCurrent(conversation, selected, {
+        instructions: baseInstructions + (roleInstructions.length === 0 ? "" : "\n\n" + roleInstructions) + relatedContext,
+        cwd: command.cwd,
+        extensions: kind === "main" ? toolsets.main : toolsets.sidechat,
+      });
+      executions.setModel(conversation.id.toString(), selected);
+      if (interrupted.has(id)) { await interrupts.get(id); return; }
+      if (turn === undefined) throw new TaskError("The conversation execution owner is unavailable");
+      turn.conversation = conversation;
+      if (kind === "main") {
+        turn.info = { type: "main_ready", ...MAIN_CAPABILITIES, conversation_id: conversation.id.toString(), model: selected, cwd: command.cwd };
+      }
+      // One owner must retain every saved input for this conversation. Completing
+      // the selected input can hand Pi directly to an older queued follow-up.
+      await retainTurnInputs(harness, conversation, turn);
+      let submission = reclaimedInput;
+      if (submission === undefined) {
+        const prepared = await application.attachments.input({
+          text: command.input,
+          ...(command.attachments === undefined ? {} : { attachments: command.attachments }),
+          call: executions.get(conversation.id.toString()).call,
+          ...(command.origin === undefined ? {} : { origin: command.origin }),
+          limits: application.tasks.inference.imageLimits(selected),
+          ...(command.reply_to === undefined ? {} : { replyTo: command.reply_to }),
+        });
+        submission = await application.attachments.admit(command.attachments, () => {
+          if (interrupted.has(id)) return undefined;
+          submissionAttempted = true;
+          return conversation.submit({ type: "input", ...prepared, whenBusy: inputMode === "steer" ? "steer" : "followUp",
+            ...(command.input_id === undefined ? {} : { requestId: command.input_id }) }, BACKGROUND_CONTEXT);
+        });
+      }
+      if (submission === undefined) { await interrupts.get(id); return; }
+      if (command.input_id !== undefined) {
+        if (reclaimedInput === undefined) emit(id, { type: "input_accepted", input_id: command.input_id });
+        else for (const event of await reconcileMainInput(conversation, command.input_id, harness) ?? []) emit(id, event);
+      }
+      trackTurnInput(turn, { submission, ...(command.input_id === undefined ? {} : { input_id: command.input_id }) });
+      turn.inputs.sort((left, right) => left.submission.id < right.submission.id ? -1 : left.submission.id > right.submission.id ? 1 : 0);
+      turn.start(true);
+      const answers = new Set<string>(); let next = 0;
+      for (;;) {
+        const input = turn.inputs[next];
+        if (input === undefined) {
+          await retainTurnInputs(harness, conversation, turn);
+          if (turn.inputs[next] !== undefined) continue;
+          if (turn.admissions === 0) { turn.accepting = false; break; }
+          const active = turn;
+          await new Promise<void>((resolve) => { active.wake = resolve; }); delete turn.wake; continue;
+        }
+        next += 1;
+        const settled = await input.submission.wait(BACKGROUND_CONTEXT);
+        if (settled.type === "input" && settled.status === "unanswered" && settled.reason === "aborted") {
+          // The native settlement commit already published its terminal
+          // receipt to this owner and every connected observer.
+          continue;
+        }
+        if (settled.type !== "input" || settled.status !== "done") throw new ModelTurnError(await modelFailureMessage(conversation, "The model turn did not complete; its state is retained", harness, settled));
+        if (kind === "main") {
+          const response = await mainResponse(harness, conversation, settled.entry, settled.answer);
+          if (!response.text.trim() || answers.has(response.entry_id)) continue;
+          answers.add(response.entry_id);
+          emit(id, { type: "answer", conversation_id: conversation.id.toString(), ...response });
+        } else {
+          const entry = await conversation.commit((tx) => tx.entry(AssistantEntry, settled.answer), BACKGROUND_CONTEXT);
+          const text = entry?.model?.flatMap((message) => message.role !== "assistant" ? []
+            : message.content.flatMap((part) => part.type === "text" ? [part.text] : [])).join("\n") ?? "";
+          await sidechats.touchUpdatedAt(conversationId);
+          const entryId = settled.answer.toString();
+          if (!text.trim() || answers.has(entryId)) continue;
+          answers.add(entryId);
+          emit(id, { type: "answer", conversation_id: conversationId, entry_id: entryId, text });
+        }
+      }
+    } catch (error) {
+      if (turn !== undefined) {
+        turn.accepting = false; await conversation.abort(BACKGROUND_CONTEXT);
+      }
+      throw error;
+    } finally {
+      if (turn !== undefined) { turn.accepting = false; turn.start(false); }
+      await Promise.allSettled([...(inputControls.get(id) ?? [])]);
+      await stop(); release();
+    }
+  });
+  try { await turnPromise; }
+  finally {
+    // Preflight/attachment failures cannot have submitted this input.
+    // Once native submission starts, preserve uncertain outcomes instead
+    // of restoring a draft that may already be committed.
+    if (!submissionAttempted && command.input_id !== undefined) emit(id, { type: "input_rejected",
+      input_id: command.input_id, message: "Input was not submitted; its draft is restored." });
+  }
+}
+
+async function admitConversationInput(
+  id: number,
+  application: Application,
+  kind: "main" | "sidechat",
+  conversation: Conversation,
+  input: {
+    origin?: InputOrigin;
+    input_id: string;
+    input: string;
+    mode: InputMode;
+    context?: import("./generated/MainInputContext.js").MainInputContext;
+    attachments?: AttachmentRef[];
+    reply_to?: ReplyReference;
+  },
+  onAccepted?: () => Promise<void>,
+): Promise<{ chat?: Extract<RuntimeCommand, { type: "chat" }>; reclaimedInput?: Submission }> {
+  const conversationId = conversation.id.toString();
+  let reclaimedInput: Submission | undefined;
+  const reconciled = await reconcileMainInput(conversation, input.input_id, application.harness);
+  if (reconciled !== undefined) {
+    for (const event of reconciled) emit(id, event);
+    const saved = await conversation.commit((tx) => tx.submissionByRequest(conversation.id, input.input_id), BACKGROUND_CONTEXT);
+    if (saved === undefined || saved.type !== "input" || saved.status === "done" || saved.status === "unanswered") return {};
+    reclaimedInput = await application.harness.submission(saved.id, BACKGROUND_CONTEXT);
+    if (reclaimedInput === undefined) throw new TaskError("The saved input could not be recovered; its original is retained");
+  }
+  const turnInput: TurnInput = {
+    input_id: input.input_id,
+    input: input.input,
+    mode: input.mode,
+    ...(input.origin === undefined ? {} : { origin: input.origin }),
+    ...(input.attachments === undefined ? {} : { attachments: input.attachments }),
+    ...(input.reply_to === undefined ? {} : { reply_to: input.reply_to }),
+  };
+  const owner = acceptingTurnFor(conversationId);
+  if (owner !== undefined) {
+    if (reclaimedInput !== undefined) return {};
+    await onAccepted?.();
+    await submitInput(owner, turnInput, id);
+    return {};
+  }
+  const context = input.context;
+  const hosts = await application.environment.hosts(context?.cwd ?? "/", context?.origin_host_id ?? null, context?.hosts ?? []);
+  const host = await application.environment.defaultHost(hosts);
+  if (host === null) throw new TaskError("The coordinator execution host is offline");
+  const admittedOwner = acceptingTurnFor(conversationId);
+  if (admittedOwner !== undefined) {
+    if (reclaimedInput !== undefined) return {};
+    await onAccepted?.();
+    await submitInput(admittedOwner, turnInput, id);
+    return {};
+  }
+  await onAccepted?.();
+  activeCommands.add(id);
+  activeTurns.set(id, conversationTurn(conversationId, kind));
+  return {
+    chat: {
+      type: "chat",
+      ...(input.origin === undefined ? {} : { origin: input.origin }),
+      input: input.input,
+      input_id: input.input_id,
+      instructions: context?.instructions ?? "",
+      model: null,
+      origin_host_id: context?.origin_host_id ?? host.host_id ?? null,
+      cwd: context?.cwd ?? host.cwd,
+      hosts,
+      ...(input.attachments === undefined ? {} : { attachments: input.attachments }),
+      ...(input.reply_to === undefined ? {} : { reply_to: input.reply_to }),
+    },
+    ...(reclaimedInput === undefined ? {} : { reclaimedInput }),
+  };
+}
+
 async function handle(request: RuntimeRequest): Promise<void> {
   const { id } = request;
   let effective = request.command;
   let reclaimedInput: Submission | undefined;
+  let sidechatTarget: SidechatSummary | undefined;
   const initial = request.command;
-  const inputMode = initial.type === "main_input" || initial.type === "conversation_input" ? initial.mode : undefined;
+  const inputMode = initial.type === "main_input" || initial.type === "sidechat_input" || initial.type === "conversation_input" ? initial.mode : undefined;
   if (initial.type === "chat" || initial.type === "run_task" || initial.type === "attach_main" || initial.type === "attach_conversation") activeCommands.add(id);
-  if (initial.type === "chat") mainTurns.set(id, mainTurn());
+  if (initial.type === "chat") activeTurns.set(id, conversationTurn(ROOT_CONVERSATION_ID.toString(), "main"));
   if (initial.type === "run_task") workers.set(id, { command: initial, controller: new AbortController() });
   try {
-    if (effective.type === "conversation_input" && effective.conversation_id === ROOT_CONVERSATION_ID.toString()) {
-      effective = { type: "main_input", ...(effective.origin === undefined ? {} : { origin: effective.origin }), input_id: effective.input_id, input: effective.input, mode: effective.mode,
-        ...(effective.context === undefined ? {} : { context: effective.context }), ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }),
-        ...(effective.reply_to === undefined ? {} : { reply_to: effective.reply_to }) };
+    if (effective.type === "conversation_input") {
+      if (effective.conversation_id === ROOT_CONVERSATION_ID.toString()) {
+        effective = { type: "main_input", ...(effective.origin === undefined ? {} : { origin: effective.origin }), input_id: effective.input_id, input: effective.input, mode: effective.mode,
+          ...(effective.context === undefined ? {} : { context: effective.context }), ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }),
+          ...(effective.reply_to === undefined ? {} : { reply_to: effective.reply_to }) };
+      } else if (await (await app()).sidechats.get(effective.conversation_id) !== undefined) {
+        effective = { type: "sidechat_input", ...(effective.origin === undefined ? {} : { origin: effective.origin }), conversation_id: effective.conversation_id, input_id: effective.input_id, input: effective.input, mode: effective.mode,
+          ...(effective.context === undefined ? {} : { context: effective.context }), ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }),
+          ...(effective.reply_to === undefined ? {} : { reply_to: effective.reply_to }) };
+      }
     }
     if (effective.type === "main_input") {
       validateInput(effective.input, effective.attachments);
       const application = await app();
       const root = await application.harness.root(BACKGROUND_CONTEXT);
-      const input_id = effective.input_id;
-      const reconciled = await reconcileMainInput(root, input_id, application.harness);
-      if (reconciled !== undefined) {
-        for (const event of reconciled) emit(id, event);
-        const saved = await root.commit((tx) => tx.submissionByRequest(root.id, input_id), BACKGROUND_CONTEXT);
-        if (saved === undefined || saved.type !== "input" || saved.status === "done" || saved.status === "unanswered") return;
-        reclaimedInput = await application.harness.submission(saved.id, BACKGROUND_CONTEXT);
-        if (reclaimedInput === undefined) throw new TaskError("The saved input could not be recovered; its original is retained");
-      }
-      const turnInput: TurnInput = {
-        input_id: effective.input_id,
-        input: effective.input,
-        mode: effective.mode,
-        ...(effective.origin === undefined ? {} : { origin: effective.origin }),
-        ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }),
-        ...(effective.reply_to === undefined ? {} : { reply_to: effective.reply_to }),
-      };
-      const owner = [...mainTurns].find(([owner, turn]) => turn.accepting && !ending.has(owner))?.[0];
-      if (owner !== undefined) {
-        if (reclaimedInput !== undefined) return;
-        await submitInput(owner, turnInput, id);
-        return;
-      }
-      const context = effective.context;
-      const hosts = await application.environment.hosts(context?.cwd ?? "/", context?.origin_host_id ?? null, context?.hosts ?? []);
-      const host = await application.environment.defaultHost(hosts);
-      if (host === null) throw new TaskError("The coordinator execution host is offline");
-      const admittedOwner = [...mainTurns].find(([owner, turn]) => turn.accepting && !ending.has(owner))?.[0];
-      if (admittedOwner !== undefined) {
-        if (reclaimedInput !== undefined) return;
-        await submitInput(admittedOwner, turnInput, id);
-        return;
-      }
-      effective = { type: "chat", ...(effective.origin === undefined ? {} : { origin: effective.origin }), input: effective.input, input_id: effective.input_id, instructions: context?.instructions ?? "", model: null,
-        origin_host_id: context?.origin_host_id ?? host.host_id ?? null, cwd: context?.cwd ?? host.cwd, hosts, ...(effective.attachments === undefined ? {} : { attachments: effective.attachments }),
-        ...(effective.reply_to === undefined ? {} : { reply_to: effective.reply_to }) };
-      activeCommands.add(id); mainTurns.set(id, mainTurn());
+      const admitted = await admitConversationInput(id, application, "main", root, effective);
+      if (admitted.chat === undefined) return;
+      effective = admitted.chat;
+      reclaimedInput = admitted.reclaimedInput;
+    }
+    if (effective.type === "sidechat_input") {
+      validateInput(effective.input, effective.attachments);
+      const application = await app();
+      const target = await application.sidechats.require(effective.conversation_id);
+      const conversation = await application.tasks.conversation(target.conversation_id);
+      const admitted = await admitConversationInput(id, application, "sidechat", conversation, effective, async () => {
+        sidechatTarget = (await application.sidechats.unarchiveIfNeeded(target.conversation_id)) ?? target;
+        await application.sidechats.touchUpdatedAt(sidechatTarget.conversation_id);
+      });
+      if (admitted.chat === undefined) return;
+      sidechatTarget ??= target;
+      effective = admitted.chat;
+      reclaimedInput = admitted.reclaimedInput;
     }
     const command = effective;
     switch (command.type) {
@@ -612,22 +857,21 @@ async function handle(request: RuntimeRequest): Promise<void> {
       }
       case "conversation_settings": {
         const application = await app();
-        const settings = await conversationSettings(application.tasks, application.environment, command);
+        const settings = await conversationSettings(application.tasks, application.environment, command, application.sidechats);
         if (command.change !== null) {
           application.executions.setModel(settings.conversation_id, settings.model);
           const update = { type: "conversation_settings", settings: { ...settings, catalog: [] } } satisfies RuntimeEventKind;
-          let mainOwnerPublished = false;
+          let ownerPublished = false;
           for (const [request, conversation] of activeConversations) {
             if (conversation.id.toString() === settings.conversation_id && !ending.has(request)) {
               emit(request, update);
-              mainOwnerPublished ||= mainTurns.has(request);
+              const turn = activeTurns.get(request);
+              ownerPublished ||= turn !== undefined && turn.conversationId === settings.conversation_id;
             }
           }
-          // A CLI can change settings while phones only observe the idle root.
-          // The active main owner already mirrors to them; never publish twice.
-          if (settings.conversation_id === ROOT_CONVERSATION_ID.toString() && !mainOwnerPublished) {
-            for (const observer of mainObservers.values()) observer.publish(update);
-          }
+          // A CLI can change settings while phones only observe the idle conversation.
+          // The active turn owner already mirrors to them; never publish twice.
+          if (!ownerPublished) publishToObservers(settings.conversation_id, update);
         }
         emit(id, { type: "conversation_settings", settings }); break;
       }
@@ -713,6 +957,60 @@ async function handle(request: RuntimeRequest): Promise<void> {
       case "list_conversations": {
         emit(id, { type: "conversations", ...await (await app()).catalog.list(command.query, command.cursor, command.limit) }); break;
       }
+      case "list_sidechats": {
+        emit(id, { type: "sidechats", items: await (await app()).sidechats.list(command.include_archived) }); break;
+      }
+      case "create_sidechat": {
+        emit(id, { type: "sidechat", sidechat: await (await app()).sidechats.create(command) }); break;
+      }
+      case "update_sidechat": {
+        emit(id, { type: "sidechat", sidechat: await (await app()).sidechats.update(command) }); break;
+      }
+      case "observe_sidechat": {
+        const observation = new Observation((event) => writeEvent(id, event));
+        const observerEntry = { conversationId: command.conversation_id, observation };
+        sidechatObservers.set(id, observerEntry);
+        let stopNotices: (() => void) | undefined;
+        try {
+          const application = await app();
+          if (observation.closed) break;
+          const summary = await application.sidechats.require(command.conversation_id);
+          observerEntry.conversationId = summary.conversation_id;
+          if (observation.closed) break;
+          const conversation = await application.tasks.conversation(summary.conversation_id);
+          if (observation.closed) break;
+          stopNotices = await watchMainNotices(application.harness, conversation, (event) => observation.publish(event));
+          const initialWork = await inspectMainWork(application.harness, conversation);
+          const working = initialWork.type !== "idle" || liveTurnFor(summary.conversation_id) !== undefined;
+          observation.snapshot({
+            type: "sidechat_ready",
+            ...INPUT_ORIGIN_CAPABILITIES,
+            conversation_settings: true,
+            conversation_id: summary.conversation_id,
+            sidechat: summary,
+            model: await inference.legacy(conversation, await application.environment.model(null)),
+            cwd: "",
+            working,
+          });
+          const receiptWork = command.input_ids.length === 0 ? undefined : initialWork;
+          for (const input_id of command.input_ids) {
+            if (observation.closed) break;
+            for (const event of await reconcileMainInput(conversation, input_id, application.harness, receiptWork) ?? []) observation.snapshot(event);
+          }
+          if (observation.closed) break;
+          for (const frame of await history(conversation, null, application.histories)) observation.snapshot(frame);
+          if (!observation.open()) break;
+          const work = await inspectMainWork(application.harness, conversation);
+          if (work.type === "blocked") failure(id, "invalid_request", "Side chat paused. Worker/runtime update required before it can resume.");
+          else if (work.type === "idle" && liveTurnFor(summary.conversation_id) === undefined) emit(id, { type: "worker_idle" });
+          await observation.finished;
+        } finally {
+          observation.close();
+          try { stopNotices?.(); }
+          finally { sidechatObservers.delete(id); }
+        }
+        break;
+      }
       case "attach_conversation": {
         await conversationViews.attach(id, command.conversation_id, (event) => writeEvent(id, event), command.input_ids ?? []); break;
       }
@@ -720,14 +1018,15 @@ async function handle(request: RuntimeRequest): Promise<void> {
         await conversationViews.input(command, (operation) => hostRequests.call(id, operation), (event) => emit(id, event)); break;
       }
       case "conversation_interrupt": {
-        const { tasks } = await app();
-        const conversation = await tasks.conversation(command.conversation_id);
-        const actor = await tasks.findOwner(command.conversation_id);
+        const { tasks, sidechats } = await app();
+        const resolvedSidechat = await sidechats.resolve(command.conversation_id);
+        const resolvedId = resolvedSidechat?.conversation_id ?? command.conversation_id;
+        const conversation = await tasks.conversation(resolvedId);
+        const actor = await tasks.findOwner(resolvedId);
         if (actor !== undefined && await tasks.stop({ task_id: actor.task.id, ...(actor.agent === undefined ? {} : { agent_id: actor.agent.id }) })) {
           emit(id, { type: "interrupted" }); break;
         }
-        const owner = [...activeConversations].find(([request, active]) => !ending.has(request) &&
-          active.id === conversation.id && mainTurns.has(request))?.[0];
+        const owner = liveTurnFor(resolvedId)?.[0];
         if (owner === undefined) await conversation.abort(BACKGROUND_CONTEXT);
         else await interrupt(owner);
         emit(id, { type: "interrupted" }); break;
@@ -750,7 +1049,10 @@ async function handle(request: RuntimeRequest): Promise<void> {
         emit(id, { type: "notice", task_id: task.id, text: `Opened ${task.title}` }); break;
       }
       case "list_tasks": emit(id, { type: "tasks", tasks: await (await app()).tasks.list() }); break;
-      case "read_task_graph": emit(id, { type: "task_graph", graph: await readTaskGraph((await app()).tasks) }); break;
+      case "read_task_graph": {
+        const application = await app();
+        emit(id, { type: "task_graph", graph: await readTaskGraph(application.tasks, application.sidechats) }); break;
+      }
       case "watch_task_graph": {
         const observer = new Observation((event) => writeEvent(id, event));
         taskGraphObservers.set(id, observer);
@@ -762,6 +1064,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
             id,
             observer,
             application.tasks,
+            application.sidechats,
             "Active work updates could not be read; run `tasks graph` to inspect current work.",
           );
           if (!observer.open()) break;
@@ -786,8 +1089,11 @@ async function handle(request: RuntimeRequest): Promise<void> {
         const { harness, tasks, histories } = await app();
         const taskId = command.task_id ?? null, agentId = command.agent_id ?? null;
         if (taskId === null && agentId !== null) throw new TaskError("Choose a task for agent history");
+        const directConversationId = command.type === "read_tool_details" ? command.conversation_id : undefined;
         const task = taskId === null ? undefined : await tasks.get(taskId);
-        const conversation = task === undefined ? await harness.root(BACKGROUND_CONTEXT)
+        const conversation = directConversationId !== undefined && task === undefined
+          ? await tasks.conversation(directConversationId)
+          : task === undefined ? await harness.root(BACKGROUND_CONTEXT)
           : await tasks.conversation(agentId === null ? task.conversation_id
             : task.agents.find((agent) => agent.id === agentId)?.conversation_id ?? "");
         if (command.type === "read_history") for (const frame of await history(conversation, command.cursor, histories)) emit(id, frame);
@@ -853,7 +1159,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
         break;
       }
       case "main_interrupt": {
-        const owner = [...mainTurns].find(([owner]) => !ending.has(owner))?.[0];
+        const owner = liveTurnFor(ROOT_CONVERSATION_ID.toString())?.[0];
         if (owner !== undefined) await interrupt(owner);
         break;
       }
@@ -901,6 +1207,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
               id,
               observer,
               application.tasks,
+              application.sidechats,
               "Active work updates could not be read; inspect current work.",
             );
           }
@@ -911,7 +1218,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
           // after history makes the observer ready, so it stays connected.
           const work = await inspectMainWork(application.harness, root);
           if (work.type === "blocked") failure(id, "invalid_request", "Main conversation paused. Worker/runtime update required before it can resume.");
-          else if (work.type === "idle" && mainTurns.size === 0) emit(id, { type: "worker_idle" });
+          else if (work.type === "idle" && liveTurnFor(ROOT_CONVERSATION_ID.toString()) === undefined) emit(id, { type: "worker_idle" });
           await observer.finished;
         } finally {
           observer.close();
@@ -929,13 +1236,13 @@ async function handle(request: RuntimeRequest): Promise<void> {
           const root = await application.harness.root(BACKGROUND_CONTEXT);
           for (const frame of await history(root, null, application.histories)) emit(id, frame);
         };
-        const [owner, turn] = [...mainTurns].find(([owner]) => !ending.has(owner)) ?? [];
+        const [owner, turn] = liveTurnFor(ROOT_CONVERSATION_ID.toString()) ?? [];
         if (owner === undefined || turn === undefined) { await snapshot(); break; }
         let finish = () => {};
         const finished = new Promise<void>((resolve) => { finish = resolve; });
         const view = { owner, live: false, finish }; mainViews.set(id, view);
         try {
-          if (!await Promise.race([turn.ready, finished.then(() => false)]) || !mainTurns.has(owner)) { await snapshot(); break; }
+          if (!await Promise.race([turn.ready, finished.then(() => false)]) || !activeTurns.has(owner)) { await snapshot(); break; }
           if (turn.info !== undefined) {
             const current = application.executions.model(turn.info.conversation_id);
             emit(id, { ...turn.info, model: current ?? turn.info.model });
@@ -946,117 +1253,15 @@ async function handle(request: RuntimeRequest): Promise<void> {
         break;
       }
       case "chat": {
-        let submissionAttempted = reclaimedInput !== undefined;
-        const turn = mainQueue.then(async () => {
-          if (interrupted.has(id)) { emit(id, { type: "interrupted" }); return; }
-          if (command.model !== null) await inference.preflight(command.model);
-          const application = await app();
-          const { harness, tasks, environment, executions, toolsets } = application;
-          const root = await harness.root(BACKGROUND_CONTEXT);
-          if (command.model !== null) await inference.configure(root, command.model, {});
-          let selected = await inference.legacy(root, await environment.model(null));
-          await inference.preflight(selected);
-          const hosts = await environment.hosts(command.cwd, command.origin_host_id, command.hosts);
-          const default_host = await environment.defaultHost(hosts);
-          activeConversations.set(id, root);
-          if (interrupted.has(id)) { emit(id, { type: "interrupted" }); return; }
-          // Recovered Pi guidance/tools need this owner before they can run.
-          // New input joins that work through Pi's steer/follow-up admission;
-          // waiting for idle here would make recovery depend on itself.
-          const release = executions.bind(root.id.toString(), {
-            model: selected, cwd: command.cwd, hosts, default_host, origin_host_id: command.origin_host_id,
-            connectedHosts: () => environment.hosts(command.cwd, command.origin_host_id, command.hosts), search: searchFor(application, id),
-            project: () => hostRequests.call(id, command.origin_host_id === null
-              ? { type: "project_guidance", cwd: command.cwd }
-              : { type: "on_node", host_id: command.origin_host_id, command: { type: "project_guidance", cwd: command.cwd } }), call: (operation) => hostRequests.call(id, environment.route(operation, default_host)),
-            notify: (task_id, text) => emit(id, { type: "notice", task_id, text }),
-          });
-          const stop = await activity(harness, root, (activity) => emit(id, { type: "activity", activity }),
-            (message) => emit(id, { type: "message", message }), (text) => emit(id, { type: "text_delta", text }));
-          const turn = mainTurns.get(id);
-          try {
-            const related = reclaimedInput === undefined ? await tasks.find(command.input, [], 8,
-              (query, refs, limit) => application.retrieval.snapshot(query, refs, limit)) : { matches: [], gaps: [] };
-            if (interrupted.has(id)) { await interrupts.get(id); return; }
-            const relatedContext = related.matches.length === 0 && related.gaps.length === 0 ? "" : "\n\nRelated saved conversations and retrieval coverage (read and reuse matching work):\n" +
-              JSON.stringify(related);
-            selected = await inference.configureCurrent(root, selected, {
-              instructions: (await environment.instructions(command.instructions)) + "\n\n" + MAIN_RESPONSE_INSTRUCTIONS + relatedContext, cwd: command.cwd, extensions: toolsets.main });
-            executions.setModel(root.id.toString(), selected);
-            if (interrupted.has(id)) { await interrupts.get(id); return; }
-            if (turn === undefined) throw new TaskError("The main execution owner is unavailable");
-            turn.conversation = root; turn.info = { type: "main_ready", ...MAIN_CAPABILITIES, conversation_id: root.id.toString(), model: selected, cwd: command.cwd };
-            // One owner must retain every saved root input. Completing the
-            // selected input can hand Pi directly to an older queued follow-up.
-            await retainMainInputs(harness, root, turn);
-            let submission = reclaimedInput;
-            if (submission === undefined) {
-              const prepared = await application.attachments.input({
-                text: command.input,
-                ...(command.attachments === undefined ? {} : { attachments: command.attachments }),
-                call: executions.get(root.id.toString()).call,
-                ...(command.origin === undefined ? {} : { origin: command.origin }),
-                limits: application.tasks.inference.imageLimits(selected),
-                ...(command.reply_to === undefined ? {} : { replyTo: command.reply_to }),
-              });
-              submission = await application.attachments.admit(command.attachments, () => {
-                if (interrupted.has(id)) return undefined;
-                submissionAttempted = true;
-                return root.submit({ type: "input", ...prepared, whenBusy: inputMode === "steer" ? "steer" : "followUp",
-                  ...(command.input_id === undefined ? {} : { requestId: command.input_id }) }, BACKGROUND_CONTEXT);
-              });
-            }
-            if (submission === undefined) { await interrupts.get(id); return; }
-            if (command.input_id !== undefined) {
-              if (reclaimedInput === undefined) emit(id, { type: "input_accepted", input_id: command.input_id });
-              else for (const event of await reconcileMainInput(root, command.input_id, harness) ?? []) emit(id, event);
-            }
-            trackMainInput(turn, { submission, ...(command.input_id === undefined ? {} : { input_id: command.input_id }) });
-            turn.inputs.sort((left, right) => left.submission.id < right.submission.id ? -1 : left.submission.id > right.submission.id ? 1 : 0);
-            turn.start(true);
-            const answers = new Set<string>(); let next = 0;
-            for (;;) {
-              const input = turn.inputs[next];
-              if (input === undefined) {
-                await retainMainInputs(harness, root, turn);
-                if (turn.inputs[next] !== undefined) continue;
-                if (turn.admissions === 0) { turn.accepting = false; break; }
-                const active = turn;
-                await new Promise<void>((resolve) => { active.wake = resolve; }); delete turn.wake; continue;
-              }
-              next += 1;
-              const settled = await input.submission.wait(BACKGROUND_CONTEXT);
-              if (settled.type === "input" && settled.status === "unanswered" && settled.reason === "aborted") {
-                // The native settlement commit already published its terminal
-                // receipt to this owner and every connected observer.
-                continue;
-              }
-              if (settled.type !== "input" || settled.status !== "done") throw new ModelTurnError(await modelFailureMessage(root, "The model turn did not complete; its state is retained", harness, settled));
-              const response = await mainResponse(harness, root, settled.entry, settled.answer);
-              if (!response.text.trim() || answers.has(response.entry_id)) continue;
-              answers.add(response.entry_id);
-              emit(id, { type: "answer", conversation_id: root.id.toString(), ...response });
-            }
-          } catch (error) {
-            if (turn !== undefined) {
-              turn.accepting = false; await root.abort(BACKGROUND_CONTEXT);
-            }
-            throw error;
-          } finally {
-            if (turn !== undefined) { turn.accepting = false; turn.start(false); }
-            await Promise.allSettled([...(inputControls.get(id) ?? [])]);
-            await stop(); release();
-          }
+        await runConversationTurn({
+          id,
+          kind: sidechatTarget === undefined ? "main" : "sidechat",
+          conversationId: sidechatTarget?.conversation_id ?? ROOT_CONVERSATION_ID.toString(),
+          ...(sidechatTarget === undefined ? {} : { sidechat: sidechatTarget }),
+          command,
+          ...(inputMode === undefined ? {} : { inputMode }),
+          ...(reclaimedInput === undefined ? {} : { reclaimedInput }),
         });
-        mainQueue = turn.then(() => {}, () => {});
-        try { await turn; }
-        finally {
-          // Preflight/attachment failures cannot have submitted this input.
-          // Once native submission starts, preserve uncertain outcomes instead
-          // of restoring a draft that may already be committed.
-          if (!submissionAttempted && command.input_id !== undefined) emit(id, { type: "input_rejected",
-            input_id: command.input_id, message: "Input was not submitted; its draft is restored." });
-        }
         break;
       }
       case "host_reply": break;
@@ -1072,14 +1277,14 @@ async function handle(request: RuntimeRequest): Promise<void> {
     else emit(id, errorEvent(error));
   } finally {
     ending.add(id);
-    const turn = mainTurns.get(id); if (turn !== undefined) { turn.accepting = false; turn.start(false); }
+    const turn = activeTurns.get(id); if (turn !== undefined) { turn.accepting = false; turn.start(false); }
     await Promise.allSettled([...(inputControls.get(id) ?? [])]); inputControls.delete(id);
     await interrupts.get(id)?.catch(() => {});
     activeCommands.delete(id); activeConversations.delete(id); interrupted.delete(id); interrupts.delete(id);
     workers.delete(id);
     hostRequests.finish(id);
     emit(id, { type: "done" });
-    mainTurns.delete(id);
+    activeTurns.delete(id);
     ending.delete(id);
   }
 }
@@ -1109,6 +1314,10 @@ try {
     }
     if (request.command.type === "detach_task_graph") {
       taskGraphObservers.get(request.id)?.close();
+      continue;
+    }
+    if (request.command.type === "detach_sidechat") {
+      sidechatObservers.get(request.id)?.observation.close();
       continue;
     }
     if (request.command.type === "detach_conversation") { conversationViews.detach(request.id); continue; }
@@ -1178,6 +1387,7 @@ try {
   conversationViews.close();
   for (const observer of mainObservers.values()) observer.close();
   for (const observer of taskGraphObservers.values()) observer.close();
+  for (const observer of sidechatObservers.values()) observer.observation.close();
   for (const worker of workers.values()) worker.controller.abort();
   await Promise.allSettled(pending);
 } finally {

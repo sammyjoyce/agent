@@ -8,4 +8,9 @@ import type { TaskInput } from "./TaskInput.js";
 import type { TaskState } from "./TaskState.js";
 import type { WorkerState } from "./WorkerState.js";
 
-export type TaskRecord = { id: TaskId, conversation_id: string, title: string, outcome: string, summary: string, model: ModelSelection | null, scheduled_run?: JobRunReceipt, state: TaskState, worker: WorkerState, sources: Array<SourceRef>, pending: Array<TaskInput>, agents: Array<TaskAgentRecord>, started_at?: number, updated_at: number, };
+export type TaskRecord = { id: TaskId, conversation_id: string, title: string, outcome: string, summary: string, model: ModelSelection | null, scheduled_run?: JobRunReceipt,
+/**
+ * Optional side chat conversation ID where routine task updates and job
+ * briefings land instead of Main.
+ */
+delivery_conversation_id?: string, state: TaskState, worker: WorkerState, sources: Array<SourceRef>, pending: Array<TaskInput>, agents: Array<TaskAgentRecord>, started_at?: number, updated_at: number, };

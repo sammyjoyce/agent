@@ -4,4 +4,9 @@ import type { JobSchedule } from "./JobSchedule.js";
 import type { ModelSelection } from "./ModelSelection.js";
 import type { TimezoneId } from "./TimezoneId.js";
 
-export type ScheduledJob = { id: JobId, title: string, prompt: string, model: ModelSelection, timezone: TimezoneId, schedules: Array<JobSchedule>, revision: string, cwd: string, };
+export type ScheduledJob = { id: JobId, title: string, prompt: string, model: ModelSelection, timezone: TimezoneId, schedules: Array<JobSchedule>, revision: string, cwd: string,
+/**
+ * Optional target side chat (by slug or conversation ID) where job
+ * briefings and updates land instead of Main.
+ */
+delivery_sidechat?: string, };

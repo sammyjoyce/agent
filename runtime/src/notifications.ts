@@ -1,6 +1,6 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { AssistantEntry, defineDoc, defineDocFamily, defineTask, ROOT_CONVERSATION_ID,
-  type EntryId, type EntryRecord, type Harness, type NextTaskState, type Registry, type TaskId } from "@earendil-works/pi-durable";
+  type ConversationId, type EntryId, type EntryRecord, type Harness, type NextTaskState, type Registry, type TaskId, type Tx } from "@earendil-works/pi-durable";
 import { createHash, createPrivateKey, randomUUID, sign, type KeyObject } from "node:crypto";
 import { constants } from "node:fs";
 import { open, realpath } from "node:fs/promises";
@@ -11,11 +11,32 @@ import type { ApnsConfig } from "./generated/ApnsConfig.js";
 import type { NotificationRequest } from "./generated/NotificationRequest.js";
 import type { NotificationStatus } from "./generated/NotificationStatus.js";
 import type { NotificationTarget } from "./generated/NotificationTarget.js";
+import type { SidechatSummary } from "./generated/SidechatSummary.js";
+import { SIDECHAT_RECORDS_KIND, type SidechatStore } from "./sidechats.js";
+import { nativeConversationId } from "./tasks.js";
 import { isUserNotice, transcript } from "./transcript.js";
 import { TranscriptVisibility, transcriptVisible } from "./transcript_visibility.js";
 
-type Installation = { id: string; token: string; generation: string; after: EntryId | null };
-type State = { initialized: boolean; cursor: EntryId | null; installations: Installation[]; pending: { key: string; due: number }[]; active: TaskId<null> | null };
+type Installation = { id: string; token: string; generation: string; after: EntryId | null; main_enabled?: boolean; main_after?: EntryId | null };
+function isNotificationAllowed(device: Installation, sidechat?: Pick<SidechatSummary, "notifications">): boolean {
+  if (sidechat === undefined) return device.main_enabled !== false;
+  return sidechat.notifications === "on" || (sidechat.notifications === "inherit" && device.main_enabled !== false);
+}
+function deviceCutoff(device: Installation, sidechat?: Pick<SidechatSummary, "notifications">): EntryId | null {
+  if (sidechat?.notifications === "on") return device.after;
+  const mainAfter = device.main_after ?? null;
+  if (device.after === null) return mainAfter;
+  if (mainAfter === null) return device.after;
+  return device.after > mainAfter ? device.after : mainAfter;
+}
+type State = {
+  initialized: boolean;
+  cursor: EntryId | null;
+  cursors?: Record<string, EntryId>;
+  installations: Installation[];
+  pending: { key: string; due: number }[];
+  active: TaskId<null> | null;
+};
 type Delivery = { installation_id: string; generation: string; conversation_id: string; entry_id: string; apns_id: string;
   state: "queued" | "attempting" | "retrying" | "accepted" | "rejected" | "uncertain" | "superseded" | "expired";
   status: number | null; attempts: number; retry_at: number | null; expires_at: number };
@@ -93,7 +114,7 @@ export class ApnsClient {
     const value = unsigned + "." + sign("sha256", Buffer.from(unsigned), { key: this.key, dsaEncoding: "ieee-p1363" }).toString("base64url");
     this.jwt = { at, value }; return value;
   }
-  async send(delivery: Delivery, token: string, preview: string, signal: AbortSignal): Promise<Result> {
+  async send(delivery: Delivery, token: string, preview: string, signal: AbortSignal, title = "Beep Boop"): Promise<Result> {
     const uncertain: Sent = { state: "uncertain", status: null, invalid_device: false };
     if (this.closed || signal.aborted) return uncertain;
     if (this.gate !== undefined) {
@@ -131,7 +152,7 @@ export class ApnsClient {
         });
         const target: NotificationTarget = { conversation_id: delivery.conversation_id, entry_id: delivery.entry_id,
           installation_id: delivery.installation_id };
-        request.end(JSON.stringify({ aps: { alert: { title: "Beep Boop", body: preview }, sound: "default" }, agent: target }));
+        request.end(JSON.stringify({ aps: { alert: { title, body: preview }, sound: "default" }, agent: target }));
       });
     } catch { return uncertain; }
   }
@@ -145,11 +166,13 @@ export class Notifications {
   private stop: (() => void) | undefined;
   private serial: Promise<void> = Promise.resolve();
   private closed = false;
-  constructor(private readonly session: Harness, registry: Registry, config?: ApnsConfig, origin?: string, gate?: OwnerGate) {
+  private readonly sidechatIds = new Set<string>();
+  constructor(private readonly session: Harness, registry: Registry, config?: ApnsConfig, origin?: string, gate?: OwnerGate,
+    private readonly sidechats?: SidechatStore) {
     this.client = config === undefined ? undefined : new ApnsClient(config, origin, gate);
     this.task = defineTask<null, Checkpoint, null>({ name: "agent.notifications", version: 1, initial: () => ({ phase: "deliver", last: null }), phases: {
       deliver: async (task, runtime, context) => {
-        let attempt: { key: string; delivery: Delivery; token: string; preview: string } | undefined;
+        let attempt: { key: string; delivery: Delivery; token: string; preview: string; title: string } | undefined;
         await runtime.commit(async (tx) => {
           const state = await tx.doc(NotificationState);
           // A newer ready delivery can replace a sleeping dispatcher. Its
@@ -169,17 +192,34 @@ export class Notifications {
             state.active = null; return terminal();
           }
           const device = state.installations.find((item) => item.id === delivery?.installation_id && item.generation === delivery.generation);
-          const visible = delivery !== null && transcriptVisible(delivery.entry_id, await tx.doc(TranscriptVisibility, ROOT_CONVERSATION_ID));
-          if ((delivery?.state === "queued" || delivery?.state === "retrying") && visible && device !== undefined && this.configured && !this.closed) {
+          let targetCid: ConversationId | undefined;
+          let alertTitle = "Beep Boop";
+          let allowed = false;
+          if (delivery !== null && device !== undefined) {
+            if (delivery.conversation_id === ROOT_CONVERSATION_ID.toString()) {
+              targetCid = ROOT_CONVERSATION_ID;
+              allowed = isNotificationAllowed(device);
+            } else if (this.sidechats !== undefined) {
+              const sidechat = await this.sidechats.getIn(tx, delivery.conversation_id);
+              if (sidechat !== undefined) {
+                targetCid = nativeConversationId(sidechat.conversation_id);
+                alertTitle = `Beep Boop · ${sidechat.title}`;
+                allowed = isNotificationAllowed(device, sidechat);
+              }
+            }
+          }
+          const visible = delivery !== null && targetCid !== undefined &&
+            transcriptVisible(delivery.entry_id, await tx.doc(TranscriptVisibility, targetCid));
+          if ((delivery?.state === "queued" || delivery?.state === "retrying") && allowed && visible && device !== undefined && targetCid !== undefined && this.configured && !this.closed) {
             const id: unknown = Number(delivery.entry_id), entry = nativeEntryId(id) ? await tx.entry(id) : undefined;
-            const body = entry?.conversationId === ROOT_CONVERSATION_ID ? preview(entry) : undefined;
+            const body = entry?.conversationId === targetCid ? preview(entry) : undefined;
             if (delivery.expires_at <= runtime.now()) delivery.state = "expired";
             else if (body !== undefined) {
               if (delivery.retry_at !== null && delivery.retry_at > runtime.now()) return {
                 status: "sleeping", until: Math.min(delivery.retry_at, delivery.expires_at), checkpoint: task.state.checkpoint,
               };
               delivery.state = "attempting"; delivery.attempts += 1;
-              attempt = { key, token: device.token, delivery: { ...delivery }, preview: body }; return;
+              attempt = { key, token: device.token, delivery: { ...delivery }, preview: body, title: alertTitle }; return;
             }
           }
           if (delivery?.state === "attempting") delivery.state = "uncertain";
@@ -188,7 +228,7 @@ export class Notifications {
           return { status: "running", checkpoint: { phase: "deliver", last: { key, state: delivery?.state ?? "superseded", attempts: delivery?.attempts ?? 0 } } };
         }, context);
         if (attempt === undefined) return;
-        const current = attempt, result = await this.client?.send(current.delivery, current.token, current.preview, runtime.signal);
+        const current = attempt, result = await this.client?.send(current.delivery, current.token, current.preview, runtime.signal, current.title);
         await runtime.commit(async (tx) => {
           const state = await tx.doc(NotificationState), saved = await tx.doc(NotificationDeliveries, current.key, null);
           if (result?.state === "unsent") {
@@ -231,8 +271,21 @@ export class Notifications {
         if (active === undefined || active.state.status === "terminal") state.active = null;
       }
     }, BACKGROUND_CONTEXT);
+    if (this.sidechats !== undefined) {
+      for (const sidechat of await this.sidechats.list(true)) this.sidechatIds.add(sidechat.conversation_id);
+    }
     const commits = this.session.observeCommits({ advance: (publication) => {
-      if (publication.changes.some((change) => change.type === "entry" && change.value.conversationId === ROOT_CONVERSATION_ID)) this.schedule();
+      let relevant = false;
+      for (const change of publication.changes) {
+        if (change.type === "document" && change.record.kind === SIDECHAT_RECORDS_KIND && typeof change.record.key === "string") {
+          this.sidechatIds.add(change.record.key);
+          relevant = true;
+        } else if (change.type === "entry" &&
+          (change.value.conversationId === ROOT_CONVERSATION_ID || this.sidechatIds.has(change.value.conversationId.toString()))) {
+          relevant = true;
+        }
+      }
+      if (relevant) this.schedule();
     }, end() {} });
     this.stop = () => commits.detach();
     await this.reconcile();
@@ -242,14 +295,33 @@ export class Notifications {
   private schedule(): void {
     this.serial = this.serial.then(() => this.reconcile()).catch(() => { if (!this.closed) console.error("Notification admission could not be saved; retained entries will be reconciled on reconnect."); });
   }
+  private async latestEntryIdIn(tx: Tx): Promise<EntryId | null> {
+    let latest: EntryId | null = (await tx.scanEntries({ conversationId: ROOT_CONVERSATION_ID, order: "descending" }, 1)).items[0]?.id ?? null;
+    if (this.sidechats !== undefined) {
+      for (const sidechat of await this.sidechats.listIn(tx, true)) {
+        const tail = (await tx.scanEntries({ conversationId: nativeConversationId(sidechat.conversation_id), order: "descending" }, 1)).items[0]?.id;
+        if (tail !== undefined && (latest === null || tail > latest)) latest = tail;
+      }
+    }
+    return latest;
+  }
   private async reconcile(): Promise<void> {
     let more = true;
     while (more && !this.closed) {
       const retired: TaskId<null>[] = [];
       more = await this.session.commit(async (tx) => {
         const state = await tx.doc(NotificationState);
+        let hasMore = false;
         if (!state.initialized) {
           state.cursor = (await tx.scanEntries({ conversationId: ROOT_CONVERSATION_ID, order: "descending" }, 1)).items[0]?.id ?? null;
+          if (this.sidechats !== undefined) {
+            if (state.cursors === undefined) state.cursors = {};
+            const cursors = state.cursors;
+            for (const sidechat of await this.sidechats.listIn(tx, true)) {
+              const tail = (await tx.scanEntries({ conversationId: nativeConversationId(sidechat.conversation_id), order: "descending" }, 1)).items[0]?.id;
+              if (tail !== undefined) cursors[sidechat.conversation_id] = tail;
+            }
+          }
           state.initialized = true;
         }
         const page = await tx.scanEntries({ conversationId: ROOT_CONVERSATION_ID, order: "ascending", ...(state.cursor === null ? {} : { minEntryId: state.cursor }) }, 51);
@@ -259,7 +331,9 @@ export class Notifications {
           state.cursor = entry.id;
           if (this.client === undefined || !transcriptVisible(entry.id.toString(), visibility) || !eligible(entry)) continue;
           for (const device of state.installations) {
-            if (device.after !== null && entry.id <= device.after) continue;
+            if (!isNotificationAllowed(device)) continue;
+            const cutoff = deviceCutoff(device);
+            if (cutoff !== null && entry.id <= cutoff) continue;
             const key = notificationDeliveryKey(device.id, entry.id.toString()), saved = await tx.doc(NotificationDeliveries, key, null);
             if (saved.delivery !== null) continue;
             saved.delivery = { installation_id: device.id, generation: device.generation, conversation_id: entry.conversationId.toString(),
@@ -267,6 +341,37 @@ export class Notifications {
             state.pending.push({ key, due: 0 });
           }
         }
+        if (page.items.length === 51) hasMore = true;
+
+        if (this.sidechats !== undefined) {
+          const allSidechats = await this.sidechats.listIn(tx, true);
+          if (state.cursors === undefined) state.cursors = {};
+          const cursors = state.cursors;
+          for (const sidechat of allSidechats) {
+            this.sidechatIds.add(sidechat.conversation_id);
+            const cid = nativeConversationId(sidechat.conversation_id);
+            const currentCursor = cursors[sidechat.conversation_id];
+            const scPage = await tx.scanEntries({ conversationId: cid, order: "ascending", ...(currentCursor === undefined ? {} : { minEntryId: currentCursor }) }, 51);
+            const scVisibility = await tx.doc(TranscriptVisibility, cid);
+            for (const entry of scPage.items) {
+              if (currentCursor !== undefined && entry.id <= currentCursor) continue;
+              cursors[sidechat.conversation_id] = entry.id;
+              if (this.client === undefined || sidechat.notifications === "off" || !transcriptVisible(entry.id.toString(), scVisibility) || !eligible(entry)) continue;
+              for (const device of state.installations) {
+                if (!isNotificationAllowed(device, sidechat)) continue;
+                const cutoff = deviceCutoff(device, sidechat);
+                if (cutoff !== null && entry.id <= cutoff) continue;
+                const key = notificationDeliveryKey(device.id, entry.id.toString()), saved = await tx.doc(NotificationDeliveries, key, null);
+                if (saved.delivery !== null) continue;
+                saved.delivery = { installation_id: device.id, generation: device.generation, conversation_id: sidechat.conversation_id,
+                  entry_id: entry.id.toString(), apns_id: randomUUID(), state: "queued", status: null, attempts: 0, retry_at: null, expires_at: Date.now() + 86_400_000 };
+                state.pending.push({ key, due: 0 });
+              }
+            }
+            if (scPage.items.length === 51) hasMore = true;
+          }
+        }
+
         if (state.pending.length > 0 && this.configured && !this.closed) {
           const previous = state.active, active = previous === null ? undefined : await tx.task(previous);
           if (previous === null || active === undefined || active.state.status === "terminal" ||
@@ -275,7 +380,7 @@ export class Notifications {
             if (previous !== null && active?.state.status === "sleeping") retired.push(previous);
           }
         }
-        return page.items.length === 51;
+        return hasMore;
       }, BACKGROUND_CONTEXT);
       for (const task of retired) await this.session.abortTask(task, BACKGROUND_CONTEXT);
     }
@@ -289,14 +394,37 @@ export class Notifications {
     return this.session.commit(async (tx) => {
       const state = await tx.doc(NotificationState), device = state.installations.find((item) => item.id === id);
       if (request.type === "unregister") state.installations = state.installations.filter((item) => item.id !== id);
-      if (request.type === "register" && device?.token !== request.token.toLocaleLowerCase()) {
-        const after = (await tx.scanEntries({ conversationId: ROOT_CONVERSATION_ID, order: "descending" }, 1)).items[0]?.id ?? null;
-        // APNs tokens identify one app/device. Reinstalling with a new local
-        // installation ID transfers that token instead of duplicating alerts.
-        state.installations = state.installations.filter((item) => item.id !== id && item.token !== request.token.toLocaleLowerCase());
-        state.installations.push({ id, token: request.token.toLocaleLowerCase(), generation: randomUUID(), after });
+      if (request.type === "register") {
+        const normalizedToken = request.token.toLocaleLowerCase();
+        if (device?.token !== normalizedToken) {
+          const after = await this.latestEntryIdIn(tx);
+          // APNs tokens identify one app/device. Reinstalling with a new local
+          // installation ID transfers that token instead of duplicating alerts.
+          state.installations = state.installations.filter((item) => item.id !== id && item.token !== normalizedToken);
+          state.installations.push({
+            id,
+            token: normalizedToken,
+            generation: randomUUID(),
+            after,
+            ...(request.main_enabled === undefined ? {} : { main_enabled: request.main_enabled }),
+          });
+        } else {
+          const wasMuted = device.main_enabled === false;
+          const nextMuted = request.main_enabled === false;
+          if (request.main_enabled === undefined) {
+            if (wasMuted) delete device.main_enabled;
+          } else {
+            device.main_enabled = request.main_enabled;
+          }
+          if (wasMuted && !nextMuted) device.main_after = await this.latestEntryIdIn(tx);
+        }
       }
-      return { configured: this.configured, registered: state.installations.some((item) => item.id === id) };
+      const saved = state.installations.find((item) => item.id === id);
+      return {
+        configured: this.configured,
+        registered: saved !== undefined,
+        ...(saved?.main_enabled === undefined ? {} : { main_enabled: saved.main_enabled }),
+      };
     }, BACKGROUND_CONTEXT);
   }
 }

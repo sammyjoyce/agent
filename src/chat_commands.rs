@@ -163,6 +163,13 @@ pub enum ChatCommand {
         #[arg(value_name = "QUERY_OR_ID", num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
         query: Vec<String>,
     },
+    /// List standing side chats, or switch to one by slug or ID.
+    Sidechat {
+        #[arg(value_name = "SLUG_OR_ID")]
+        target: Option<String>,
+    },
+    /// Switch back to the Main conversation.
+    Main,
     /// Load earlier saved messages.
     #[command(hide = true)]
     History,
@@ -599,6 +606,29 @@ mod tests {
             ChatCommand::Resume { query: Vec::new() }
                 .settings(None)
                 .is_none()
+        );
+        assert_eq!(
+            ChatCommand::parse("/sidechat").unwrap().unwrap(),
+            ChatCommand::Sidechat { target: None }
+        );
+        assert_eq!(
+            ChatCommand::parse("/sidechat morning-brief")
+                .unwrap()
+                .unwrap(),
+            ChatCommand::Sidechat {
+                target: Some("morning-brief".into())
+            }
+        );
+        assert_eq!(
+            ChatCommand::parse("/main").unwrap().unwrap(),
+            ChatCommand::Main
+        );
+        assert_eq!(
+            crate::chat_commands::completions("/side", 5)
+                .into_iter()
+                .map(|item| item.text)
+                .collect::<Vec<_>>(),
+            ["/sidechat"]
         );
     }
 

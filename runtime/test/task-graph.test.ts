@@ -606,4 +606,44 @@ test("buildActiveWork sorts running main first, waiting_owner before waiting_ext
   assert.equal(work[1]?.host, host.name);
   assert.equal(work[2]?.detail, undefined, "Blank owner wait leaves detail unset so clients render Needs your reply once");
   assert.equal(work[3]?.detail, "Waiting on GitHub Actions · Checks pending");
+
+  const sidechatWork = buildActiveWork(
+    [
+      {
+        id: 501,
+        conversation_id: "42",
+        owner: null,
+        background: false,
+        abort_requested: false,
+        state: { status: "running", phase: "stream" },
+        blocked: null,
+        conversations: ["42"],
+        kind: { type: "generation" },
+        started_at: 4000,
+      },
+      {
+        id: 502,
+        conversation_id: "42",
+        owner: 501,
+        background: false,
+        abort_requested: false,
+        state: { status: "running", phase: "run" },
+        blocked: null,
+        conversations: ["42"],
+        kind: { type: "tool", name: "read_file" },
+        argument_summary: "docs/roadmap.md",
+        started_at: 4050,
+      },
+    ],
+    [],
+    new Map([["42", { type: "other" }]]),
+    new Map([["42", { slug: "homelab-ops", title: "Homelab Ops" }]]),
+  );
+  assert.equal(sidechatWork.length, 1);
+  assert.equal(sidechatWork[0]?.id, "sidechat:42");
+  assert.equal(sidechatWork[0]?.title, "Homelab Ops");
+  assert.equal(sidechatWork[0]?.sidechat_slug, "homelab-ops");
+  assert.equal(sidechatWork[0]?.conversation_id, "42");
+  assert.equal(sidechatWork[0]?.status, "running");
+  assert.equal(sidechatWork[0]?.detail, "read_file: docs/roadmap.md");
 });

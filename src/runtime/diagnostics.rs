@@ -392,12 +392,25 @@ impl Trace {
             }
             RuntimeCommand::ReadHistory {
                 task_id, agent_id, ..
-            }
-            | RuntimeCommand::ConversationSettings {
-                task_id, agent_id, ..
             } => {
                 trace.task_id = task_id.as_ref().map(ToString::to_string);
                 trace.agent_id = agent_id.as_deref().and_then(token);
+            }
+            RuntimeCommand::ConversationSettings {
+                task_id,
+                agent_id,
+                conversation_id,
+                ..
+            }
+            | RuntimeCommand::ReadToolDetails {
+                task_id,
+                agent_id,
+                conversation_id,
+                ..
+            } => {
+                trace.task_id = task_id.as_ref().map(ToString::to_string);
+                trace.agent_id = agent_id.as_deref().and_then(token);
+                trace.conversation_id = conversation_id.as_deref().and_then(token);
             }
             RuntimeCommand::ReadConversation {
                 conversation_id, ..
@@ -406,6 +419,15 @@ impl Trace {
                 conversation_id, ..
             }
             | RuntimeCommand::AttachConversation {
+                conversation_id, ..
+            }
+            | RuntimeCommand::ObserveSidechat {
+                conversation_id, ..
+            }
+            | RuntimeCommand::SidechatInput {
+                conversation_id, ..
+            }
+            | RuntimeCommand::UpdateSidechat {
                 conversation_id, ..
             }
             | RuntimeCommand::ConversationInput {
@@ -440,6 +462,7 @@ impl Trace {
             }),
             RuntimeCommand::SubmitInput { input_id, mode, .. }
             | RuntimeCommand::MainInput { input_id, mode, .. }
+            | RuntimeCommand::SidechatInput { input_id, mode, .. }
             | RuntimeCommand::ConversationInput { input_id, mode, .. } => {
                 Some(Event::InputReceived {
                     input_id: token(input_id),
@@ -461,6 +484,9 @@ impl Trace {
             RuntimeEventKind::MainReady {
                 conversation_id, ..
             }
+            | RuntimeEventKind::SidechatReady {
+                conversation_id, ..
+            }
             | RuntimeEventKind::TaskReady {
                 conversation_id, ..
             }
@@ -480,6 +506,9 @@ impl Trace {
                 self.task_id = conversation.task_id.as_ref().map(ToString::to_string);
                 self.agent_id = conversation.agent_id.as_deref().and_then(token);
             }
+            RuntimeEventKind::Sidechat { sidechat } => {
+                self.conversation_id = token(&sidechat.conversation_id);
+            }
             _ => {}
         }
         let first = if !self.active
@@ -494,6 +523,7 @@ impl Trace {
         };
         let observed = match event {
             RuntimeEventKind::MainReady { .. }
+            | RuntimeEventKind::SidechatReady { .. }
             | RuntimeEventKind::TaskReady { .. }
             | RuntimeEventKind::ConversationReady { .. } => Some(Event::Ready),
             RuntimeEventKind::InputAccepted { input_id, .. } => Some(Event::InputAccepted {

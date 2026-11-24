@@ -23,6 +23,7 @@ pub mod runtime;
 pub mod scrawl_feedback;
 pub mod serialized_spawn;
 pub mod service;
+pub mod sidechats;
 
 pub mod background;
 pub mod broker;

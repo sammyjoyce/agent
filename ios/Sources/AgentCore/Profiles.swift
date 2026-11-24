@@ -338,6 +338,29 @@ public struct ProfileDirectory: Sendable {
     self.held = held
   }
 
+  private init(
+    profile: ProfileID, root: URL, cache: URL,
+    held: @escaping @Sendable () throws -> Int
+  ) {
+    self.profile = profile
+    self.root = root
+    self.cache = cache
+    self.held = held
+  }
+
+  /// Isolated on-device outbox, ledger and preview paths for one standing side chat under this
+  /// profile's directory. Removing the profile removes every side chat subfolder with it.
+  public func sidechat(_ conversationID: String) -> ProfileDirectory {
+    let key = SHA256.hash(data: Data(conversationID.utf8)).map {
+      String(format: "%02x", $0)
+    }.joined()
+    return ProfileDirectory(
+      profile: profile,
+      root: root.appending(path: "Sidechats/\(key)"),
+      cache: cache.appending(path: "Sidechats/\(key)"),
+      held: { 0 })
+  }
+
   var outbox: URL { root.appending(path: "Outbox/pending.json") }
   var outboxAttachments: URL { root.appending(path: "Outbox/Attachments") }
   var ledger: URL { root.appending(path: "Ledger.json") }
@@ -361,7 +384,17 @@ public struct ProfileDirectory: Sendable {
   /// update for this profile's coordinator, read from disk. A missing file holds none. An
   /// unreadable one throws, so it is never counted as empty.
   public func queuedMessages() throws -> Int {
-    try countItems(OutboxItem.self, in: outbox) + held()
+    var total = try countItems(OutboxItem.self, in: outbox) + held()
+    let sidechatsRoot = root.appending(path: "Sidechats")
+    if FileManager.default.fileExists(atPath: sidechatsRoot.path) {
+      let dirs = try FileManager.default.contentsOfDirectory(
+        at: sidechatsRoot, includingPropertiesForKeys: [.isDirectoryKey])
+      for dir in dirs
+      where (try? dir.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+        total += try countItems(OutboxItem.self, in: dir.appending(path: "Outbox/pending.json"))
+      }
+    }
+    return total
   }
 
   /// Deletes everything the phone keeps for this profile. Call only after its session is

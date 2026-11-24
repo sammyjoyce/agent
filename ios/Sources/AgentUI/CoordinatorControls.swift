@@ -31,6 +31,8 @@ enum LaneError: LocalizedError, Equatable {
 struct CoordinatorControls: View {
   let model: ChatModel
   let lane: ProfileID
+  var notifications: AppNotifications? = nil
+  var dictation: Dictation? = nil
 
   @State private var pendingDreams: Int?
   @State private var dreamsRefresh = 0
@@ -39,6 +41,16 @@ struct CoordinatorControls: View {
   var body: some View {
     let snapshot = model.snapshots[lane]
     let connected = snapshot?.connection == .connected
+    if snapshot?.sidechatsSupported == true {
+      NavigationLink("Side chats") {
+        LaneScreen(model: model, lane: lane) {
+          SidechatsListView(
+            model: model, initialLane: lane, lockedLane: true, notifications: notifications,
+            dictation: dictation)
+        }
+      }
+      .accessibilityIdentifier("settingsSidechatsLink")
+    }
     if snapshot?.workInspectionSupported == true {
       NavigationLink("Jobs and work") {
         LaneScreen(model: model, lane: lane) { WorkView(model: model, lane: lane) }

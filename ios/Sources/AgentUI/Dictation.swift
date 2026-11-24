@@ -545,6 +545,12 @@ public final class Dictation {
 
   func dismissNotice() { notice = nil }
 
+  /// Stops an active take owned by `chat` without sending, e.g. when navigating away from its screen.
+  func stop(for chat: ChatModel) {
+    guard take?.target.chat === chat else { return }
+    keep()
+  }
+
   private func progressed(_ fraction: Double) {
     guard case .downloading(_, let bytes) = model else { return }
     model = fraction >= 1 ? .preparing : .downloading(fraction, of: bytes)

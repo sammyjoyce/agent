@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import type { Harness } from "@earendil-works/pi-durable";
+import { AssistantEntry, ROOT_CONVERSATION_ID, type Conversation, type Harness, type SubmissionRecord } from "@earendil-works/pi-durable";
 import type { ScheduledOccurrence } from "./generated/ScheduledOccurrence.js";
 import type { ScheduledJob } from "./generated/ScheduledJob.js";
+import type { SidechatStore } from "./sidechats.js";
 import { SourceJournal } from "./sources.js";
-import { TaskError, TaskStore } from "./tasks.js";
+import { nativeConversationId, publishConversationNotice, TaskError, TaskStore } from "./tasks.js";
 
 /** A stable UUID keeps the ordinary task API authoritative across replay. */
 export function scheduledTaskId(occurrence: string): string {
@@ -44,17 +45,95 @@ async function requireReconciledTask(session: Harness, tasks: TaskStore, sources
   }
 }
 
+async function deliverJobOutput(
+  occurrence: ScheduledOccurrence,
+  session: Harness,
+  tasks: TaskStore,
+  sidechats: SidechatStore | undefined,
+  taskId: string,
+  conversation: Conversation,
+  submission: Extract<SubmissionRecord, { type: "input"; status: "done" }>,
+): Promise<void> {
+  const targetRef = occurrence.job.delivery_sidechat;
+  if (targetRef === undefined) return;
+  const answerEntry = await conversation.commit((tx) => tx.entry(AssistantEntry, submission.answer), BACKGROUND_CONTEXT);
+  if (answerEntry === undefined) return;
+  const answerText = answerEntry.model
+    ?.flatMap((message) =>
+      message.role !== "assistant"
+        ? []
+        : message.content.flatMap((part) => (part.type === "text" ? [part.text] : [])),
+    )
+    .join("\n")
+    .trim() ?? "";
+  if (answerText.length === 0) return;
+
+  const deliveryKey = "job-delivery:" + occurrence.id;
+  const deliveryRequestId = "notice:" + answerEntry.id.toString() + ":" + deliveryKey;
+  const alreadyDeliveredTo = async (targetConversationId: typeof ROOT_CONVERSATION_ID): Promise<boolean> =>
+    (await session.commit(
+      (tx) => tx.submissionByRequest(targetConversationId, deliveryRequestId),
+      BACKGROUND_CONTEXT,
+    )) !== undefined;
+
+  // If an earlier attempt already fell back to Main for this exact occurrence
+  // answer, never post a duplicate even if a side chat with that slug is
+  // created later.
+  if (await alreadyDeliveredTo(ROOT_CONVERSATION_ID)) return;
+
+  const targetSidechat = await sidechats?.resolve(targetRef);
+  if (targetSidechat !== undefined && sidechats !== undefined) {
+    const targetConversationId = nativeConversationId(targetSidechat.conversation_id);
+    if (await alreadyDeliveredTo(targetConversationId)) return;
+    await sidechats.unarchiveIfNeeded(targetSidechat.conversation_id);
+    const lineage = await tasks.noticeOrigin(conversation, answerEntry.id);
+    await publishConversationNotice(session, targetConversationId, conversation, answerEntry, taskId, [], {
+      key: deliveryKey,
+      text: answerText,
+      events: [],
+      taskTitle: occurrence.job.title,
+      ...(lineage === undefined ? {} : { origin: lineage }),
+    });
+    await sidechats.touchUpdatedAt(targetSidechat.conversation_id);
+    return;
+  }
+
+  const warningText = `[Scheduled job "${occurrence.job.title}" could not find side chat "${targetRef}"; delivered here instead.]\n\n${answerText}`;
+  const lineage = await tasks.noticeOrigin(conversation, answerEntry.id);
+  await publishConversationNotice(session, ROOT_CONVERSATION_ID, conversation, answerEntry, taskId, [], {
+    key: deliveryKey,
+    text: warningText,
+    events: [],
+    taskTitle: occurrence.job.title,
+    ...(lineage === undefined ? {} : { origin: lineage }),
+  });
+}
+
 /** Run the existing task actor in the coordinator, then settle its exact Pi input. */
 export async function runScheduled(occurrence: ScheduledOccurrence, signal: AbortSignal,
-  services: { session: Harness; tasks: TaskStore; sources: SourceJournal },
+  services: { session: Harness; tasks: TaskStore; sources: SourceJournal; sidechats?: SidechatStore },
   id = scheduledTaskId(occurrence.id)): Promise<void> {
-  const { session, tasks, sources } = services;
-  const task = await tasks.create({ id, title: occurrence.job.title,
-    outcome: occurrence.job.prompt, model: occurrence.job.model,
-    job_id: occurrence.job.id });
+  const { session, tasks, sources, sidechats } = services;
+  const resolvedTarget = occurrence.job.delivery_sidechat === undefined
+    ? undefined
+    : await sidechats?.resolve(occurrence.job.delivery_sidechat);
+  const task = await tasks.create({
+    id,
+    title: occurrence.job.title,
+    outcome: occurrence.job.prompt,
+    model: occurrence.job.model,
+    job_id: occurrence.job.id,
+    ...(resolvedTarget === undefined ? {} : { delivery_conversation_id: resolvedTarget.conversation_id }),
+  });
+  if (task.delivery_conversation_id !== resolvedTarget?.conversation_id) {
+    await tasks.setDeliveryConversation(task.id, resolvedTarget?.conversation_id);
+  }
   const conversation = await tasks.conversation(task.conversation_id);
   let submission = await session.commit((tx) => tx.submissionByRequest(conversation.id, occurrence.id), BACKGROUND_CONTEXT);
-  if (submission?.status === "done") return;
+  if (submission?.type === "input" && submission.status === "done") {
+    await deliverJobOutput(occurrence, session, tasks, sidechats, id, conversation, submission);
+    return;
+  }
   if (submission?.status === "unanswered") { await requireReconciledTask(session, tasks, sources, id, occurrence.id); return; }
   if (submission === undefined && !task.pending.some((input) => input.id === occurrence.id)) {
     await tasks.enqueueScheduled(id, occurrencePrompt(occurrence), occurrence);
@@ -78,7 +157,10 @@ export async function runScheduled(occurrence: ScheduledOccurrence, signal: Abor
       const observed = revision;
       submission = await session.commit((tx) => tx.submissionByRequest(conversation.id, occurrence.id), BACKGROUND_CONTEXT);
       if (submission?.status === "unanswered") { await requireReconciledTask(session, tasks, sources, id, occurrence.id); return; }
-      if (submission?.status === "done") return;
+      if (submission?.type === "input" && submission.status === "done") {
+        await deliverJobOutput(occurrence, session, tasks, sidechats, id, conversation, submission);
+        return;
+      }
       if (failure !== undefined) throw failure;
       const latest = (await sources.events({ provider: "task_outcomes", thread_id: id, limit: 1 }))[0];
       if (latest?.key !== previousOutcome && latest?.outcome?.state.state === "failed") throw new TaskError(latest.outcome.state.reason);

@@ -2,8 +2,9 @@
 use crate::{
     chat_commands::ChatCommand,
     protocol::{
-        GoalTarget, HistoryMessage, InputMode, ModelActivity, RuntimeCommand, RuntimeEventKind,
-        SavedConversation, SourceState,
+        GoalTarget, HistoryMessage, InputMode, ModelActivity, ReplyReference, RuntimeCommand,
+        RuntimeEventKind, SavedConversation, SidechatNotificationPreference, SidechatSummary,
+        SourceState,
     },
 };
 use anyhow::{Result, ensure};
@@ -67,15 +68,95 @@ pub enum NativeRequest {
     Inspect {
         conversation_id: String,
     },
-    /// Main-only local controls. Never submits a composer input.
+    /// Main or sidechat local controls. Never submits a composer input.
     Settings {
         change: Option<crate::protocol::ConversationChange>,
         #[serde(default)]
         catalog: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        conversation_id: Option<String>,
+    },
+    ListSidechats {
+        #[serde(default)]
+        include_archived: bool,
+    },
+    CreateSidechat {
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        slug: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        charter: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        isolated: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        notifications: Option<SidechatNotificationPreference>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        seed: Option<ReplyReference>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        handoff: Option<String>,
+    },
+    UpdateSidechat {
+        conversation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        slug: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pinned: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        archived: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        charter: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        clear_charter: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        isolated: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        notifications: Option<SidechatNotificationPreference>,
+    },
+    ObserveSidechat {
+        conversation_id: String,
+        input_ids: Vec<String>,
+    },
+    SidechatInput {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        origin: Option<crate::protocol::InputOrigin>,
+        conversation_id: String,
+        input_id: String,
+        text: String,
+        mode: InputMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        attachments: Option<Vec<crate::attachments::AttachmentRef>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reply_to: Option<ReplyReference>,
+    },
+    SidechatInterrupt {
+        conversation_id: String,
     },
     ToolDetails {
         entry_id: String,
         call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        conversation_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         task_id: Option<crate::protocol::TaskId>,
@@ -271,6 +352,12 @@ pub enum NativeEvent {
         dreams: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
+        sidechats: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        sidechat: Option<Box<SidechatSummary>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
         working: Option<bool>,
         conversation_id: String,
         model: String,
@@ -289,6 +376,12 @@ pub enum NativeEvent {
     Conversations {
         items: Vec<SavedConversation>,
         next_cursor: Option<String>,
+    },
+    Sidechat {
+        sidechat: Box<SidechatSummary>,
+    },
+    Sidechats {
+        items: Vec<SidechatSummary>,
     },
     Working {
         working: bool,
@@ -396,7 +489,12 @@ pub enum Operation {
 pub fn commands() -> Vec<SlashCommand> {
     crate::chat_commands::command_help()
         .into_iter()
-        .filter(|(usage, _)| usage.split_whitespace().next() != Some("/resume"))
+        .filter(|(usage, _)| {
+            !matches!(
+                usage.split_whitespace().next(),
+                Some("/resume" | "/sidechat" | "/main")
+            )
+        })
         .map(|(usage, description)| SlashCommand { usage, description })
         .collect()
 }
@@ -419,13 +517,134 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
             }
         }
         NativeRequest::TaskGraph => RuntimeCommand::ReadTaskGraph,
-        NativeRequest::Settings { change, catalog } => RuntimeCommand::ConversationSettings {
-            task_id: None,
-            agent_id: None,
-            conversation_id: None,
+        NativeRequest::Settings {
             change,
             catalog,
-        },
+            conversation_id,
+        } => {
+            if let Some(ref id) = conversation_id {
+                validate_non_empty_id(id, "Choose a saved conversation")?;
+            }
+            RuntimeCommand::ConversationSettings {
+                task_id: None,
+                agent_id: None,
+                conversation_id,
+                change,
+                catalog,
+            }
+        }
+        NativeRequest::ListSidechats { include_archived } => {
+            RuntimeCommand::ListSidechats { include_archived }
+        }
+        NativeRequest::CreateSidechat {
+            title,
+            slug,
+            charter,
+            isolated,
+            notifications,
+            seed,
+            handoff,
+        } => {
+            crate::sidechats::validate_title(&title)?;
+            if let Some(ref slug) = slug {
+                crate::sidechats::validate_slug(slug)?;
+            }
+            if let Some(ref charter) = charter {
+                crate::sidechats::validate_charter(charter)?;
+            }
+            if let Some(ref seed) = seed {
+                crate::sidechats::validate_seed(seed)?;
+            }
+            if let Some(ref handoff) = handoff {
+                crate::sidechats::validate_handoff(handoff)?;
+            }
+            RuntimeCommand::CreateSidechat {
+                title,
+                slug,
+                charter,
+                isolated,
+                notifications,
+                seed,
+                handoff,
+            }
+        }
+        NativeRequest::UpdateSidechat {
+            conversation_id,
+            title,
+            slug,
+            pinned,
+            archived,
+            charter,
+            clear_charter,
+            isolated,
+            notifications,
+        } => {
+            validate_non_empty_id(&conversation_id, "Choose a side chat conversation")?;
+            if let Some(ref title) = title {
+                crate::sidechats::validate_title(title)?;
+            }
+            if let Some(ref slug) = slug {
+                crate::sidechats::validate_slug(slug)?;
+            }
+            if let Some(ref charter) = charter {
+                crate::sidechats::validate_charter(charter)?;
+            }
+            ensure!(
+                !(charter.is_some() && clear_charter == Some(true)),
+                "Choose either charter text or clear_charter, not both"
+            );
+            RuntimeCommand::UpdateSidechat {
+                conversation_id,
+                title,
+                slug,
+                pinned,
+                archived,
+                charter,
+                clear_charter,
+                isolated,
+                notifications,
+            }
+        }
+        NativeRequest::ObserveSidechat {
+            conversation_id,
+            input_ids,
+        } => {
+            validate_non_empty_id(&conversation_id, "Choose a side chat conversation")?;
+            ensure!(input_ids.len() <= 32, "Too many pending inputs");
+            for id in &input_ids {
+                validate_id(id)?;
+            }
+            RuntimeCommand::ObserveSidechat {
+                conversation_id,
+                input_ids,
+            }
+        }
+        NativeRequest::SidechatInput {
+            origin,
+            conversation_id,
+            input_id,
+            text,
+            mode,
+            attachments,
+            reply_to,
+        } => {
+            validate_non_empty_id(&conversation_id, "Choose a side chat conversation")?;
+            validate_user_input(&input_id, &text, attachments.as_deref(), reply_to.as_ref())?;
+            RuntimeCommand::SidechatInput {
+                origin,
+                conversation_id,
+                input_id,
+                input: text,
+                mode,
+                context: None,
+                attachments,
+                reply_to,
+            }
+        }
+        NativeRequest::SidechatInterrupt { conversation_id } => {
+            validate_non_empty_id(&conversation_id, "Choose a side chat conversation")?;
+            RuntimeCommand::ConversationInterrupt { conversation_id }
+        }
         NativeRequest::History {
             cursor,
             conversation_id,
@@ -466,6 +685,7 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
         NativeRequest::ToolDetails {
             entry_id,
             call_id,
+            conversation_id,
             task_id,
             agent_id,
         } => {
@@ -478,9 +698,13 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
                 !call_id.is_empty() && call_id.len() <= 1024,
                 "Invalid tool call ID"
             );
+            if let Some(conversation_id) = conversation_id.as_deref() {
+                validate_non_empty_id(conversation_id, "Choose a saved conversation")?;
+            }
             RuntimeCommand::ReadToolDetails {
                 entry_id,
                 call_id,
+                conversation_id,
                 task_id,
                 agent_id,
             }
@@ -517,20 +741,8 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
             attachments,
             reply_to,
         } => {
-            let request_id = validate_id(&input_id)?;
-            ensure!(
-                (!text.trim().is_empty()
-                    || attachments.as_ref().is_some_and(|items| !items.is_empty()))
-                    && text.len() <= 65_536,
-                "Input must contain 1 to 65536 UTF-8 bytes"
-            );
-            ensure!(
-                attachments
-                    .as_ref()
-                    .is_none_or(|items| items.len() <= crate::attachments::MAX_ATTACHMENTS),
-                "Choose at most eight attachments"
-            );
-            validate_reply_reference(reply_to.as_ref())?;
+            let request_id =
+                validate_user_input(&input_id, &text, attachments.as_deref(), reply_to.as_ref())?;
             if let Some(control) = ChatCommand::parse(&text) {
                 let control = match control {
                     Ok(control) => control,
@@ -585,6 +797,9 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
                     ChatCommand::Resume { .. } => return Ok(Operation::Local(NativeEvent::Rejected {
                         input_id, message: "This phone client stays on the main conversation. Saved conversation viewing with /resume is available in the TUI.".into(),
                     })),
+                    ChatCommand::Sidechat { .. } | ChatCommand::Main => return Ok(Operation::Local(NativeEvent::Rejected {
+                        input_id, message: "Use the Side chats button in the header to browse or switch standing side chats.".into(),
+                    })),
                     ChatCommand::Status | ChatCommand::Model { .. } | ChatCommand::Fast { .. }
                     | ChatCommand::Reasoning { .. } | ChatCommand::Jobs { .. }
                     | ChatCommand::RunJob(_) | ChatCommand::Worktrees | ChatCommand::Goal { .. } => anyhow::bail!("The shared control handler did not accept this request"),
@@ -606,7 +821,14 @@ pub fn prepare(request: NativeRequest) -> Result<Operation> {
 }
 
 fn validate_non_empty_id(value: &str, message: &str) -> Result<()> {
-    ensure!(!value.trim().is_empty() && value.len() <= 128, "{message}");
+    ensure!(
+        !value.trim().is_empty()
+            && value.len() <= 128
+            && !value
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control()),
+        "{message}"
+    );
     Ok(())
 }
 
@@ -619,6 +841,26 @@ fn validate_reply_reference(reply_to: Option<&crate::protocol::ReplyReference>) 
         );
     }
     Ok(())
+}
+
+fn validate_user_input(
+    input_id: &str,
+    text: &str,
+    attachments: Option<&[crate::attachments::AttachmentRef]>,
+    reply_to: Option<&crate::protocol::ReplyReference>,
+) -> Result<uuid::Uuid> {
+    let request_id = validate_id(input_id)?;
+    ensure!(
+        (!text.trim().is_empty() || attachments.is_some_and(|items| !items.is_empty()))
+            && text.len() <= 65_536,
+        "Input must contain 1 to 65536 UTF-8 bytes"
+    );
+    ensure!(
+        attachments.is_none_or(|items| items.len() <= crate::attachments::MAX_ATTACHMENTS),
+        "Choose at most eight attachments"
+    );
+    validate_reply_reference(reply_to)?;
+    Ok(request_id)
 }
 
 fn validate_id(id: &str) -> Result<uuid::Uuid> {
@@ -638,6 +880,38 @@ fn model_label(model: &crate::models::ModelSelection) -> String {
             .map_or("default", crate::models::Reasoning::as_str),
         if model.fast { " · fast" } else { "" }
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_ready(
+    input_origins: Option<bool>,
+    accepted_input_origins: Option<&crate::protocol::AcceptedInputOrigins>,
+    conversation_settings: Option<bool>,
+    work_inspection: Option<bool>,
+    active_work: Option<bool>,
+    sidechats: Option<bool>,
+    sidechat: Option<Box<crate::protocol::SidechatSummary>>,
+    working: Option<bool>,
+    conversation_id: &str,
+    model: &crate::models::ModelSelection,
+) -> NativeEvent {
+    let accepted = crate::protocol::AcceptedInputOrigins::from_main_ready(
+        accepted_input_origins,
+        input_origins,
+    );
+    NativeEvent::Ready {
+        input_origins: accepted.flag_for_phones_before_the_list(),
+        accepted_input_origins: accepted.non_empty(),
+        conversation_settings,
+        work_inspection,
+        active_work,
+        dreams: None,
+        sidechats,
+        sidechat,
+        working,
+        conversation_id: conversation_id.to_owned(),
+        model: model_label(model),
+    }
 }
 
 pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
@@ -665,26 +939,43 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
             accepted_input_origins,
             conversation_settings,
             active_work,
+            sidechats,
             conversation_id,
             model,
             ..
-        } => {
-            let accepted = crate::protocol::AcceptedInputOrigins::from_main_ready(
-                accepted_input_origins.as_ref(),
-                *input_origins,
-            );
-            NativeEvent::Ready {
-                input_origins: accepted.flag_for_phones_before_the_list(),
-                accepted_input_origins: accepted.non_empty(),
-                conversation_settings: *conversation_settings,
-                work_inspection: Some(true),
-                active_work: *active_work,
-                dreams: None,
-                working: None,
-                conversation_id: conversation_id.clone(),
-                model: model_label(model),
-            }
-        }
+        } => project_ready(
+            *input_origins,
+            accepted_input_origins.as_ref(),
+            *conversation_settings,
+            Some(true),
+            *active_work,
+            *sidechats,
+            None,
+            None,
+            conversation_id,
+            model,
+        ),
+        RuntimeEventKind::SidechatReady {
+            input_origins,
+            accepted_input_origins,
+            conversation_settings,
+            conversation_id,
+            sidechat,
+            model,
+            working,
+            ..
+        } => project_ready(
+            *input_origins,
+            accepted_input_origins.as_ref(),
+            *conversation_settings,
+            None,
+            None,
+            Some(true),
+            Some(Box::new(sidechat.clone())),
+            Some(*working),
+            conversation_id,
+            model,
+        ),
         RuntimeEventKind::ConversationReady {
             conversation,
             model,
@@ -697,6 +988,8 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
             work_inspection: None,
             active_work: None,
             dreams: None,
+            sidechats: None,
+            sidechat: None,
             working: Some(*working),
             conversation_id: conversation.conversation_id.clone(),
             model: model_label(model),
@@ -707,6 +1000,12 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
         RuntimeEventKind::Conversations { items, next_cursor } => NativeEvent::Conversations {
             items: items.clone(),
             next_cursor: next_cursor.clone(),
+        },
+        RuntimeEventKind::Sidechat { sidechat } => NativeEvent::Sidechat {
+            sidechat: Box::new(sidechat.clone()),
+        },
+        RuntimeEventKind::Sidechats { items } => NativeEvent::Sidechats {
+            items: items.clone(),
         },
         RuntimeEventKind::History {
             messages,
@@ -846,6 +1145,7 @@ mod tests {
             let request = NativeRequest::Settings {
                 change: Some(change.clone()),
                 catalog: true,
+                conversation_id: None,
             };
             let decoded = serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
             let Operation::Runtime(command) = prepare(decoded).unwrap() else {
@@ -884,17 +1184,20 @@ mod tests {
                 accepted_input_origins: None,
                 conversation_settings: advertised,
                 active_work: advertised,
+                sidechats: advertised,
             };
             let Some(NativeEvent::Ready {
                 input_origins,
                 conversation_settings,
                 active_work,
+                sidechats,
                 ..
             }) = crate::native::project(&event)
             else {
                 panic!("Expected main ready")
             };
             assert_eq!(active_work, advertised);
+            assert_eq!(sidechats, advertised);
             assert_eq!(input_origins, advertised.filter(|value| *value));
             assert_eq!(conversation_settings, advertised);
         }
@@ -1310,6 +1613,7 @@ mod tests {
                 model: crate::models::ModelSelection::default(),
                 timezone: "Etc/UTC".to_string().try_into().unwrap(),
                 cwd: "/workspace/example".into(),
+                delivery_sidechat: None,
                 revision: "original".into(),
                 schedules: vec![JobSchedule {
                     id: "daily".to_string().try_into().unwrap(),
@@ -1430,6 +1734,7 @@ mod tests {
     #[test]
     fn tool_details_keep_the_durable_anchor_and_never_become_model_input() {
         let Operation::Runtime(command) = prepare(NativeRequest::ToolDetails {
+            conversation_id: None,
             task_id: None,
             agent_id: None,
             entry_id: "42".into(),
@@ -1439,12 +1744,13 @@ mod tests {
             panic!("Expected a read-only runtime lookup");
         };
         assert!(
-            matches!(*command, RuntimeCommand::ReadToolDetails { entry_id, call_id, task_id: None, agent_id: None }
+            matches!(*command, RuntimeCommand::ReadToolDetails { entry_id, call_id, conversation_id: None, task_id: None, agent_id: None }
             if entry_id == "42" && call_id == "provider-call")
         );
         for entry_id in ["", "0", "-1", "01", "1.0", "9007199254740992"] {
             assert!(
                 prepare(NativeRequest::ToolDetails {
+                    conversation_id: None,
                     task_id: None,
                     agent_id: None,
                     entry_id: entry_id.into(),
@@ -1456,6 +1762,7 @@ mod tests {
         for call_id in [String::new(), "🦀".repeat(257)] {
             assert!(
                 prepare(NativeRequest::ToolDetails {
+                    conversation_id: None,
                     task_id: None,
                     agent_id: None,
                     entry_id: "42".into(),
@@ -1828,6 +2135,7 @@ mod tests {
             accepted_input_origins: None,
             conversation_settings: Some(true),
             active_work: Some(true),
+            sidechats: Some(true),
         };
         let Some(NativeEvent::Ready { dreams, .. }) = crate::native::project(&main_ready) else {
             panic!("Expected NativeEvent::Ready");
@@ -1836,6 +2144,145 @@ mod tests {
             dreams, None,
             "Pi MainReady never advertises Dreams directly"
         );
+    }
+
+    #[test]
+    fn sidechat_requests_validate_and_project_typed_events() {
+        let list = prepare(NativeRequest::ListSidechats {
+            include_archived: true,
+        })
+        .unwrap();
+        assert!(matches!(
+            list,
+            Operation::Runtime(cmd) if matches!(*cmd, RuntimeCommand::ListSidechats { include_archived: true })
+        ));
+
+        let created = prepare(NativeRequest::CreateSidechat {
+            title: "Morning Brief".into(),
+            slug: Some("morning-brief".into()),
+            charter: Some("Daily briefings.".into()),
+            isolated: Some(false),
+            notifications: Some(crate::protocol::SidechatNotificationPreference::On),
+            seed: None,
+            handoff: Some("Start from today.".into()),
+        })
+        .unwrap();
+        assert!(matches!(
+            created,
+            Operation::Runtime(cmd) if matches!(*cmd, RuntimeCommand::CreateSidechat { .. })
+        ));
+
+        // Reject invalid/numeric slugs, control chars in titles, and conflicting charter + clear_charter.
+        assert!(
+            prepare(NativeRequest::CreateSidechat {
+                title: "Bad".into(),
+                slug: Some("BAD SLUG!".into()),
+                charter: None,
+                isolated: None,
+                notifications: None,
+                seed: None,
+                handoff: None,
+            })
+            .is_err()
+        );
+        assert!(
+            prepare(NativeRequest::CreateSidechat {
+                title: "Numeric slug".into(),
+                slug: Some("42".into()),
+                charter: None,
+                isolated: None,
+                notifications: None,
+                seed: None,
+                handoff: None,
+            })
+            .is_err()
+        );
+        assert!(
+            prepare(NativeRequest::CreateSidechat {
+                title: "Underscore slug".into(),
+                slug: Some("Morning_Brief".into()),
+                charter: None,
+                isolated: None,
+                notifications: None,
+                seed: None,
+                handoff: None,
+            })
+            .is_ok()
+        );
+        assert!(
+            prepare(NativeRequest::CreateSidechat {
+                title: "Bad\nTitle".into(),
+                slug: None,
+                charter: None,
+                isolated: None,
+                notifications: None,
+                seed: None,
+                handoff: None,
+            })
+            .is_err()
+        );
+        assert!(
+            prepare(NativeRequest::UpdateSidechat {
+                conversation_id: "7".into(),
+                title: None,
+                slug: None,
+                pinned: None,
+                archived: None,
+                charter: Some("New charter".into()),
+                clear_charter: Some(true),
+                isolated: None,
+                notifications: None,
+            })
+            .is_err()
+        );
+
+        let interrupt = prepare(NativeRequest::SidechatInterrupt {
+            conversation_id: "7".into(),
+        })
+        .unwrap();
+        assert!(matches!(
+            interrupt,
+            Operation::Runtime(cmd) if matches!(&*cmd, RuntimeCommand::ConversationInterrupt { conversation_id } if conversation_id == "7")
+        ));
+
+        let summary = crate::protocol::SidechatSummary {
+            conversation_id: "7".into(),
+            slug: "morning-brief".into(),
+            title: "Morning Brief".into(),
+            pinned: true,
+            archived_at: None,
+            charter: Some("Daily briefings.".into()),
+            isolated: false,
+            notifications: crate::protocol::SidechatNotificationPreference::On,
+            seed: None,
+            created_at: 100,
+            updated_at: 200,
+        };
+        let ready = crate::native::project(&RuntimeEventKind::SidechatReady {
+            input_origins: Some(true),
+            accepted_input_origins: None,
+            conversation_settings: Some(true),
+            conversation_id: "7".into(),
+            sidechat: summary.clone(),
+            model: crate::models::ModelSelection {
+                provider: crate::models::ModelProvider::OpenAi,
+                model_id: "fixture".into(),
+                reasoning: None,
+                fast: false,
+            },
+            cwd: String::new(),
+            working: true,
+        });
+        assert!(matches!(
+            ready,
+            Some(NativeEvent::Ready {
+                sidechats: Some(true),
+                sidechat: Some(projected),
+                working: Some(true),
+                conversation_id,
+                ..
+            }) if *projected == summary && conversation_id == "7"
+        ));
     }
 }
 

@@ -539,6 +539,87 @@ pub enum RuntimeCommand {
         cursor: Option<String>,
         limit: u32,
     },
+    /// List standing topic side chats (pinned first, then recently updated).
+    ListSidechats {
+        #[serde(default)]
+        include_archived: bool,
+    },
+    /// Create a fresh standing topic side chat (never a Pi conversation fork).
+    CreateSidechat {
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        slug: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        charter: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        isolated: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        notifications: Option<SidechatNotificationPreference>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        seed: Option<ReplyReference>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        handoff: Option<String>,
+    },
+    /// Update metadata, pin state, archive state, charter, isolation, or alerts on a side chat.
+    UpdateSidechat {
+        conversation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        slug: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pinned: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        archived: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        charter: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        clear_charter: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        isolated: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        notifications: Option<SidechatNotificationPreference>,
+    },
+    /// Long-lived, snapshot-to-live observation of a standing side chat.
+    ObserveSidechat {
+        conversation_id: String,
+        #[serde(default)]
+        input_ids: Vec<String>,
+    },
+    DetachSidechat,
+    /// Admit a message into a standing side chat using durable request identity.
+    SidechatInput {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        origin: Option<InputOrigin>,
+        conversation_id: String,
+        input_id: String,
+        input: String,
+        mode: InputMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        context: Option<MainInputContext>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        attachments: Option<Vec<crate::attachments::AttachmentRef>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reply_to: Option<ReplyReference>,
+    },
     /// Observe a saved conversation without claiming its execution.
     AttachConversation {
         conversation_id: String,
@@ -583,6 +664,9 @@ pub enum RuntimeCommand {
     ReadToolDetails {
         entry_id: String,
         call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        conversation_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         task_id: Option<TaskId>,
@@ -889,6 +973,11 @@ pub struct TaskRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub scheduled_run: Option<crate::background::JobRunReceipt>,
+    /// Optional side chat conversation ID where routine task updates and job
+    /// briefings land instead of Main.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub delivery_conversation_id: Option<String>,
     pub state: TaskState,
     pub worker: WorkerState,
     pub sources: Vec<SourceRef>,
@@ -965,6 +1054,9 @@ pub struct ActiveWorkItem {
     #[ts(optional)]
     pub host: Option<String>,
     pub is_job: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub sidechat_slug: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub detail: Option<String>,
@@ -1090,10 +1182,24 @@ pub enum TaskGraphBlocked {
     RestartLimit,
 }
 
+/// Metadata identifying a standing topic side chat in a `TaskGraphConversation`.
+///
+/// Carried as an optional field on `TaskGraphConversation` (with `actor: TaskGraphActor::Other`)
+/// rather than a new closed `TaskGraphActor` enum variant so older native and CLI clients continue
+/// decoding task-graph snapshots without error while a side chat turn is running.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
+pub struct TaskGraphSidechat {
+    pub slug: String,
+    pub title: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS)]
 pub struct TaskGraphConversation {
     pub conversation_id: String,
     pub actor: TaskGraphActor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub sidechat: Option<TaskGraphSidechat>,
 }
 
 /// Who a conversation belongs to in Beep Boop.
@@ -1112,7 +1218,8 @@ pub enum TaskGraphActor {
         /// The conversation of the task this agent works for. Its row is always present.
         parent_conversation_id: String,
     },
-    /// No task or agent owns it, as with source triage.
+    /// No task or agent owns it, as with source triage or standing side chats
+    /// (side chats carry additional metadata in `TaskGraphConversation::sidechat`).
     Other,
 }
 
@@ -1713,6 +1820,12 @@ pub enum RuntimeEventKind {
         items: Vec<SavedConversation>,
         next_cursor: Option<String>,
     },
+    Sidechat {
+        sidechat: SidechatSummary,
+    },
+    Sidechats {
+        items: Vec<SidechatSummary>,
+    },
     Configured,
     Notifications {
         status: crate::notifications::NotificationStatus,
@@ -1803,9 +1916,29 @@ pub enum RuntimeEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         active_work: Option<bool>,
+        /// Missing on legacy runtimes; native clients gate standing side chats per connection.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        sidechats: Option<bool>,
         conversation_id: String,
         model: ModelSelection,
         cwd: String,
+    },
+    SidechatReady {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        input_origins: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        accepted_input_origins: Option<AcceptedInputOrigins>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        conversation_settings: Option<bool>,
+        conversation_id: String,
+        sidechat: SidechatSummary,
+        model: ModelSelection,
+        cwd: String,
+        working: bool,
     },
     ConversationReady {
         conversation: SavedConversation,
@@ -1944,6 +2077,57 @@ pub struct HistoryMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub reply_to: Option<ReplyReference>,
+}
+
+/// Per-sidechat APNs push notification override.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Deserialize,
+    Serialize,
+    JsonSchema,
+    TS,
+    clap::ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SidechatNotificationPreference {
+    /// Follow the device's Main chat notification preference.
+    #[default]
+    Inherit,
+    /// Always push alerts for this side chat while the device has push permission.
+    On,
+    /// Suppress push alerts for this side chat even when Main alerts are enabled.
+    Off,
+}
+
+/// Durable metadata for a standing topic side chat.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
+pub struct SidechatSummary {
+    pub conversation_id: String,
+    pub slug: String,
+    pub title: String,
+    pub pinned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub archived_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub charter: Option<String>,
+    #[serde(default)]
+    pub isolated: bool,
+    #[serde(default)]
+    pub notifications: SidechatNotificationPreference,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub seed: Option<ReplyReference>,
+    #[ts(type = "number")]
+    pub created_at: i64,
+    #[ts(type = "number")]
+    pub updated_at: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]

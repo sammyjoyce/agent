@@ -5,7 +5,7 @@ import { DREAMS_HOST_TIMEOUT_MS } from "./generated/dreams-limits.js";
 import { awaitWithContext, BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import { Type } from "typebox";
 import { Check } from "typebox/value";
-import { defineExtension, defineTool, ROOT_CONVERSATION_ID, type Extension, type Harness, type ToolExecutionResult } from "@earendil-works/pi-durable";
+import { defineExtension, defineTool, GenerationTask, hook, ROOT_CONVERSATION_ID, type Extension, type Harness, type ToolExecutionResult } from "@earendil-works/pi-durable";
 import { DEFAULT_MODEL } from "./models.js";
 import { agentPresentation, commandPresentation, outputPreview, type MessageContent } from "./message-presentation.js";
 import type { ToolCall } from "@earendil-works/pi-ai";
@@ -29,7 +29,7 @@ import { imageInput, readImageFile, type ReadFileCommand } from "./images.js";
 import type { OwnerGate } from "./failover/owner-gate.js";
 
 export const MAX_FILE_READ_BYTES = 262_144;
-export type Execution = { model?: ModelSelection; cwd: string; hosts: WorkerHost[]; default_host?: WorkerHost | null; call: HostCall; role?: "worker" | "triage";
+export type Execution = { model?: ModelSelection; cwd: string; hosts: WorkerHost[]; default_host?: WorkerHost | null; call: HostCall; role?: "worker" | "triage" | "sidechat";
   origin_host_id?: string | null; connectedHosts?: () => Promise<WorkerHost[]>;
   search?: SearchQuery;
   project?: () => Promise<HostResult>;
@@ -72,9 +72,13 @@ export class Executions {
     if (execution === undefined) throw new TaskError("The execution client is disconnected; attach the task to continue");
     return execution;
   }
+  isCoordinator(id: string): boolean {
+    const execution = this.get(id);
+    return id === ROOT_CONVERSATION_ID.toString() || execution.role === "triage" || execution.role === "sidechat";
+  }
   async sender(tasks: TaskStore, id: string): Promise<TaskMessageSender> {
-    // Source triage is coordinator-owned, but has its own native conversation.
-    return this.get(id).role === "triage" ? { type: "coordinator", conversation_id: id } : tasks.messageSender(id);
+    // Source triage and standing side chats are coordinator-owned, each with its own native conversation.
+    return this.isCoordinator(id) ? { type: "coordinator", conversation_id: id } : tasks.messageSender(id);
   }
   async hosts(id: string): Promise<WorkerHost[]> {
     const execution = this.get(id);
@@ -218,9 +222,8 @@ export class HostRequests {
 /** Job definitions stay in the scheduler; tools only expose its typed control API. */
 export function createJobTools(jobs: BackgroundScheduler, executions: Executions): Extension {
   function control(id: string): void {
-    const execution = executions.get(id);
-    if (execution.role === "worker" || (id !== ROOT_CONVERSATION_ID.toString() && execution.role !== "triage")) {
-      throw new TaskError("Job control belongs to the main conversation or coordinator triage");
+    if (!executions.isCoordinator(id)) {
+      throw new TaskError("Job control belongs to the main conversation, standing side chats, or coordinator triage");
     }
   }
   return defineExtension({ name: "job-control", tools: [
@@ -325,20 +328,21 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
       reconciles_input: Type.Optional(Type.String({ minLength: 1,
         description: "Exact unanswered input request ID reconciled by this recovery turn. Verify prior effects first; this does not resolve ongoing work." })) }),
     async execute(args, api) {
-      const execution = executions.get(api.conversationId.toString());
+      const callerId = api.conversationId.toString();
+      const coordinator = executions.isCoordinator(callerId);
       const task = args.task_id === undefined
-        ? (await tasks.list()).find((task) => task.conversation_id === api.conversationId.toString())
+        ? (await tasks.list()).find((task) => task.conversation_id === callerId)
         : await tasks.get(args.task_id);
       if (task === undefined) throw new TaskError("No task owns this conversation");
-      if (task.conversation_id !== api.conversationId.toString() && api.conversationId !== ROOT_CONVERSATION_ID && execution.role !== "triage") {
+      if (task.conversation_id !== callerId && !coordinator) {
         throw new TaskError("A worker can update only its own task");
       }
       if (args.state.state === "waiting" && args.state.next_check !== null && !Number.isFinite(Date.parse(args.state.next_check))) {
         throw new TaskError("The next check must be an ISO timestamp or null");
       }
-      const recorded = await tasks.record(task.id, args, { conversation_id: api.conversationId.toString(),
+      const recorded = await tasks.record(task.id, args, { conversation_id: callerId,
         call_id: api.callId, native_task_id: api.taskId,
-        settled: api.conversationId === ROOT_CONVERSATION_ID || execution.role === "triage" });
+        settled: coordinator });
       return output({ id: recorded.id, conversation_id: recorded.conversation_id, state: recorded.state,
         updated_at: recorded.updated_at } satisfies Pick<TaskRecord, "id" | "conversation_id" | "state" | "updated_at">);
     } });
@@ -389,18 +393,22 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         cwd: Type.Optional(Type.String({ minLength: 1 })), new_task: Type.Optional(Type.Boolean()),
         new_task_reason: Type.Optional(Type.String({ minLength: 1, maxLength: 500 })), sources: Type.Optional(Type.Array(source)) }),
       async execute(args, api, context) {
-        const execution = executions.get(api.conversationId.toString());
+        const callerId = api.conversationId.toString();
+        const execution = executions.get(callerId);
+        // Resolve sender ownership before committing any new task so invalid callers never strand orphan tasks.
+        const sender = await executions.sender(tasks, callerId);
         let query: string | null = null;
         let related: Awaited<ReturnType<TaskStore["find"]>> = { matches: [], gaps: [] };
         let action: "reuse" | "create" | "adopt" = "reuse";
         const reason = args.new_task_reason?.trim() || null;
         const mode = args.mode ?? "steer";
         const record = (selection: DelegationDecision["selection"]) => api.commit((tx) => recordDelegation(tx, api.conversationId, {
-          actor_conversation_id: api.conversationId.toString(), tool_call_id: api.callId, query,
+          actor_conversation_id: callerId, tool_call_id: api.callId, query,
           candidates: related.matches.map((match) => ({ conversation_id: match.conversation_id, task_id: match.task_id, score: match.score })),
           gaps: related.gaps, selection, input_mode: mode,
         }), context);
         let task;
+        const deliveryConversationId = execution.role === "sidechat" ? callerId : undefined;
         if (args.task_id !== undefined && args.conversation_id !== undefined) throw new TaskError("Choose a task_id or conversation_id");
         if (args.conversation_id !== undefined) {
           const saved = await tasks.saved(args.conversation_id);
@@ -413,14 +421,15 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
             const model = configured.launch?.model ?? execution.model ?? DEFAULT_MODEL;
             await tasks.inference.preflight(model);
             const id = await api.memo("task_id", randomUUID(), context);
-            query = args.input; related = await tasks.find(query, args.sources ?? [], 8, execution.search);
+            query = args.input; related = await tasks.find(query, args.sources ?? [], 8, execution.search, "semantic", { includeSidechats: false });
             const evidence = related.matches.find((match) => match.conversation_id === args.conversation_id)?.excerpt ?? await tasks.readConversation(args.conversation_id, 24_000);
             task = await tasks.adopt(args.conversation_id, { id, ...(args.title === undefined ? {} : { title: args.title }),
-              outcome: args.outcome ?? args.input, evidence, model, ...(args.sources === undefined ? {} : { sources: args.sources }) });
+              outcome: args.outcome ?? args.input, evidence, model, ...(args.sources === undefined ? {} : { sources: args.sources }),
+              ...(deliveryConversationId === undefined ? {} : { delivery_conversation_id: deliveryConversationId }) });
             action = "adopt";
           }
         } else if (args.task_id === undefined) {
-          query = args.input + " " + (args.title ?? ""); related = await tasks.find(query, args.sources ?? [], 8, execution.search);
+          query = args.input + " " + (args.title ?? ""); related = await tasks.find(query, args.sources ?? [], 8, execution.search, "semantic", { includeSidechats: false });
           if (related.matches.length > 0 && (args.new_task !== true || reason === null)) {
             await record({ kind: "considered" });
             return output({ related_conversations: related.matches, gaps: related.gaps,
@@ -433,7 +442,14 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
           const model = configured.launch?.model ?? execution.model ?? DEFAULT_MODEL;
           await tasks.inference.preflight(model);
           const id = await api.memo("task_id", randomUUID(), context);
-          task = await tasks.create({ id, title: args.title, outcome: args.outcome, sources: args.sources ?? [], model });
+          task = await tasks.create({
+            id,
+            title: args.title,
+            outcome: args.outcome,
+            sources: args.sources ?? [],
+            model,
+            ...(deliveryConversationId === undefined ? {} : { delivery_conversation_id: deliveryConversationId }),
+          });
           action = "create";
         } else task = await tasks.get(args.task_id);
         if (task.model === null) { await tasks.selection(task.id, execution.model ?? DEFAULT_MODEL); task = await tasks.get(task.id); }
@@ -454,8 +470,8 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         await record(action === "create" ? { kind: "create", task_id: task.id, conversation_id: task.conversation_id, reason }
           : { kind: action, task_id: task.id, conversation_id: task.conversation_id });
         const inputId = await api.memo("input_id", randomUUID(), context);
-        await tasks.enqueue(task.id, args.input, inputId, undefined, mode, await tasks.attachmentRefs(args.attachments), undefined, await executions.sender(tasks, api.conversationId.toString()));
-        return agentOutput("delegate_task", args, api.conversationId.toString(), await tasks.dispatch(task.id, host, execution.call));
+        await tasks.enqueue(task.id, args.input, inputId, undefined, mode, await tasks.attachmentRefs(args.attachments), undefined, sender);
+        return agentOutput("delegate_task", args, callerId, await tasks.dispatch(task.id, host, execution.call));
       } }),
     record,
   ] });
@@ -519,11 +535,18 @@ export function createAppTools(tasks: TaskStore, executions: Executions): {
         return agentOutput("report_result", args, api.conversationId.toString(), await tasks.reportAgent(owner.task.id, owner.agent.id, args.summary, args.failure,
           { conversation_id: api.conversationId.toString(), call_id: api.callId }));
       } });
+  const workerOwnerWaitHook = hook(GenerationTask, {
+    async onYield(_answer, api) {
+      await tasks.flushWorkerOwnerWait(api.conversationId);
+      return undefined;
+    },
+  });
   const worker = defineExtension({ name: "task-parent",
     namespace: { name: "tasks", description: "Search, inspect, record, and coordinate tasks and child agents." },
+    hooks: [workerOwnerWaitHook],
     tools: [record, searchTask, readTask, messageTask, continueAgent, spawnAgent, readAgents, waitAgents] });
   const agent = defineExtension({ name: "task-agent", tools: [searchTask, readTask, messageTask, readAgents, reportResult] });
   // Pending actors may recover before their next configuration refresh.
-  const legacy = defineExtension({ name: "task-worker", tools: [record, searchTask, readTask, messageTask, continueAgent, spawnAgent, readAgents, waitAgents, reportResult] });
+  const legacy = defineExtension({ name: "task-worker", hooks: [workerOwnerWaitHook], tools: [record, searchTask, readTask, messageTask, continueAgent, spawnAgent, readAgents, waitAgents, reportResult] });
   return { host, main, worker, agent, legacy };
 }

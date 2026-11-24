@@ -14,7 +14,8 @@ import type { ModelSelection } from "./generated/ModelSelection.js";
 import type { TaskOutcome } from "./generated/TaskOutcome.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import { NoticeContextPlacement } from "./notice_context.js";
-import { publishMainNotice, sourceReference, TaskError, TaskStore, type NoticePublication } from "./tasks.js";
+import { nativeConversationId, publishConversationNotice, sourceReference, TaskError, TaskStore, type NoticePublication } from "./tasks.js";
+import type { SidechatStore } from "./sidechats.js";
 import { Executions } from "./tools.js";
 import { PartitionedRecords } from "./partitioned-records.js";
 import { watchDerived } from "./watch-derived.js";
@@ -82,7 +83,9 @@ export class SourceJournal {
   private triaging = false;
   private readonly records = new PartitionedRecords<StoredEvent>("agent.source.event", false);
   private preparing: Promise<void> | undefined;
+  private sidechats: SidechatStore | undefined;
   constructor(readonly session: Harness, readonly tasks: TaskStore, private readonly executions?: Executions) { tasks.trackOutcomes(this); }
+  useSidechats(sidechats: SidechatStore): void { this.sidechats = sidechats; }
   prepare(): Promise<void> {
     return this.preparing ??= this.migrate().catch((error: unknown) => { this.preparing = undefined; throw error; });
   }
@@ -561,6 +564,7 @@ export class SourceJournal {
         const prepared = "Continue this admitted source work; do not repeat completed actions.\n" + JSON.stringify({
           observed_at: new Date().toISOString(), events: records.map((record) => ({ key: record.key, event: record.event })),
           due_followups: due.map(task => ({ id: task.id, title: task.title, state: task.state, sources: task.sources,
+            ...(task.delivery_conversation_id === undefined ? {} : { delivery_conversation_id: task.delivery_conversation_id }),
             summary_preview: task.summary.slice(0, 1200), summary_truncated: task.summary.length > 1200 })),
           related_tasks: related.matches.map(match => ({ ...match, excerpt: match.excerpt.slice(0, 1200),
             excerpt_truncated: match.excerpt.length > 1200 })), retrieval_gaps: related.gaps,
@@ -606,17 +610,87 @@ export class SourceJournal {
     }
   }
   async notify(conversationId: string, callId: string, keys: readonly string[], taskId: string | null,
-    text: string, emit?: (task: string | null, text: string) => void): Promise<NoticePublication> {
+    text: string, emit?: (task: string | null, text: string) => void,
+    options?: { escalateToMain?: boolean }): Promise<{ publication: NoticePublication; destination: "main" | "sidechat" | "both" }> {
     const records = await this.events({ keys, limit: 100 });
     if (new Set(keys).size !== records.length) throw new TaskError("Notification refers to unknown source events");
     const task = taskId === null ? undefined : await this.tasks.get(taskId);
     const conversation = await this.tasks.conversation(conversationId);
     const origin = await this.tasks.origin(conversation, callId);
     const lineage = await this.tasks.noticeOrigin(conversation, origin.id);
-    const publication = await publishMainNotice(this.session, conversation, origin, taskId, records.map((record) => record.event.source),
-      { key: callId, text, ...(task === undefined ? {} : { taskTitle: task.title }), events: records.map((record) => record.event), ...(lineage === undefined ? {} : { origin: lineage }) });
+    const waitingOnOwner = task?.state.state === "waiting" && task.state.target === "owner";
+    const hasSidechatDelivery =
+      task?.delivery_conversation_id !== undefined &&
+      task.delivery_conversation_id !== ROOT_CONVERSATION_ID.toString();
+    const targetSidechat =
+      options?.escalateToMain === true || !hasSidechatDelivery
+        ? undefined
+        : await this.sidechats?.get(task.delivery_conversation_id!);
+    const sources = records.map((record) => record.event.source);
+    const notice = {
+      key: callId,
+      text,
+      ...(task === undefined ? {} : { taskTitle: task.title }),
+      events: records.map((record) => record.event),
+      ...(lineage === undefined ? {} : { origin: lineage }),
+    };
+
+    if (targetSidechat !== undefined && waitingOnOwner) {
+      // Keep the topic's own side chat up to date and also pass the blocking question up to Main.
+      await this.sidechats?.unarchiveIfNeeded(targetSidechat.conversation_id);
+      await publishConversationNotice(
+        this.session,
+        nativeConversationId(targetSidechat.conversation_id),
+        conversation,
+        origin,
+        taskId,
+        sources,
+        notice,
+      );
+      await this.sidechats?.touchUpdatedAt(targetSidechat.conversation_id);
+
+      const duplicateMain = records.length === 0 && task !== undefined
+        ? await this.tasks.hasMainNoticeInEpisode(task.id, text)
+        : false;
+      const mainPublication = duplicateMain
+        ? "published"
+        : await publishConversationNotice(this.session, ROOT_CONVERSATION_ID, conversation, origin, taskId, sources, notice);
+      if (task !== undefined) {
+        await this.tasks.recordMainNotice(task.id, text, { markEpisodeEscalated: true });
+      }
+      if (!duplicateMain && mainPublication === "published") emit?.(taskId, text);
+      return { publication: mainPublication, destination: "both" };
+    }
+
+    if (targetSidechat !== undefined) {
+      await this.sidechats?.unarchiveIfNeeded(targetSidechat.conversation_id);
+      const publication = await publishConversationNotice(
+        this.session,
+        nativeConversationId(targetSidechat.conversation_id),
+        conversation,
+        origin,
+        taskId,
+        sources,
+        notice,
+      );
+      await this.sidechats?.touchUpdatedAt(targetSidechat.conversation_id);
+      if (task !== undefined) {
+        await this.tasks.recordSidechatNotice(task.id, {
+          call_id: callId,
+          source_conversation_id: conversation.id.toString(),
+          source_entry_id: origin.id,
+          text,
+        });
+      }
+      return { publication, destination: "sidechat" };
+    }
+
+    const publication = await publishConversationNotice(this.session, ROOT_CONVERSATION_ID, conversation, origin, taskId, sources, notice);
+    if (task !== undefined) {
+      await this.tasks.recordMainNotice(task.id, text);
+    }
     if (publication === "published") emit?.(taskId, text);
-    return publication;
+    return { publication, destination: "main" };
   }
 }
 
@@ -626,7 +700,7 @@ function output(value: unknown): ToolExecutionResult {
 export function createSourceTools(journal: SourceJournal, executions: Executions): { main: Extension; worker: Extension } {
   function control(id: string) {
     const execution = executions.get(id);
-    if (id !== ROOT_CONVERSATION_ID.toString() && execution.role !== "triage") {
+    if (!executions.isCoordinator(id)) {
       throw new TaskError("Source decisions belong to the coordinator");
     }
     return execution;
@@ -638,18 +712,26 @@ export function createSourceTools(journal: SourceJournal, executions: Executions
       pending: Type.Optional(Type.Boolean()), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })) }),
     async execute(args) { return output(await journal.events(args)); } });
   const notifyUser = defineTool({ name: "notify_user", replay: "safe",
-    description: "Publish a brief useful update or necessary user question to the main chat while work continues. Stay quiet for routine progress or receipts; do not request approval again for already authorized work.",
-    parameters: Type.Object({ text: Type.String({ minLength: 1, maxLength: 4000 }) }, { additionalProperties: false }),
+    description: "Publish a brief useful update or necessary user question to the originating side chat (also passed up to Main while the task is waiting on the owner, or to Main only when started from Main or when escalate_to_main is true). Stay quiet for routine progress or receipts; do not request approval again for already authorized work.",
+    parameters: Type.Object({
+      text: Type.String({ minLength: 1, maxLength: 4000 }),
+      escalate_to_main: Type.Optional(Type.Boolean({ description: "Set true to surface an urgent alert or required owner decision in the Main chat instead of this task's originating side chat." })),
+    }, { additionalProperties: false }),
     async execute(args, api) {
-      const id = api.conversationId.toString(), execution = executions.get(id);
-      const task = id === ROOT_CONVERSATION_ID.toString() || execution.role === "triage"
-        ? undefined : (await journal.tasks.owner(id)).task;
+      const id = api.conversationId.toString();
+      const execution = executions.get(id);
+      if (execution.role === "sidechat" && args.escalate_to_main !== true) {
+        throw new TaskError("You are already in this side chat; reply directly or pass escalate_to_main: true to notify Main.");
+      }
+      const task = executions.isCoordinator(id) ? undefined : (await journal.tasks.owner(id)).task;
       const text = args.text.trim();
       if (text.length === 0) throw new TaskError("A user update needs actionable text");
       // The native tool call owns publication and its stable replay identity.
-      // Canonical main observers deliver it; no second callback is emitted.
-      const publication = await journal.notify(id, api.callId, [], task?.id ?? null, text);
-      return output(publication === "published" ? "Published to the main chat." : "Queued for the main chat; not yet delivered.");
+      // Canonical observers deliver it; no second callback is emitted.
+      const { publication, destination } = await journal.notify(id, api.callId, [], task?.id ?? null, text, undefined,
+        { ...(args.escalate_to_main === undefined ? {} : { escalateToMain: args.escalate_to_main }) });
+      const targetLabel = destination === "both" ? "the side chat and the main chat" : destination === "sidechat" ? "the side chat" : "the main chat";
+      return output(publication === "published" ? `Published to ${targetLabel}.` : `Queued for ${targetLabel}; not yet delivered.`);
     } });
   const main = defineExtension({ name: "source-tools", tasks: [NoticeContextPlacement], tools: [read, notifyUser,
     defineTool({ name: "link_source_events", description: "Account for source events by linking them to an existing durable task.",
@@ -666,13 +748,20 @@ export function createSourceTools(journal: SourceJournal, executions: Executions
         return output(result.unverified_source_links.length === 0 ? "No-action judgment saved." : { ...result,
           message: "Judgment saved. Other matching task references have no current event ownership and were preserved. Inspect their provenance; use record_task.remove_sources only for verified stale references." });
       } }),
-    defineTool({ name: "notify", description: "Publish a brief useful outcome, concrete recommendation, or needed decision that the user has not already handled. Stay quiet when the user already completed or confirmed the work in the thread, when a task resolves by confirming existing state with no new action or requested update, or when nothing needs attention; save ongoing decisions in task state first.",
-      parameters: Type.Object({ keys: Type.Array(Type.String()), task_id: Type.Optional(Type.String()), text: Type.String({ minLength: 1 }) }),
+    defineTool({ name: "notify", description: "Publish a brief useful outcome, concrete recommendation, or needed decision that the user has not already handled. Tasks originating from a standing side chat deliver there unless escalate_to_main is true. Stay quiet when the user already completed or confirmed the work in the thread, when a task resolves by confirming existing state with no new action or requested update, or when nothing needs attention; save ongoing decisions in task state first.",
+      parameters: Type.Object({
+        keys: Type.Array(Type.String()),
+        task_id: Type.Optional(Type.String()),
+        text: Type.String({ minLength: 1 }),
+        escalate_to_main: Type.Optional(Type.Boolean()),
+      }),
       async execute(args, api) {
         const execution = control(api.conversationId.toString());
         if (execution.notify === undefined) throw new TaskError("The notification client is unavailable");
-        const publication = await journal.notify(api.conversationId.toString(), api.callId, args.keys, args.task_id ?? null, args.text, execution.notify);
-        return output(publication === "published" ? "Published to the main chat." : "Queued for the main chat; not yet delivered.");
+        const { publication, destination } = await journal.notify(api.conversationId.toString(), api.callId, args.keys, args.task_id ?? null, args.text, execution.notify,
+          { ...(args.escalate_to_main === undefined ? {} : { escalateToMain: args.escalate_to_main }) });
+        const targetLabel = destination === "both" ? "the side chat and the main chat" : destination === "sidechat" ? "the side chat" : "the main chat";
+        return output(publication === "published" ? `Published to ${targetLabel}.` : `Queued for ${targetLabel}; not yet delivered.`);
       } }),
   ] });
   return { main, worker: defineExtension({ name: "worker-source-tools", tools: [read, notifyUser] }) };

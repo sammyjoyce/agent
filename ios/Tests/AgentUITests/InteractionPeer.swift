@@ -29,6 +29,14 @@ actor InteractionPeer {
   private var dreamsSummaries: [DreamsRunSummary] = []
   private var dreamsDetails: [String: DreamsRunDetail] = [:]
   private var dreamsApplyRequests: [NativeRequestDreamsApply] = []
+  private var sidechatsAdvertised: Bool?
+  private var servedSidechats: [SidechatSummary] = []
+  private var sidechatObservers: [String: NWConnection] = [:]
+  private var sidechatHistory: [String: [HistoryMessage]] = [:]
+  private var sidechatAutoReply: String?
+  private var createdSidechats: [NativeRequestCreateSidechat] = []
+  private var updatedSidechats: [NativeRequestUpdateSidechat] = []
+  private var receivedSidechatInputs: [NativeRequestSidechatInput] = []
   private var retried: [String] = []
   private var submitCount = 0
   private var files: [String: Data] = [:]
@@ -96,6 +104,18 @@ actor InteractionPeer {
     dreamsDetails = Dictionary(uniqueKeysWithValues: details.map { ($0.run, $0) })
   }
   func dreamsApplies() -> [NativeRequestDreamsApply] { dreamsApplyRequests }
+  func serveSidechats(_ items: [SidechatSummary], advertise: Bool = true, autoReply: String? = nil)
+  {
+    sidechatsAdvertised = advertise
+    servedSidechats = items
+    sidechatAutoReply = autoReply
+  }
+  func serveSidechatHistory(_ conversationId: String, messages: [HistoryMessage]) {
+    sidechatHistory[conversationId] = messages
+  }
+  func sidechatCreations() -> [NativeRequestCreateSidechat] { createdSidechats }
+  func sidechatUpdates() -> [NativeRequestUpdateSidechat] { updatedSidechats }
+  func sidechatInputs() -> [NativeRequestSidechatInput] { receivedSidechatInputs }
   func submitAttempts() -> Int { submitCount }
   /// Rejects each submit while set, as a coordinator that cannot take a message does.
   func rejectSubmits(_ value: Bool) { rejecting = value }
@@ -198,6 +218,7 @@ actor InteractionPeer {
               dreams: dreamsDetails.isEmpty && dreamsSummaries.isEmpty ? nil : true,
               inputOrigins: settingsValue == nil && origins == nil ? nil : true,
               model: "fixture/model",
+              sidechats: sidechatsAdvertised,
               workInspection: servedJobs.isEmpty ? nil : true, working: working)), to: socket)
         try await emitHistory(try XCTUnwrap(initial), to: socket)
         if let activeWorkSnapshot {
@@ -335,6 +356,98 @@ actor InteractionPeer {
         try await emit(
           .dreamsApplied(.init(alreadyApplied: alreadyApplied, commit: commit, run: request.run)),
           to: socket)
+        try await emit(.done, to: socket)
+      case .listSidechats(let request):
+        let items =
+          request.includeArchived
+          ? servedSidechats : servedSidechats.filter { $0.archivedAt == nil }
+        try await emit(.sidechats(.init(items: items)), to: socket)
+        try await emit(.done, to: socket)
+      case .createSidechat(let request):
+        createdSidechats.append(request)
+        let slug =
+          request.slug
+          ?? request.title.lowercased().replacingOccurrences(of: " ", with: "-")
+        let now = Int(Date().timeIntervalSince1970 * 1000)
+        let created = SidechatSummary(
+          archivedAt: nil,
+          charter: request.charter,
+          conversationId: "sc-\(servedSidechats.count + 100)",
+          createdAt: now,
+          isolated: request.isolated ?? false,
+          notifications: request.notifications ?? .inherit,
+          pinned: false,
+          seed: request.seed,
+          slug: slug,
+          title: request.title,
+          updatedAt: now)
+        servedSidechats.insert(created, at: 0)
+        try await emit(.sidechat(.init(sidechat: created)), to: socket)
+        try await emit(.done, to: socket)
+      case .updateSidechat(let request):
+        updatedSidechats.append(request)
+        guard
+          let index = servedSidechats.firstIndex(where: {
+            $0.conversationId == request.conversationId
+          })
+        else {
+          try await emit(.failure(.init(message: "Side chat not found")), to: socket)
+          try await emit(.done, to: socket)
+          break
+        }
+        var updated = servedSidechats[index]
+        if let title = request.title { updated.title = title }
+        if let slug = request.slug { updated.slug = slug }
+        if let pinned = request.pinned { updated.pinned = pinned }
+        if let archived = request.archived {
+          updated.archivedAt = archived ? Int(Date().timeIntervalSince1970 * 1000) : nil
+        }
+        if request.clearCharter == true {
+          updated.charter = nil
+        } else if let charter = request.charter {
+          updated.charter = charter
+        }
+        if let isolated = request.isolated { updated.isolated = isolated }
+        if let alerts = request.notifications { updated.notifications = alerts }
+        updated.updatedAt = Int(Date().timeIntervalSince1970 * 1000)
+        servedSidechats[index] = updated
+        try await emit(.sidechat(.init(sidechat: updated)), to: socket)
+        try await emit(.done, to: socket)
+      case .observeSidechat(let request):
+        sidechatObservers[request.conversationId] = socket
+        let summary = servedSidechats.first { $0.conversationId == request.conversationId }
+        try await emit(
+          .ready(
+            .init(
+              acceptedInputOrigins: origins,
+              conversationId: request.conversationId,
+              conversationSettings: settingsValue == nil ? nil : true,
+              inputOrigins: true,
+              model: "fixture/model",
+              sidechat: summary,
+              sidechats: true,
+              working: false)),
+          to: socket)
+        try await emitHistory(
+          .init(
+            messages: sidechatHistory[request.conversationId] ?? [], nextCursor: nil,
+            pageComplete: true),
+          to: socket)
+        try await emit(.idle, to: socket)
+      case .sidechatInput(let request):
+        receivedSidechatInputs.append(request)
+        try await emit(.accepted(.init(inputId: request.inputId)), to: socket)
+        try await emit(
+          .placed(.init(entryId: "sc-placed-\(request.inputId)", inputId: request.inputId)),
+          to: socket)
+        try await emit(.done, to: socket)
+        if let reply = sidechatAutoReply, let scSocket = sidechatObservers[request.conversationId] {
+          try await emit(.textDelta(.init(text: reply)), to: scSocket)
+          try await emit(
+            .answer(.init(entryId: "sc-answer-\(request.inputId)", text: reply)), to: scSocket)
+          try await emit(.idle, to: scSocket)
+        }
+      case .sidechatInterrupt:
         try await emit(.done, to: socket)
       case .inspect(let inspect):
         try await emit(
