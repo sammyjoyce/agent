@@ -2,10 +2,16 @@
   description = "Beep Boop, a local agent CLI";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/3ec636362e1816bc2f0888fa0fa2c69f1bc9e504";
+  # Only for the rust-analyzer release deslop-please is tested with.
+  inputs.rust-overlay = {
+    url = "github:oxalica/rust-overlay/8afee9fa8caa877a4feb65adc33e8d72f3747dc9";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
 
   outputs = {
     self,
     nixpkgs,
+    rust-overlay,
     ...
   }: let
     systems = ["aarch64-darwin" "x86_64-linux" "aarch64-linux"];
@@ -123,6 +129,44 @@
         alsa-lib libdrm libgbm cairo pango systemdLibs fontconfig freetype stdenv.cc.cc.lib
         libx11 libxext libxcomposite libxdamage libxfixes libxrandr
       ]);
+      # deslop-please's lints read `rust-analyzer scip`, and what they report
+      # (such as how a crate root's symbols are named) depends on the analyzer
+      # release. Upstream pins the one shipped with Rust 1.99.0; nixpkgs' newer
+      # rust-analyzer fails deslop-please's end-to-end tests, so take that
+      # release from rust-overlay, the source upstream's flake uses. It reads
+      # the standard library of the shell's rustc, which is also 1.99.0.
+      rustAnalyzer = pkgs.symlinkJoin {
+        name = "rust-analyzer-1.99.0";
+        paths = [(rust-overlay.lib.mkRustBin {} pkgs).stable."1.99.0".rust-analyzer];
+        nativeBuildInputs = [pkgs.makeWrapper];
+        postBuild = ''
+          wrapProgram "$out/bin/rust-analyzer" \
+            --set-default RUST_SRC_PATH "${pkgs.rustPlatform.rustLibSrc}"
+        '';
+      };
+      # Architecture linter for agents (see AGENTS.md). Upstream's flake only
+      # has a Linux dev shell, so build the pinned source here.
+      deslopPlease = pkgs.rustPlatform.buildRustPackage {
+        pname = "deslop-please";
+        version = "0.1.4";
+        src = pkgs.fetchFromGitHub {
+          owner = "deterministic-machines";
+          repo = "deslop-please";
+          rev = "f678d10d6e6860e70900ceae919e2d769b0a11ae";
+          hash = "sha256-S2z9Hq5rrD+NVeiSEE5/a76+ZvkUuLXUSbnvwV37Xk0=";
+        };
+        cargoHash = "sha256-f2fNM2ZklAofTsizFPzKeWVjzbdN3xN62HDiRKYzNRE=";
+        nativeCheckInputs = [rustAnalyzer];
+        # nixpkgs' cargoCheckHook sets CARGO_BUILD_TARGET, which outranks the
+        # `build.target` that one of upstream's end-to-end tests writes to a
+        # `.cargo/config.toml`. Run the same tests with --target only.
+        checkPhase = ''
+          runHook preCheck
+          cargo test -j "$NIX_BUILD_CORES" --profile release --offline \
+            --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget}
+          runHook postCheck
+        '';
+      };
       tools = {
         packages = with pkgs; [cargo rustc rustfmt clippy nodejs_26 pkg-config git curl lsof actionlint unzip wrangler]
           ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.procps];
@@ -134,6 +178,7 @@
     in {
       default = pkgs.mkShell (tools
         // {
+          packages = tools.packages ++ [deslopPlease rustAnalyzer];
           AGENT_LLAMA_SERVER = "${self.packages.${system}.embeddingRuntime}/bin/llama-server";
           AGENT_EMBEDDING_MODEL = self.packages.${system}.embeddingModel;
         });
