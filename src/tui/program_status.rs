@@ -14,7 +14,6 @@ const MAX_SEGMENT_LEN: usize = 32;
 pub(super) enum BlockedKind {
     Auth,
     Question,
-    Permission,
 }
 
 impl BlockedKind {
@@ -22,7 +21,6 @@ impl BlockedKind {
         match self {
             Self::Auth => "auth",
             Self::Question => "question",
-            Self::Permission => "permission",
         }
     }
 }

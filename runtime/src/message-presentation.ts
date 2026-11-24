@@ -19,6 +19,24 @@ export function bounded(value: string, maximum = 32_768, suffix = "\n[Excerpt; f
   if (last >= 0xd800 && last <= 0xdbff) end -= 1;
   return value.slice(0, end) + suffix;
 }
+/** Collapse whitespace and truncate by Unicode code points so surrogate pairs never split. */
+export function excerpt(value: string, maximum: number): string | undefined {
+  const collapsed = value.trim().replace(/\s+/gu, " ");
+  if (collapsed.length === 0) return undefined;
+  const characters = Array.from(collapsed);
+  return characters.length <= maximum ? collapsed : characters.slice(0, Math.max(1, maximum - 1)).join("") + "…";
+}
+export function firstMeaningfulLine(value: string | undefined, maximum: number): string | undefined {
+  if (value === undefined) return undefined;
+  for (const line of value.split(/\r?\n/u)) {
+    const trimmed = line.trim();
+    if (trimmed.length > 0 && !trimmed.startsWith("//") && !trimmed.startsWith("#")) {
+      const text = excerpt(trimmed, maximum);
+      if (text !== undefined) return text;
+    }
+  }
+  return excerpt(value, maximum);
+}
 export function replyRoleLabel(role: ReplyReference["role"]): string {
   switch (role) {
     case "user": return "user";
@@ -42,6 +60,35 @@ export function formatReplyContext(replyTo: ReplyReference): string {
   return trimmed.length > 0
     ? `[Replying to ${roleLabel} message ${replyTo.entry_id}: ${JSON.stringify(trimmed)}]\n\n`
     : `[Replying to ${roleLabel} message ${replyTo.entry_id}]\n\n`;
+}
+export function toolPresentationSummary(presentation: MessagePresentation, maximum: number): string | undefined {
+  switch (presentation.type) {
+    case "command":
+      return presentation.command === undefined ? undefined : excerpt(presentation.command, maximum);
+    case "file_changes": {
+      const firstPath = presentation.changes[0]?.path;
+      return firstPath === undefined ? undefined : excerpt(firstPath, maximum);
+    }
+    case "web_search":
+      return excerpt(presentation.query, maximum);
+    case "media":
+      return presentation.path === null ? undefined : excerpt(presentation.path, maximum);
+    case "tool":
+    case "agent_coordination":
+    case "agent_activity":
+    case "sleep":
+    case "plan":
+    case "review":
+    case "hook_prompt":
+    case "compaction":
+    case "unknown":
+    case "unavailable":
+      return undefined;
+    default: {
+      const unsupported: never = presentation;
+      return unsupported;
+    }
+  }
 }
 export function outputPreview(value: string): string {
   const maximum = 32_768, suffix = "\n[Output preview truncated]";

@@ -51,6 +51,132 @@
         "subject"
       ]
     },
+    "ActiveWorkChild": {
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        },
+        "conversation_id": {
+          "type": "string"
+        },
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "host": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/ActiveWorkStatus"
+        },
+        "title": {
+          "type": "string"
+        },
+        "tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "agent_id",
+        "conversation_id",
+        "title",
+        "status",
+        "tools"
+      ]
+    },
+    "ActiveWorkItem": {
+      "type": "object",
+      "properties": {
+        "children": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/ActiveWorkChild"
+          }
+        },
+        "conversation_id": {
+          "type": "string"
+        },
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "host": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "is_job": {
+          "type": "boolean"
+        },
+        "started_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/ActiveWorkStatus"
+        },
+        "task_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "title": {
+          "type": "string"
+        },
+        "tools": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "id",
+        "conversation_id",
+        "title",
+        "status",
+        "is_job"
+      ]
+    },
+    "ActiveWorkStatus": {
+      "description": "Summary status of one active work item for live chat UIs.",
+      "type": "string",
+      "enum": [
+        "running",
+        "waiting_owner",
+        "waiting_external"
+      ]
+    },
     "AgentAction": {
       "type": "string",
       "enum": [
@@ -5515,6 +5641,13 @@
                 }
               ]
             },
+            "active_work": {
+              "description": "Advertised when the coordinator provides live task-graph / Active work updates.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
             "conversation_id": {
               "type": "string"
             },
@@ -6575,6 +6708,14 @@
             "$ref": "#/$defs/TaskInput"
           }
         },
+        "started_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "state": {
           "$ref": "#/$defs/TaskAgentState"
         },
@@ -6831,6 +6972,12 @@
         "abort_requested": {
           "type": "boolean"
         },
+        "argument_summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "background": {
           "description": "Pi's lifecycle boundary: an abort of the owning conversation stops here.",
           "type": "boolean"
@@ -6866,6 +7013,14 @@
         },
         "owner": {
           "description": "The Pi task that owns this one. None for a task its conversation owns.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "started_at": {
           "type": [
             "integer",
             "null"
@@ -6920,6 +7075,14 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0
+        },
+        "work": {
+          "description": "Summarized running and waiting work rows for live chat UIs.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ActiveWorkItem"
+          }
         }
       },
       "required": [
@@ -7198,6 +7361,14 @@
             "$ref": "#/$defs/SourceRef"
           }
         },
+        "started_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "state": {
           "$ref": "#/$defs/TaskState"
         },
@@ -7259,6 +7430,16 @@
             "state": {
               "type": "string",
               "const": "waiting"
+            },
+            "target": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TaskWaitTarget"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -7282,6 +7463,13 @@
             "evidence"
           ]
         }
+      ]
+    },
+    "TaskWaitTarget": {
+      "type": "string",
+      "enum": [
+        "owner",
+        "external"
       ]
     },
     "TelemetryStatus": {

@@ -311,6 +311,44 @@ final class ChatModel {
       }
     }
   }
+  var activeWorkSummary: ActiveWorkSummary {
+    guard inspectedConversation == nil else { return .empty }
+    var omitted = 0
+    var shownLanes = 0
+    var rows: [ActiveWorkRow] = []
+    for lane in lanes where scope.shows(lane.id) {
+      guard let snapshot = snapshots[lane.id], snapshot.activeWorkSupported,
+        let graph = snapshot.taskGraph
+      else { continue }
+      shownLanes += 1
+      omitted += graph.omitted
+      for item in graph.work {
+        rows.append(
+          ActiveWorkRow(
+            id: "\(lane.id)-\(item.id)", lane: lane.id, laneName: name(lane.id), item: item
+          ))
+      }
+    }
+    if shownLanes > 1 {
+      let rank: (ActiveWorkStatus) -> Int = {
+        switch $0 {
+        case .running: 0
+        case .waitingOwner: 1
+        case .waitingExternal: 2
+        }
+      }
+      rows.sort { left, right in
+        let lRank = rank(left.item.status)
+        let rRank = rank(right.item.status)
+        if lRank != rRank { return lRank < rRank }
+        let lStart = left.item.startedAt ?? Int.max
+        let rStart = right.item.startedAt ?? Int.max
+        if lStart != rStart { return lStart < rStart }
+        return left.id < right.id
+      }
+    }
+    return ActiveWorkSummary(omittedCount: omitted, items: rows)
+  }
   struct PendingReply: Equatable, Sendable {
     let reference: ReplyReference
     let lane: ProfileID?

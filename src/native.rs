@@ -28,7 +28,11 @@ pub enum NativeRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         source_status: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        task_graph: Option<bool>,
     },
+    TaskGraph,
     Submit {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
@@ -261,12 +265,18 @@ pub enum NativeEvent {
         work_inspection: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
+        active_work: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
         dreams: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         working: Option<bool>,
         conversation_id: String,
         model: String,
+    },
+    TaskGraph {
+        graph: crate::protocol::TaskGraphSnapshot,
     },
     History {
         messages: Vec<HistoryMessage>,
@@ -394,13 +404,21 @@ pub fn commands() -> Vec<SlashCommand> {
 pub fn prepare(request: NativeRequest) -> Result<Operation> {
     let command = match request {
         NativeRequest::Attachment { request } => RuntimeCommand::Attachment { request },
-        NativeRequest::Observe { input_ids, .. } => {
+        NativeRequest::Observe {
+            input_ids,
+            task_graph,
+            ..
+        } => {
             ensure!(input_ids.len() <= 32, "Too many pending inputs");
             for id in &input_ids {
                 validate_id(id)?;
             }
-            RuntimeCommand::ObserveMain { input_ids }
+            RuntimeCommand::ObserveMain {
+                input_ids,
+                task_graph,
+            }
         }
+        NativeRequest::TaskGraph => RuntimeCommand::ReadTaskGraph,
         NativeRequest::Settings { change, catalog } => RuntimeCommand::ConversationSettings {
             task_id: None,
             agent_id: None,
@@ -646,6 +664,7 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
             input_origins,
             accepted_input_origins,
             conversation_settings,
+            active_work,
             conversation_id,
             model,
             ..
@@ -659,6 +678,7 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
                 accepted_input_origins: accepted.non_empty(),
                 conversation_settings: *conversation_settings,
                 work_inspection: Some(true),
+                active_work: *active_work,
                 dreams: None,
                 working: None,
                 conversation_id: conversation_id.clone(),
@@ -675,6 +695,7 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
             accepted_input_origins: None,
             conversation_settings: None,
             work_inspection: None,
+            active_work: None,
             dreams: None,
             working: Some(*working),
             conversation_id: conversation.conversation_id.clone(),
@@ -778,6 +799,9 @@ pub fn project(event: &RuntimeEventKind) -> Option<NativeEvent> {
             job_status: None,
             text: crate::resources::format_inventory(resources),
         },
+        RuntimeEventKind::TaskGraph { graph } => NativeEvent::TaskGraph {
+            graph: graph.clone(),
+        },
         RuntimeEventKind::Goal { status } => NativeEvent::Notice {
             settings: None,
             job_status: None,
@@ -859,15 +883,18 @@ mod tests {
                 input_origins: advertised,
                 accepted_input_origins: None,
                 conversation_settings: advertised,
+                active_work: advertised,
             };
             let Some(NativeEvent::Ready {
                 input_origins,
                 conversation_settings,
+                active_work,
                 ..
             }) = crate::native::project(&event)
             else {
                 panic!("Expected main ready")
             };
+            assert_eq!(active_work, advertised);
             assert_eq!(input_origins, advertised.filter(|value| *value));
             assert_eq!(conversation_settings, advertised);
         }
@@ -1356,12 +1383,13 @@ mod tests {
             request: NativeRequest::Observe {
                 input_ids: vec![id.clone()],
                 source_status: None,
+                task_graph: None,
             },
         };
         let bytes = serde_json::to_vec(&command).unwrap();
         assert!(
             matches!(serde_json::from_slice::<RuntimeCommand>(&bytes).unwrap(),
-            RuntimeCommand::Native { request: NativeRequest::Observe { input_ids, source_status: None } } if input_ids == [id])
+            RuntimeCommand::Native { request: NativeRequest::Observe { input_ids, source_status: None, task_graph: None } } if input_ids == [id])
         );
         for input_id in [String::new(), uuid::Uuid::nil().to_string()] {
             assert!(
@@ -1380,6 +1408,7 @@ mod tests {
             prepare(NativeRequest::Observe {
                 input_ids: (0..33).map(|_| uuid::Uuid::new_v4().to_string()).collect(),
                 source_status: None,
+                task_graph: None,
             })
             .is_err()
         );
@@ -1798,6 +1827,7 @@ mod tests {
             input_origins: Some(true),
             accepted_input_origins: None,
             conversation_settings: Some(true),
+            active_work: Some(true),
         };
         let Some(NativeEvent::Ready { dreams, .. }) = crate::native::project(&main_ready) else {
             panic!("Expected NativeEvent::Ready");

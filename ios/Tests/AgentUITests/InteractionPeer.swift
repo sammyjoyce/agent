@@ -24,6 +24,8 @@ actor InteractionPeer {
   private var streamsOnSubmit = false
   private var commandValues: [SlashCommand] = []
   private var servedJobs: [ScheduledJobStatus] = []
+  private var activeWorkSnapshot: TaskGraphSnapshot?
+  private var inspectedConversations: [String: [HistoryMessage]] = [:]
   private var dreamsSummaries: [DreamsRunSummary] = []
   private var dreamsDetails: [String: DreamsRunDetail] = [:]
   private var dreamsApplyRequests: [NativeRequestDreamsApply] = []
@@ -85,6 +87,10 @@ actor InteractionPeer {
   func retriedJobs() -> [String] { retried }
   /// Advertises work inspection, and answers `jobs` and `retry_job` from these.
   func serve(jobs: [ScheduledJobStatus]) { servedJobs = jobs }
+  func serveActiveWork(_ graph: TaskGraphSnapshot?) { activeWorkSnapshot = graph }
+  func serveInspection(_ conversationId: String, messages: [HistoryMessage]) {
+    inspectedConversations[conversationId] = messages
+  }
   func serveDreams(summaries: [DreamsRunSummary], details: [DreamsRunDetail]) {
     dreamsSummaries = summaries
     dreamsDetails = Dictionary(uniqueKeysWithValues: details.map { ($0.run, $0) })
@@ -186,13 +192,17 @@ actor InteractionPeer {
         try await emit(
           .ready(
             .init(
-              acceptedInputOrigins: origins, conversationId: "fixture-root",
+              acceptedInputOrigins: origins, activeWork: activeWorkSnapshot == nil ? nil : true,
+              conversationId: "fixture-root",
               conversationSettings: settingsValue == nil ? nil : true,
               dreams: dreamsDetails.isEmpty && dreamsSummaries.isEmpty ? nil : true,
               inputOrigins: settingsValue == nil && origins == nil ? nil : true,
               model: "fixture/model",
               workInspection: servedJobs.isEmpty ? nil : true, working: working)), to: socket)
         try await emitHistory(try XCTUnwrap(initial), to: socket)
+        if let activeWorkSnapshot {
+          try await emit(.taskGraph(.init(graph: activeWorkSnapshot)), to: socket)
+        }
         if !commandValues.isEmpty {
           try await emit(.commands(.init(commands: commandValues)), to: socket)
         }
@@ -230,8 +240,15 @@ actor InteractionPeer {
         let cursor = request.cursor ?? "<latest>"
         requests.append(cursor)
         if held.contains(cursor) { await withCheckedContinuation { releases[cursor] = $0 } }
-        try await emitHistory(
-          try XCTUnwrap(request.cursor == nil ? latest : pages[cursor]), to: socket)
+        if let conversationId = request.conversationId,
+          let messages = inspectedConversations[conversationId]
+        {
+          try await emit(
+            .history(.init(messages: messages, nextCursor: nil, pageComplete: true)), to: socket)
+        } else {
+          try await emitHistory(
+            try XCTUnwrap(request.cursor == nil ? latest : pages[cursor]), to: socket)
+        }
         try await emit(.done, to: socket)
       case .attachment(let value):
         guard case .download(let chunk) = value.request, let file = files[chunk.id] else {
@@ -273,6 +290,9 @@ actor InteractionPeer {
           try await emit(.accepted(.init(inputId: request.inputId)), to: socket)
           if streamsOnSubmit { try await beginReply("More text streams after acknowledgement. ") }
         }
+        try await emit(.done, to: socket)
+      case .conversations:
+        try await emit(.conversations(.init(items: [], nextCursor: nil)), to: socket)
         try await emit(.done, to: socket)
       case .dreamsList:
         let pendingCount = dreamsSummaries.filter { $0.proposalStatus == .pending }.count
@@ -316,6 +336,12 @@ actor InteractionPeer {
           .dreamsApplied(.init(alreadyApplied: alreadyApplied, commit: commit, run: request.run)),
           to: socket)
         try await emit(.done, to: socket)
+      case .inspect(let inspect):
+        try await emit(
+          .ready(
+            .init(
+              conversationId: inspect.conversationId, model: "fixture/model", working: false)),
+          to: socket)
       default: try await emit(.done, to: socket)
       }
       _ = try await receive(socket)

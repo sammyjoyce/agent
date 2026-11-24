@@ -242,6 +242,7 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
     let Operation::Runtime(observe) = agent_cli::native::prepare(NativeRequest::Observe {
         input_ids: vec![],
         source_status: None,
+        task_graph: None,
     })
     .unwrap() else {
         panic!("Expected native main observation");

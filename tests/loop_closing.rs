@@ -653,7 +653,7 @@ fn seed_script() -> Vec<(String, Vec<Value>)> {
                 vec![
                     json!({ "tool": "record_task", "args": {
                         "summary": summary,
-                        "state": { "state": "waiting", "actor": "supplier", "next_check": null },
+                        "state": { "state": "waiting", "actor": "supplier", "next_check": null, "target": "external" },
                         "sources": [{ "provider": "google", "account": ACCOUNT, "thread_id": standing.thread }],
                     } }),
                     text(&summary),
@@ -3242,7 +3242,7 @@ const WRONG_AGENTS: &[Agent] = &[
                     json!({ "tool": "record_task", "args": {
                         "task_id": at.task,
                         "summary": "Newsletter received. Waiting on Alex to decide what to do.",
-                        "state": { "state": "waiting", "actor": "user", "next_check": null },
+                        "state": { "state": "waiting", "actor": "user", "next_check": null, "target": "owner" },
                     } }),
                 ]),
             )]
@@ -3261,7 +3261,7 @@ const WRONG_AGENTS: &[Agent] = &[
                     json!({ "tool": "record_task", "args": {
                         "task_id": at.task,
                         "summary": "Northwind cancelled PO-1042. Alex must arrange a replacement order.",
-                        "state": { "state": "waiting", "actor": "supplier", "next_check": null },
+                        "state": { "state": "waiting", "actor": "supplier", "next_check": null, "target": "external" },
                     } }),
                 ]),
             )]
@@ -3280,7 +3280,7 @@ const WRONG_AGENTS: &[Agent] = &[
                     json!({ "tool": "record_task", "args": {
                         "task_id": at.decoy,
                         "summary": "Harbor Freight cancelled PO-2077. Alex must arrange a replacement order.",
-                        "state": { "state": "waiting", "actor": "supplier", "next_check": null },
+                        "state": { "state": "waiting", "actor": "supplier", "next_check": null, "target": "external" },
                     } }),
                 ]),
             )]
@@ -3306,7 +3306,7 @@ const WRONG_AGENTS: &[Agent] = &[
                     vec![
                         json!({ "tool": "record_task", "args": {
                             "summary": format!("{NOISE_SUMMARY}. Still waiting on the supplier."),
-                            "state": { "state": "waiting", "actor": "supplier", "next_check": null },
+                            "state": { "state": "waiting", "actor": "supplier", "next_check": null, "target": "external" },
                         } }),
                         text(&format!("{NOISE_SUMMARY}. Still waiting on the supplier.")),
                     ],
@@ -3759,7 +3759,7 @@ const LEGAL_ALTERNATIVES: &[Agent] = &[
                     json!({ "tool": "record_task", "args": {
                         "task_id": at.task,
                         "summary": "Rejected the lookalike sender. No supplier confirmation was received.",
-                        "state": { "state": "waiting", "actor": "supplier", "next_check": null },
+                        "state": { "state": "waiting", "actor": "supplier", "next_check": null, "target": "external" },
                     } }),
                 ]),
             )]

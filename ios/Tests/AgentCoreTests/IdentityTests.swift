@@ -154,7 +154,9 @@ func aNameThatReturnsToItsCoordinatorReconnectsAndReconciles() async throws {
     #expect(recovered.answeredAs == nil)
     #expect(try queuedRequests(directory.outbox).isEmpty)
     #expect(await right.count() == 1, "Reconciliation never resends")
-    #expect(await right.received().contains(.observe(.init(inputIds: [id], sourceStatus: true))))
+    #expect(
+      await right.received().contains(
+        .observe(.init(inputIds: [id], sourceStatus: true, taskGraph: true))))
     #expect(await wrong.received().allSatisfy { $0 == .identify })
   }
 }

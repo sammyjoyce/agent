@@ -318,6 +318,40 @@ private func inspectionJob(
   }
 }
 
+@MainActor @Test func olderCoordinatorRejectingTaskGraphObserveStillConnectsViaFallback()
+  async throws
+{
+  let fixture = FixtureCoordinator()
+  await fixture.leaveObserveUnanswered(.closedOnTaskGraph)
+  let (listener, port) = try await listen(fixture)
+  defer { listener.cancel() }
+  let (directory, root) = temporaryProfile()
+  defer { try? FileManager.default.removeItem(at: root) }
+  let session = CoordinatorSession(
+    directory: directory, address: try CoordinatorAddress(host: "100.64.1.2"), pin: fixture.id,
+    stamps: StampSource(), transport: loopback(port))
+  let model = ChatModel()
+  model.attach(Lane(id: directory.profile, session: session))
+  await model.setActive(true)
+  do {
+    try await waitUntil(description: "fallback observe connects without task_graph") {
+      model.snapshots[directory.profile]?.connection == .connected
+    }
+    let observes = await fixture.received().compactMap { request -> NativeRequestObserve? in
+      if case .observe(let value) = request { value } else { nil }
+    }
+    #expect(observes.count >= 2)
+    #expect(observes.first?.taskGraph == true)
+    #expect(observes.last?.taskGraph == nil)
+    await model.detach(directory.profile)
+    await fixture.stop()
+  } catch {
+    await model.detach(directory.profile)
+    await fixture.stop()
+    throw error
+  }
+}
+
 #if os(iOS) && AGENT_APP_HOST
   import CoreGraphics
   import SwiftUI
@@ -552,6 +586,68 @@ private func inspectionJob(
         #expect(await fixture.count() == 0)
         await model.detach(session.profile)
       }
+    }
+
+    @MainActor @Test func activeWorkSummaryGatesOnSupportAndRendersReadOnlyStripAndSheet()
+      async throws
+    {
+      let (directory, root) = temporaryProfile()
+      defer { try? FileManager.default.removeItem(at: root) }
+      let model = ChatModel()
+      model.attach(Lane(id: directory.profile, session: nil))
+
+      let graph = TaskGraphSnapshot(
+        conversations: [],
+        nodes: [],
+        omitted: 2,
+        work: [
+          ActiveWorkItem(
+            children: [
+              ActiveWorkChild(
+                agentId: "review", conversationId: "12", detail: "read: src/protocol.rs",
+                host: "laptop", status: .running, title: "Reviewer",
+                tools: ["read: src/protocol.rs"])
+            ],
+            conversationId: "10", detail: "exec: cargo test", host: "workstation", id: "task:1",
+            isJob: false, startedAt: 1_798_797_600_000, status: .running, taskId: "t1",
+            title: "Build fix", tools: ["exec: cargo test"]),
+          ActiveWorkItem(
+            conversationId: "11", detail: "Confirm production rollout", id: "task:2", isJob: false,
+            startedAt: 1_798_797_601_000, status: .waitingOwner, taskId: "t2",
+            title: "Deploy release"),
+          ActiveWorkItem(
+            conversationId: "13", detail: "Waiting on CI pipeline", id: "task:3", isJob: true,
+            startedAt: 1_798_797_602_000, status: .waitingExternal, taskId: "t3",
+            title: "Nightly check"),
+        ])
+
+      var unsupported = ChatSnapshot()
+      unsupported.connection = .connected
+      unsupported.activeWorkSupported = false
+      unsupported.taskGraph = graph
+      model.apply(unsupported, lane: directory.profile)
+      #expect(model.activeWorkSummary.isEmpty)
+
+      var supported = unsupported
+      supported.activeWorkSupported = true
+      model.apply(supported, lane: directory.profile)
+      #expect(model.activeWorkSummary.runningCount == 1)
+      #expect(model.activeWorkSummary.waitingOwnerCount == 1)
+      #expect(model.activeWorkSummary.waitingExternalCount == 1)
+      #expect(model.activeWorkSummary.omittedCount == 2)
+      #expect(
+        model.activeWorkSummary.stripText == "1 running · 1 needs you · 1 waiting · +2 more")
+      #expect(
+        model.activeWorkSummary.items.map(\.item.status) == [
+          .running, .waitingOwner, .waitingExternal,
+        ])
+
+      try await Self.captureWork(
+        VStack(spacing: 0) {
+          ActiveWorkStrip(summary: model.activeWorkSummary) {}
+          Spacer()
+        }, name: "active-work-strip")
+      try await Self.captureWork(ActiveWorkSheet(model: model), name: "active-work-sheet")
     }
 
     @MainActor @Test func dreamsListAndDetailViewsRenderCoverageChecksEvidenceAndEscapedPatch()

@@ -194,7 +194,7 @@ test("record_task confirms the saved state without replaying retained child evid
     const childConversation = await app.tasks.conversation(child.conversation_id);
     const childEntries = (await childConversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT)).items;
     const childHistory = await app.tasks.history(command.task_id, 120_000, child.id);
-    const state = { state: "waiting", actor: "Supplier reply", next_check: null } satisfies TaskRecord["state"];
+    const state = { state: "waiting", actor: "Supplier reply", next_check: null, target: "external" } satisfies TaskRecord["state"];
     const root = await app.session.root(BACKGROUND_CONTEXT); release = app.bind(root);
     await app.inference.configure(root, fixtureModel, { extensions: app.toolsets.main });
     let confirmation: string | undefined, recorded: TaskRecord | undefined, read: unknown;

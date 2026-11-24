@@ -83,6 +83,7 @@ fn main() -> Result<()> {
             serde_json::to_value(schema_for!(agent_cli::native::NativeCommand))?,
             serde_json::to_value(schema_for!(agent_cli::native::NativeEvent))?,
             serde_json::to_value(schema_for!(agent_cli::notifications::NotificationTarget))?,
+            serde_json::to_value(schema_for!(agent_cli::protocol::TaskRecord))?,
         ])? + &format!(
             "public enum AttachmentLimits {{\n    public static let maximumBytes = {}\n    public static let chunkBytes = {}\n    public static let maximumCount = {}\n    public static let maximumNameBytes = {}\n}}\n",
             agent_cli::attachments::MAX_ATTACHMENT_BYTES,

@@ -673,7 +673,9 @@ func theMigratedProfilePairsAndHeldMessagesLeaveOnlyByADeliberateSend() async th
   #expect(
     try JSONDecoder().decode(Saved.self, from: install.savedProfiles()).profiles.first?.pin
       == fixture.id)
-  #expect(await fixture.received().contains(.observe(.init(inputIds: [], sourceStatus: true))))
+  #expect(
+    await fixture.received().contains(
+      .observe(.init(inputIds: [], sourceStatus: true, taskGraph: true))))
   try await eventually("this lane's own notification channel, and the old installation withdrawn") {
     let controls = await fixture.notificationControls()
     return controls.contains(.status(.init(installationId: "\(profile.id)")))

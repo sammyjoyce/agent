@@ -12,6 +12,20 @@ private struct OpenedJob: Hashable {
   let request: UUID
 }
 
+private enum PresentedSheet: Identifiable, Equatable {
+  case settings
+  case sourceDetails
+  case activeWork
+
+  var id: String {
+    switch self {
+    case .settings: "settings"
+    case .sourceDetails: "sourceDetails"
+    case .activeWork: "activeWork"
+    }
+  }
+}
+
 public struct MainChatView: View {
   @State private var model: ChatModel
   @State private var activityExpansion = ActivityExpansion()
@@ -23,9 +37,8 @@ public struct MainChatView: View {
   private let inspectRelated: ((SavedConversation) -> Void)?
   private let dictation: Dictation?
   @Environment(\.dismiss) private var dismiss
-  @State private var settings = false
   @FocusState private var composerFocused: Bool
-  @State private var sourceDetails = false
+  @State private var presentedSheet: PresentedSheet?
   @State private var opened: [OpenedJob] = []
   @State private var handledOpen: OpenRequest?
   @State private var followsLatest = true
@@ -112,7 +125,7 @@ public struct MainChatView: View {
                   UIApplication.shared.sendAction(
                     #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
                 #endif
-                settings = true
+                presentedSheet = .settings
               }
               .tint(.primary)
             }
@@ -129,7 +142,11 @@ public struct MainChatView: View {
 
   @ViewBuilder
   private var chatBody: some View {
+    let workSummary = model.activeWorkSummary
     VStack(spacing: 0) {
+      if !workSummary.isEmpty {
+        ActiveWorkStrip(summary: workSummary) { presentedSheet = .activeWork }
+      }
       Group {
         if model.namesLanes {
           let visibleProfiles = model.profiles.filter { laneState($0) != nil }
@@ -165,7 +182,7 @@ public struct MainChatView: View {
       ForEach(model.sourceReports.filter { model.scope.shows($0.id) && $0.warning != nil }) {
         report in
         Button {
-          sourceDetails = true
+          presentedSheet = .sourceDetails
         } label: {
           HStack {
             Label {
@@ -243,18 +260,25 @@ public struct MainChatView: View {
     .background(.background)
     .onscreenEntity(covered ? nil : .feed(of: model))
     .safeAreaInset(edge: .bottom, spacing: 0) { if !inspecting { composer } }
-    .sheet(isPresented: $settings) {
-      connectionSettings.preferredColorScheme(appearance.colorScheme)
-    }
-    .sheet(isPresented: $sourceDetails) {
-      NavigationStack {
-        SourceDetailsView(model: model)
-          .toolbar {
-            ToolbarItem(placement: .confirmationAction) {
-              Button("Done") { sourceDetails = false }
-            }
+    .sheet(item: $presentedSheet) { sheet in
+      Group {
+        switch sheet {
+        case .settings:
+          connectionSettings
+        case .sourceDetails:
+          NavigationStack {
+            SourceDetailsView(model: model)
+              .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                  Button("Done") { presentedSheet = nil }
+                }
+              }
           }
-      }.preferredColorScheme(appearance.colorScheme)
+        case .activeWork:
+          ActiveWorkSheet(model: model)
+        }
+      }
+      .preferredColorScheme(appearance.colorScheme)
     }
     .fileImporter(
       isPresented: $importingFiles, allowedContentTypes: [.item], allowsMultipleSelection: true
@@ -284,7 +308,7 @@ public struct MainChatView: View {
       guard let coordinators else { return }
       await model.restoreDraft()
       // With nothing saved, start on the Add form.
-      if coordinators.profiles.isEmpty { settings = true }
+      if coordinators.profiles.isEmpty { presentedSheet = .settings }
     }
     .onChange(of: scenePhase) { _, phase in
       notifications?.mainVisible = mainVisible
@@ -314,8 +338,7 @@ public struct MainChatView: View {
       if case .latest(_, scope: scope)? = historyRequest { return }
       historyRequest = model.includesLatest ? nil : .latest(UUID(), scope: scope)
     }
-    .onChange(of: settings) { _, _ in notifications?.mainVisible = mainVisible }
-    .onChange(of: sourceDetails) { _, _ in notifications?.mainVisible = mainVisible }
+    .onChange(of: presentedSheet) { _, _ in notifications?.mainVisible = mainVisible }
     .onChange(of: opened) { _, _ in notifications?.mainVisible = mainVisible }
     .onChange(of: latestVisible) { _, _ in notifications?.mainVisible = mainVisible }
     .onChange(of: model.includesLatest) { _, _ in notifications?.mainVisible = mainVisible }
@@ -329,8 +352,7 @@ public struct MainChatView: View {
       // job, so each request is handled once.
       guard let request, request != handledOpen else { return }
       handledOpen = request
-      settings = false
-      sourceDetails = false
+      presentedSheet = nil
       switch request.destination {
       case .job(let job):
         opened = [OpenedJob(job: job, request: request.id)]
@@ -347,7 +369,9 @@ public struct MainChatView: View {
     scenePhase == .active && !covered
       ? .visible(atLatest: latestVisible && model.includesLatest) : .hidden
   }
-  private var covered: Bool { settings || sourceDetails || !opened.isEmpty }
+  private var covered: Bool {
+    presentedSheet != nil || !opened.isEmpty
+  }
   private var inspecting: Bool { model.inspectedConversation != nil }
   /// A saved profile that is not paired yet. It shows its held messages and takes no sends.
   private var unpaired: CoordinatorProfile? { coordinators?.profiles.first { $0.pin == nil } }
@@ -1122,7 +1146,7 @@ public struct MainChatView: View {
       .navigationTitle("Connection")
       .toolbar {
         ToolbarItem(placement: .confirmationAction) {
-          Button("Done") { settings = false }.accessibilityIdentifier("dismissConnection")
+          Button("Done") { presentedSheet = nil }.accessibilityIdentifier("dismissConnection")
         }
       }
     }

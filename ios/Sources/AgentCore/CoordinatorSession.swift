@@ -60,7 +60,9 @@ public struct ChatSnapshot: Sendable {
   public var sources: [SourceState] = []
   public var settingsSupported = false
   public var workInspectionSupported = false
+  public var activeWorkSupported = false
   public var dreamsSupported = false
+  public var taskGraph: TaskGraphSnapshot?
   public var settings: NativeSettingsSnapshot?
   public var error: String?
   /// The coordinator this profile's address answers as, while that is not its pin. The session
@@ -249,6 +251,8 @@ public actor CoordinatorSession {
   private var inherited: Set<String> = []
   /// Set for good by `retire`. A retired session never connects, sends or writes again.
   private var retired = false
+  /// Starts true; cleared automatically if a pre-change coordinator rejects `task_graph` on observe.
+  private var requestTaskGraph = true
   private var generation = UUID()
   private var flush: Task<Void, Never>?
   private let directory: ProfileDirectory
@@ -974,6 +978,7 @@ public actor CoordinatorSession {
     while !Task.isCancelled && self.generation == generation {
       var stream: VerifiedConnection?
       var answered = false
+      var ready = false
       do {
         resetCapabilities()
         transcript.reconnect()
@@ -987,12 +992,14 @@ public actor CoordinatorSession {
         stream = opened
         connection = opened
         let stream = opened
-        var ready = false
         let request: NativeRequest =
           if let inspectedConversation {
             .inspect(.init(conversationId: inspectedConversation.conversationId))
           } else {
-            .observe(.init(inputIds: watched, sourceStatus: true))
+            .observe(
+              .init(
+                inputIds: watched, sourceStatus: true,
+                taskGraph: requestTaskGraph ? true : nil))
           }
         try await timedSend(stream, request)
         while !Task.isCancelled {
@@ -1058,7 +1065,13 @@ public actor CoordinatorSession {
         // A network drop never ends the stream from the coordinator's side. Every current
         // coordinator answers an observe with a frame before anything that can fail.
         let endedByPeer = await stream?.endedByPeer ?? false
-        let outdated = !answered && endedByPeer && error as? ConnectionError == .closed
+        let closedBeforeAnswer = endedByPeer && !answered && error as? ConnectionError == .closed
+        if inspectedConversation == nil, requestTaskGraph, !ready, closedBeforeAnswer {
+          requestTaskGraph = false
+          connection = nil
+          continue
+        }
+        let outdated = closedBeforeAnswer
         let error = outdated ? ConnectionError.outdatedCoordinator : error
         connection = nil
         tellEveryVoice(.connectionLost)
@@ -1301,7 +1314,9 @@ public actor CoordinatorSession {
     acceptedInputOrigins = []
     snapshot.settingsSupported = false
     snapshot.workInspectionSupported = false
+    snapshot.activeWorkSupported = false
     snapshot.dreamsSupported = false
+    snapshot.taskGraph = nil
     snapshot.settings = nil
   }
 
@@ -1646,9 +1661,12 @@ public actor CoordinatorSession {
       acceptedInputOrigins = Self.acceptedInputOrigins(value)
       snapshot.settingsSupported = value.conversationSettings == true
       snapshot.workInspectionSupported = value.workInspection == true
+      snapshot.activeWorkSupported = value.activeWork == true
       snapshot.dreamsSupported = value.dreams == true
       snapshot.model = value.model
       snapshot.busy = value.working ?? true
+    case .taskGraph(let value):
+      snapshot.taskGraph = value.graph
     case .working(let value):
       snapshot.busy = value.working
       if !value.working { transcript.idle() }

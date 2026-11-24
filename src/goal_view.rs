@@ -81,10 +81,12 @@ fn task_state(state: &TaskState) -> String {
         TaskState::Waiting {
             actor,
             next_check: None,
+            ..
         } => format!("waiting on {}", label(actor)),
         TaskState::Waiting {
             actor,
             next_check: Some(next),
+            ..
         } => format!("waiting on {}, next check {}", label(actor), label(next)),
         TaskState::Resolved { .. } => "resolved".into(),
     }

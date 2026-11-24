@@ -23,4 +23,4 @@ blocked: TaskGraphBlocked | null,
  * Conversations this task owns in Pi. Delegate and agent conversations are not owned by a
  * Pi task; their parent is `TaskGraphActor::Agent::parent_conversation_id`.
  */
-conversations: Array<string>, };
+conversations: Array<string>, started_at?: number, argument_summary?: string, };

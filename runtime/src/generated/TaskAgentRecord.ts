@@ -4,4 +4,4 @@ import type { TaskAgentState } from "./TaskAgentState.js";
 import type { TaskInput } from "./TaskInput.js";
 import type { WorkerState } from "./WorkerState.js";
 
-export type TaskAgentRecord = { id: string, conversation_id: string, title: string, outcome: string, summary: string, model: ModelSelection | null, state: TaskAgentState, worker: WorkerState, pending: Array<TaskInput>, updated_at: number, };
+export type TaskAgentRecord = { id: string, conversation_id: string, title: string, outcome: string, summary: string, model: ModelSelection | null, state: TaskAgentState, worker: WorkerState, pending: Array<TaskInput>, started_at?: number, updated_at: number, };
