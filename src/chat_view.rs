@@ -1,6 +1,6 @@
 //! A terminal view never claims the Rex worker's execution or effects.
 
-use crate::{ClientContext, UiSession, connection, exchange, write_command};
+use crate::{ClientContext, UiSession, ViewError, connection, exchange, write_command};
 use agent_cli::{
     config::ClientConfig,
     protocol::{ErrorCode, RuntimeCommand, RuntimeEventKind, SavedConversation, SidechatSummary},
@@ -104,55 +104,6 @@ pub(crate) fn observation(ready: &tokio::sync::watch::Receiver<Observation>) -> 
         ObservationState::Disconnected
     } else {
         ready.borrow().state()
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum ViewError {
-    Coordinator(anyhow::Error),
-    Internal(anyhow::Error),
-}
-impl From<anyhow::Error> for ViewError {
-    fn from(error: anyhow::Error) -> Self {
-        match error.downcast::<Self>() {
-            Ok(error) => error,
-            Err(error) => Self::Internal(error),
-        }
-    }
-}
-impl std::fmt::Display for ViewError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Coordinator(error) | Self::Internal(error) => write!(formatter, "{error}"),
-        }
-    }
-}
-impl std::error::Error for ViewError {}
-impl ViewError {
-    pub(crate) fn transport(error: anyhow::Error) -> anyhow::Error {
-        Self::Coordinator(error).into()
-    }
-    pub(crate) fn is_transport(error: &anyhow::Error) -> bool {
-        matches!(error.downcast_ref::<Self>(), Some(Self::Coordinator(_)))
-    }
-    pub(crate) fn read(error: anyhow::Error) -> Self {
-        if error.is::<std::io::Error>() {
-            Self::Coordinator(error)
-        } else {
-            Self::Internal(error)
-        }
-    }
-    pub(crate) fn event(self, conversation_id: &str) -> RuntimeEventKind {
-        let (code, message) = match self {
-            Self::Coordinator(error) => (
-                ErrorCode::CoordinatorUnavailable,
-                format!(
-                    "{error}\n\nReconnect with `/resume {conversation_id}`. Saved work may still be running; pending inputs will be reconciled."
-                ),
-            ),
-            Self::Internal(error) => (ErrorCode::Internal, error.to_string()),
-        };
-        RuntimeEventKind::Failure { code, message }
     }
 }
 
