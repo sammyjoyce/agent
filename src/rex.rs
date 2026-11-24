@@ -458,7 +458,11 @@ impl RexClient {
     pub fn sdk_server(&self) -> Option<&str> {
         match &self.route {
             RexRoute::Personal => Some("personal"),
-            RexRoute::Private(endpoint) if endpoint.kind == EndpointKind::Unix => {
+            // The SDK percent-decodes a unix:// path, so it could reach
+            // another socket than the CLI does.
+            RexRoute::Private(endpoint)
+                if endpoint.kind == EndpointKind::Unix && !endpoint.as_str().contains('%') =>
+            {
                 Some(endpoint.as_str())
             }
             RexRoute::Private(_) => None,
@@ -1904,6 +1908,23 @@ esac
                 .is_empty()
         );
         assert!(decode::<SessionList>(b"{}").is_err());
+    }
+
+    #[test]
+    fn the_runtime_sdk_reaches_only_this_process_own_local_rex() {
+        let sdk = |server: Option<&str>| {
+            RexClient::for_process(server)
+                .unwrap()
+                .sdk_server()
+                .map(str::to_owned)
+        };
+        assert_eq!(sdk(None).as_deref(), Some("personal"));
+        assert_eq!(
+            sdk(Some("unix:///run/example/rex.sock")).as_deref(),
+            Some("unix:///run/example/rex.sock")
+        );
+        assert_eq!(sdk(Some("unix:///run/example/rex%2Fother.sock")), None);
+        assert_eq!(sdk(Some("ssh://example.invalid")), None);
     }
 
     #[test]

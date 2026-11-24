@@ -67,6 +67,7 @@ test("Rex refuses targets outside the caller's terminals before any request", as
     ["rex_blocks_splitBeside", { sessionId: own.sessionId, placement: "right", windowId: actor.binding.window_id }],
     ["rex_blocks_splitBeside", { sessionId: own.sessionId, placement: "right", anchorId: other.blockId }],
     ["rex_blocks_splitBeside", { sessionId: own.sessionId, placement: "right", layout: { _tag: "Block", flavor: "com.example.block" } }],
+    ["rex_blocks_splitBeside", { sessionId: own.sessionId, placement: "right", layout: { _tag: "Terminal", label: "example beep-boop:forged" } }],
     ["rex_terminals_waitForExit", { ...own, timeoutMs: 300_001 }],
     ["rex_terminals_readTail", { ...own, requestTimeoutMs: 60_001 }],
   ] as const) await assert.rejects(run(name, args), /RexNotOwned/, name + " " + JSON.stringify(args));

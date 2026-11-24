@@ -132,9 +132,10 @@ const SCRIPTS: Record<Phase, ((outs: string[]) => Promise<Step> | Step)[]> = {
     () => script(["let out = { agents: 'agent did not finish' };",
       "for (let i = 0; i < 4; i++) { const read = await tools.wait_agents({ timeout_seconds: 45 });",
       "  if (String(read).includes('\"state\":\"done\"')) { out = { agents: String(read).slice(0, 3000) }; break; } }"], 200_000),
-    (outs) => script(["const here = await tools.rex_here({});",
-      "const out = { closed: await attempt('rex_blocks_close', { sessionId: here.sessionId, blockId: " + JSON.stringify(childOf(outs)) + " }),",
-      "  here: await tools.rex_here({}) };"]),
+    () => script(["const here = await tools.rex_here({});",
+      "const out = { closed: [] };",
+      "for (const blockId of here.children) out.closed.push(await attempt('rex_blocks_close', { sessionId: here.sessionId, blockId }));",
+      "out.here = await tools.rex_here({});"]),
     () => ({ tool: "record_task", args: { summary: "Rex lab finished.", state: { state: "resolved", evidence: "The Rex lab scripts ran; the lab checks their results." } } }),
     () => ({ text: "Rex lab work finished." }),
   ],
@@ -305,11 +306,14 @@ try {
     && main.fencedWrite?.ok === false && String(main.fencedWrite?.message).includes("was not replayed")
     && main.hereUncertain?.uncertain?.tool === "rex_blocks_splitBeside" && main.wrongClear?.ok === false && main.afterClear?.ok === true,
     { uncertain: main.uncertainWrite, fenced: main.fencedWrite, here: main.hereUncertain?.uncertain, wrongClear: main.wrongClear, afterClear: main.afterClear });
-  check("the uncertain split counts against the child limit after it is cleared", main.cleared?.unconfirmedTerminals === 1, main.cleared);
   const orphans = (main.viewAfterUncertain ?? []).filter((id: string) => ![binding.block_id, ids.inSession, main.child].includes(id));
   report.uncertain_split_orphans = orphans;
-  check("the uncertain split was not recorded as owned", Array.isArray(main.hereUncertain?.children) && main.hereUncertain.children.length === 1
-    && orphans.every((id: string) => !main.hereUncertain.children.includes(id)), { children: main.hereUncertain?.children, orphans });
+  check("the uncertain split was not recorded as owned before it was cleared", Array.isArray(main.hereUncertain?.children)
+    && main.hereUncertain.children.length === 1 && orphans.every((id: string) => !main.hereUncertain.children.includes(id)),
+    { children: main.hereUncertain?.children, orphans });
+  const adopted = (main.cleared?.children ?? []).filter((id: string) => id !== main.child);
+  check("clearing the uncertain split adopted exactly the terminal it opened, found by its label", orphans.length === 1
+    && adopted.length === 1 && adopted[0] === orphans[0] && main.cleared?.unconfirmedTerminals === 0, { orphans, cleared: main.cleared });
   check("the cancelled script ended at its 3 s deadline, not the 120 s wait", cancel.elapsed_ms !== null && cancel.elapsed_ms >= 2_500
     && cancel.elapsed_ms < 20_000 && !String(cancel.output).includes("rexlab-out"), cancel);
   check("Rex tools still answer after the cancellation", afterCancel.tail?.ok === true, afterCancel.tail);
@@ -319,8 +323,8 @@ try {
     check("agent refused: " + name, agent[name]?.ok === false && String(agent[name]?.message).includes("RexNotOwned"), agent[name]);
   }
   check("the agent reads its own terminal", agent.ownTail?.ok === true, agent.ownTail);
-  check("the child closed and left the actor's children", closing.closed?.ok === true && Array.isArray(closing.here?.children)
-    && closing.here.children.length === 0, closing);
+  check("every child closed and left the actor's children", Array.isArray(closing.closed) && closing.closed.length === 2
+    && closing.closed.every((result: { ok: boolean }) => result.ok) && Array.isArray(closing.here?.children) && closing.here.children.length === 0, closing);
 
   // Independent readback through the Rex CLI on the private server.
   const decoyScreen = await rex(["capture", "-s", ids.decoySession!, "-b", ids.decoyBlock!, "--trim"]);
@@ -331,7 +335,8 @@ try {
   check("decoy session untouched", decoyScreen.includes("DECOY_UNTOUCHED") && !decoyScreen.includes("DECOY_TOUCHED") && !decoyScreen.includes("printf"), decoyScreen.slice(-300));
   check("unowned block in the task session untouched", unownedScreen.includes("INSESSION_UNTOUCHED") && !unownedScreen.includes("printf"), unownedScreen.slice(-300));
   check("unowned block in the task session still open", viewText.includes(ids.inSession!), ids.inSession);
-  check("the closed child is gone from the session", typeof main.child === "string" && !viewText.includes(main.child), main.child);
+  check("the closed children are gone from the session", typeof main.child === "string" && !viewText.includes(main.child)
+    && orphans.every((id: string) => !viewText.includes(id)), { child: main.child, orphans });
   const childScreen = await rex(["capture", "-s", binding.session_id, "-b", binding.block_id, "--trim"]).catch((error: unknown) => String(error));
   check("the worker's own terminal received no lab writes", !childScreen.includes("OWN_TOUCHED") && !childScreen.includes("PARENT_TOUCHED"), childScreen.slice(-300));
   check("the task binding names this private Rex instance", binding.rex_instance_id === status.instance_id && binding.host_id === status.host_id,

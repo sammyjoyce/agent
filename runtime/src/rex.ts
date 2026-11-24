@@ -9,7 +9,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
-import { BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
+import { BACKGROUND_CONTEXT, withAbortSignal, type Context } from "@earendil-works/chord/context";
 import type { JsonValue } from "@earendil-works/chord/json";
 import { defineDocFamily, defineExtension, defineTool, type Extension, type Harness, type ToolExecutionResult, type ToolNamespace,
   type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
@@ -47,33 +47,39 @@ const DESCRIPTIONS: Readonly<Record<string, string>> = {
 };
 export const MAX_REX_CHILDREN = 8;
 const MAX_LAYOUT_TERMINALS = 4, MAX_WAIT_MS = 300_000, MAX_REQUEST_MS = 60_000, MAX_TAIL_BYTES = 262_144, MAX_MARK_OWNERS = 64;
-/** How long a call waits for an actor's terminal that is still opening. */
+/** How long a call waits for an actor's terminal that is still opening, or its execution that is still recovering. */
 const BINDING_WAIT_MS = 15_000;
+const TERMINAL_FLAVOR = "com.superlogical.terminal.shell";
+/** Every child's label ends with this and the id of the split that opened it; actors cannot choose such a label. */
+const CHILD_LABEL = "beep-boop:";
 /** Failures reported before any request was sent, or by a server that refused it. Others leave a write uncertain. */
 const DEFINITE = new Set(["RexNotOwned", "RexInvalidInput", "SchemaError", "RexConfigurationError", "RexConnectionError", "RexHandshakeError",
   "RexUnsupportedApiRevision", "RexMessageTooLarge", "RexBadRequest", "RexNotFound", "RexSessionNotFound", "RexMethodNotFound", "RexConflict",
   "RexNotSupported", "RexRefused", "RexTooLarge", "RexRevisionTooLow", "RexInvalidPattern", "RexUnknownMark", "RexBlockClosed"]);
 
 type Uncertain = { id: string; tool: string; block_id: string | null; at: number; terminals: number };
-/** `unconfirmed`: terminals that uncertain splits may have opened. They are never adopted, but count against the limit. */
-type Owned = { instance_id: string | null; children: string[]; unconfirmed: number; uncertain: Uncertain | null };
+/** `pending`: cleared uncertain splits whose terminals were not found yet. They count against the limit until adopted. */
+type Owned = { instance_id: string | null; children: string[]; pending: { id: string; terminals: number }[]; uncertain: Uncertain | null };
 const RexOwned = defineDocFamily<Owned, null>({ kind: "agent.rex.owned", scope: "session", family: true, version: 1,
-  initial: () => ({ instance_id: null, children: [], unconfirmed: 0, uncertain: null }), checkpointWhen: () => true });
+  initial: () => ({ instance_id: null, children: [], pending: [], uncertain: null }), checkpointWhen: () => true });
 
 /** The actor's recorded terminal, confirmed by the Rex instance that started it. */
 export type RexActor = { key: string; binding: WorkerRef & { rex_instance_id: string } };
-export type RexActorResolver = (conversationId: string, signal: AbortSignal | undefined) => Promise<RexActor>;
+export type RexActorResolver = (conversationId: string, context: Context) => Promise<RexActor>;
 
 class RexNotOwned extends Error {
   readonly _tag = "RexNotOwned";
   constructor(message: string) { super(message); this.name = "RexNotOwned"; }
 }
-/** The SDK reached another Rex instance after the call started; its effect is uncertain. */
+/** The server could not be confirmed after the call ran, so its effect is uncertain. */
 class RexServerChanged extends Error {
   readonly _tag = "RexServerChanged";
-  constructor() { super("the Rex server changed during the call"); this.name = "RexServerChanged"; }
+  constructor(why: string) { super(`after the call, the Rex server was not confirmed as the one that started this actor's terminal (${why})`); this.name = "RexServerChanged"; }
 }
 function refusal(message: string): TaskError { return new TaskError("RexNotOwned: " + message); }
+function tagOf(error: unknown): string {
+  return typeof error === "object" && error !== null && "_tag" in error ? String(error._tag) : error instanceof Error ? error.name : String(error);
+}
 
 /** The server the SDK reaches: unset leaves Rex tools off, "personal" uses the SDK's own default selection. */
 export function rexServerFromEnv(env: NodeJS.ProcessEnv = process.env): { server?: string } | undefined {
@@ -84,8 +90,14 @@ export function rexServerFromEnv(env: NodeJS.ProcessEnv = process.env): { server
 
 /** Task workers and their agents only, bound to a terminal whose Rex instance is recorded. */
 export function taskRexActors(tasks: TaskStore, executions: Executions): RexActorResolver {
-  return async (conversationId, signal) => {
-    if (executions.get(conversationId).role !== "worker") throw refusal("only task workers and their agents reach Rex");
+  return async (conversationId, context) => {
+    const recovering = withAbortSignal(AbortSignal.timeout(BINDING_WAIT_MS), context);
+    let execution: Awaited<ReturnType<Executions["ready"]>>;
+    try { execution = await executions.ready(conversationId, recovering); } catch (error) {
+      if (recovering.abortSignal?.aborted === true && context.abortSignal?.aborted !== true) throw refusal("this actor's execution is still recovering; retry shortly");
+      throw error;
+    }
+    if (execution.role !== "worker") throw refusal("only task workers and their agents reach Rex");
     // An actor's first turn can start while its terminal is still opening.
     const deadline = Date.now() + BINDING_WAIT_MS;
     for (;;) {
@@ -100,20 +112,29 @@ export function taskRexActors(tasks: TaskStore, executions: Executions): RexActo
       if ((worker.state !== "allocating" && worker.state !== "resuming") || Date.now() >= deadline) {
         throw refusal(`this actor's Rex terminal is not confirmed (${worker.state}); retry once it is open`);
       }
-      await delay(100, undefined, signal === undefined ? undefined : { signal });
+      await delay(100, undefined, context.abortSignal === undefined ? undefined : { signal: context.abortSignal });
     }
   };
 }
 
 function terminalCount(layout: unknown, seen = 0): number {
   if (typeof layout !== "object" || layout === null) throw refusal("layout must be a Terminal or Split node");
-  const node = layout as { _tag?: unknown; before?: unknown; after?: unknown };
+  const node = layout as { _tag?: unknown; label?: unknown; before?: unknown; after?: unknown };
   let count: number;
-  if (node._tag === "Terminal") count = seen + 1;
-  else if (node._tag === "Split") count = terminalCount(node.after, terminalCount(node.before, seen));
+  if (node._tag === "Terminal") {
+    if (typeof node.label === "string" && node.label.includes(CHILD_LABEL)) throw refusal(`a child's label may not contain ${CHILD_LABEL}`);
+    count = seen + 1;
+  } else if (node._tag === "Split") count = terminalCount(node.after, terminalCount(node.before, seen));
   else throw refusal("layout may hold only Terminal and Split nodes");
   if (count > MAX_LAYOUT_TERMINALS) throw refusal(`a layout may open at most ${MAX_LAYOUT_TERMINALS} terminals`);
   return count;
+}
+
+/** Marks each terminal of a checked layout with the split that opens it, so an uncertain split's terminals can be found later. */
+function labelled(layout: unknown, id: string): unknown {
+  const node = layout as { _tag?: unknown; label?: unknown; before?: unknown; after?: unknown };
+  if (node._tag === "Split") return { ...node, before: labelled(node.before, id), after: labelled(node.after, id) };
+  return { ...node, label: (typeof node.label === "string" ? node.label.slice(0, 64) + " " : "") + CHILD_LABEL + id };
 }
 
 function bounded(params: Record<string, unknown>, key: string, max: number): void {
@@ -135,7 +156,7 @@ Read your own terminal or a child. Write only to children: open one with rex_blo
 Run: const { markId } = await tools.rex_terminals_writeLine({ sessionId, blockId, text }), then rex_terminals_waitForOutput({ sessionId, blockId, since: markId, match: { type: "regex", value }, timeoutMs }). Waits resolve to { timedOut: true } or { timedOut: false, match | quiet | exit }.
 Deadlines: timeoutMs at most 300000; requestTimeoutMs bounds each request (default 10000, at most 60000).
 Failures reject with the SDK error tag first; RexNotOwned means the target is outside this actor's terminals.
-One write at a time. A write without a receipt (RexConnectionLost, RexRequestTimeout, interrupted) is not replayed, and further writes are refused until you inspect its effect and call rex_here({ clearUncertain: <its id> }). Terminals an uncertain split may have opened are never yours to write, but count against your ${MAX_REX_CHILDREN} children.
+One write at a time. A write without a receipt (RexConnectionLost, RexRequestTimeout, interrupted) is not replayed, and further writes are refused until you inspect its effect and call rex_here({ clearUncertain: <its id> }). Terminals an uncertain split opened become your children once rex_here finds them by their label; until then they count against your ${MAX_REX_CHILDREN} children.
 Close children you no longer need with rex_blocks_close({ sessionId, blockId }).`;
 export const REX_NAMESPACE: ToolNamespace = { name: "rex", description: "Rex terminals of this task: read your terminal, open child terminals, run commands in them and wait for output.", instructions };
 
@@ -166,6 +187,12 @@ export function createRexTools({ harness, actors, gate, server = {}, makeLayer }
   makeLayer?: () => Layer.Layer<RexSdk, unknown>;
 }): RexTools {
   const connection = new RexConnection(makeLayer ?? (() => rexSdkLayerFromOptions({ ...server, client: { kind: "agent", name: "beep-boop" } })));
+  const operation = (name: string): RexToolOperation => {
+    const found = rexToolOperations.find((candidate) => candidate.name === name);
+    if (found === undefined) throw new Error(`rex-sdk has no operation ${name}`);
+    return found;
+  };
+  const viewOperation = operation("sessions_view");
   /** Marks stay with the actor that made them, for the newest actors only. Their IDs name this process, so none outlives it. */
   const marks = new Map<string, RexMarkStore>();
   const epoch = randomUUID().slice(0, 8);
@@ -178,20 +205,19 @@ export function createRexTools({ harness, actors, gate, server = {}, makeLayer }
     return store;
   }
 
-  async function actor(conversationId: string, signal: AbortSignal | undefined): Promise<RexActor & Omit<Owned, "instance_id">> {
-    const resolved = await actors(conversationId, signal);
+  async function actor(conversationId: string, context: Context): Promise<RexActor & Omit<Owned, "instance_id">> {
+    const resolved = await actors(conversationId, context);
     const saved = await harness.snapshot(RexOwned, resolved.key, BACKGROUND_CONTEXT);
     const current = saved?.instance_id === resolved.binding.rex_instance_id;
-    return { ...resolved, children: current ? [...saved.children] : [], unconfirmed: current ? saved.unconfirmed ?? 0 : 0,
+    return { ...resolved, children: current ? [...saved.children] : [], pending: current ? saved.pending.map((entry) => ({ ...entry })) : [],
       uncertain: current ? saved.uncertain : null };
   }
   /** The actor's record, reset when its terminal now belongs to another Rex instance. */
   async function owned(tx: Tx, caller: RexActor): Promise<Owned> {
     const doc = await tx.doc(RexOwned, caller.key, null);
     if (doc.instance_id !== caller.binding.rex_instance_id) {
-      doc.instance_id = caller.binding.rex_instance_id; doc.children = []; doc.unconfirmed = 0; doc.uncertain = null;
+      doc.instance_id = caller.binding.rex_instance_id; doc.children = []; doc.pending = []; doc.uncertain = null;
     }
-    doc.unconfirmed ??= 0;
     return doc;
   }
   /** Ends one write: only its own marker is removed. */
@@ -202,8 +228,9 @@ export function createRexTools({ harness, actors, gate, server = {}, makeLayer }
       change(doc);
     }, BACKGROUND_CONTEXT);
   }
+  const unconfirmed = (record: Pick<Owned, "pending">) => record.pending.reduce((sum, entry) => sum + entry.terminals, 0);
 
-  function authorize(access: Access, caller: RexActor, record: { children: readonly string[]; unconfirmed: number },
+  function authorize(access: Access, caller: RexActor, record: Pick<Owned, "children" | "pending">,
     args: Record<string, unknown>): Record<string, unknown> {
     const params = { ...args };
     bounded(params, "requestTimeoutMs", MAX_REQUEST_MS); bounded(params, "timeoutMs", MAX_WAIT_MS); bounded(params, "maxBytes", MAX_TAIL_BYTES);
@@ -222,8 +249,8 @@ export function createRexTools({ harness, actors, gate, server = {}, makeLayer }
       if (params.windowId !== undefined) throw refusal("open children beside your own terminal or a child, not by windowId");
       const anchor = params.anchorId ?? own;
       if (anchor !== own && !children.includes(String(anchor))) throw refusal(`anchorId ${String(anchor)} is not your terminal or a child you opened`);
-      if (children.length + record.unconfirmed + terminalCount(params.layout ?? { _tag: "Terminal" }) > MAX_REX_CHILDREN) {
-        throw refusal(`an actor may keep at most ${MAX_REX_CHILDREN} child terminals, counting ${record.unconfirmed} an uncertain split may have opened; close some with rex_blocks_close`);
+      if (children.length + unconfirmed(record) + terminalCount(params.layout ?? { _tag: "Terminal" }) > MAX_REX_CHILDREN) {
+        throw refusal(`an actor may keep at most ${MAX_REX_CHILDREN} child terminals, counting ${unconfirmed(record)} an uncertain split may have opened; close some with rex_blocks_close`);
       }
       return { ...params, anchorId: anchor, focus: false };
     }
@@ -241,51 +268,75 @@ export function createRexTools({ harness, actors, gate, server = {}, makeLayer }
     if (status.instanceId !== binding.rex_instance_id || Option.getOrUndefined(status.hostId) !== binding.host_id) return yield* Effect.fail(fail());
     return null;
   });
+  const notOwned = () => new RexNotOwned("the Rex server the coordinator reaches did not start this actor's terminal");
+  /** Runs an operation, then confirms the server again; failing that, the call's effect is uncertain. */
+  const checked = (caller: RexActor, run: RexToolOperation, params: Record<string, unknown>) => Effect.gen(function* () {
+    const value = yield* makeRexToolProgram(run, params, marksOf(caller.key));
+    yield* verify(caller.binding, () => new RexServerChanged("another instance answered")).pipe(
+      Effect.mapError((cause) => cause instanceof RexServerChanged ? cause : new RexServerChanged(tagOf(cause))));
+    return value;
+  });
 
-  async function call(operation: RexToolOperation, access: Access, args: Record<string, unknown>, conversationId: string,
+  /** Adopts the terminals of cleared uncertain splits that the actor's session now shows with their label. */
+  async function adopt(caller: RexActor, signal: AbortSignal | undefined): Promise<void> {
+    const exit = await connection.run(Effect.andThen(verify(caller.binding, notOwned),
+      checked(caller, viewOperation, { sessionId: caller.binding.session_id })), signal);
+    if (Exit.isFailure(exit)) return;
+    type Block = { blockId?: unknown; label?: unknown; flavor?: unknown; hostId?: unknown };
+    const view = exit.value as { windows?: { layers?: { blocks?: Block[] }[] }[] } | null;
+    const blocks = (view?.windows ?? []).flatMap((window) => (window.layers ?? []).flatMap((layer) => layer.blocks ?? []));
+    await harness.commit(async (tx) => {
+      const doc = await owned(tx, caller);
+      for (const entry of doc.pending) {
+        const found = blocks.filter((block): block is Block & { blockId: string } => typeof block.blockId === "string"
+          && typeof block.label === "string" && block.label.endsWith(CHILD_LABEL + entry.id) && block.flavor === TERMINAL_FLAVOR
+          && block.hostId === caller.binding.host_id && block.blockId !== caller.binding.block_id && !doc.children.includes(block.blockId))
+          .slice(0, entry.terminals).map((block) => block.blockId);
+        doc.children.push(...found);
+        entry.terminals -= found.length;
+      }
+      doc.pending = doc.pending.filter((entry) => entry.terminals > 0);
+    }, BACKGROUND_CONTEXT);
+  }
+
+  async function call(run: RexToolOperation, access: Access, args: Record<string, unknown>, conversationId: string,
     context: Context): Promise<ToolExecutionResult> {
     const signal = context.abortSignal;
-    const caller = await actor(conversationId, signal);
+    let caller = await actor(conversationId, context);
+    if (access === "split" && caller.pending.length > 0) { await adopt(caller, signal); caller = await actor(conversationId, context); }
     let params = authorize(access, caller, caller, args);
-    const notOwned = () => new RexNotOwned("the Rex server the coordinator reaches did not start this actor's terminal");
-    const program = Effect.gen(function* () {
-      const value = yield* makeRexToolProgram(operation, params, marksOf(caller.key));
-      // The call ran; whatever stops this check leaves its effect uncertain.
-      yield* verify(caller.binding, () => new RexServerChanged()).pipe(Effect.mapError(() => new RexServerChanged()));
-      return value;
-    });
     if (!MUTATES.includes(access)) {
-      return output(toRexToolResult(await connection.run(Effect.andThen(verify(caller.binding, notOwned), program), signal)));
+      return output(toRexToolResult(await connection.run(Effect.andThen(verify(caller.binding, notOwned), checked(caller, run, params)), signal)));
     }
-    // The marker serializes this actor's writes, so the children checked here are current.
     const id = randomUUID();
-    params = await harness.commit(async (tx) => {
-      const doc = await owned(tx, caller);
-      const checked = authorize(access, caller, doc, args);
-      if (doc.uncertain !== null) {
-        throw refusal(`${doc.uncertain.tool} (${doc.uncertain.id}) has no receipt or is still running and was not replayed. Inspect its effect with rex_sessions_view or rex_terminals_readTail, then call rex_here({ clearUncertain: "${doc.uncertain.id}" })`);
-      }
-      doc.uncertain = { id, tool: "rex_" + operation.name, block_id: typeof checked.blockId === "string" ? checked.blockId : null, at: Date.now(),
-        terminals: access === "split" ? terminalCount(checked.layout ?? { _tag: "Terminal" }) : 0 };
-      return checked;
-    }, BACKGROUND_CONTEXT);
     running.add(id);
     try {
+      // The marker serializes this actor's writes, so the children checked here are current.
+      params = await harness.commit(async (tx) => {
+        const doc = await owned(tx, caller);
+        const allowed = authorize(access, caller, doc, args);
+        if (doc.uncertain !== null) {
+          throw refusal(`${doc.uncertain.tool} (${doc.uncertain.id}) has no receipt or is still running and was not replayed. Inspect its effect with rex_sessions_view or rex_terminals_readTail, then call rex_here({ clearUncertain: "${doc.uncertain.id}" })`);
+        }
+        const terminals = access === "split" ? terminalCount(allowed.layout ?? { _tag: "Terminal" }) : 0;
+        doc.uncertain = { id, tool: "rex_" + run.name, block_id: typeof allowed.blockId === "string" ? allowed.blockId : null, at: Date.now(), terminals };
+        return access === "split" ? { ...allowed, layout: labelled(allowed.layout ?? { _tag: "Terminal" }, id) } : allowed;
+      }, BACKGROUND_CONTEXT);
       // Nothing is sent until the owner and the server are confirmed, so failures up to here are definite.
       try {
-        await gate?.fresh(signal);
+        await gate?.fresh(AbortSignal.any([AbortSignal.timeout(MAX_REQUEST_MS), ...(signal === undefined ? [] : [signal])]));
         toRexToolResult(await connection.run(verify(caller.binding, notOwned), signal));
         signal?.throwIfAborted();
       } catch (error) { await settle(caller, id); throw error; }
-      const exit = await connection.run(program, signal);
+      const exit = await connection.run(checked(caller, run, params), signal);
       if (Exit.isFailure(exit) && !definite(exit)) {
         let message: string;
         try { toRexToolResult(exit); message = "the call failed"; } catch (error) { message = error instanceof Error ? error.message : String(error); }
         throw new TaskError(`${message}. The outcome is uncertain and was not replayed; inspect it, then call rex_here({ clearUncertain: "${id}" }) before writing again.`);
       }
-      const tag = Exit.isFailure(exit) ? Option.getOrUndefined(Cause.findErrorOption(exit.cause)) as { _tag?: unknown } | undefined : undefined;
+      const failure = Exit.isFailure(exit) ? tagOf(Option.getOrUndefined(Cause.findErrorOption(exit.cause))) : undefined;
       // A child the server no longer has stops counting against this actor.
-      const gone = access === "close" && (Exit.isSuccess(exit) || tag?._tag === "RexNotFound" || tag?._tag === "RexBlockClosed");
+      const gone = access === "close" && (failure === undefined || failure === "RexNotFound" || failure === "RexBlockClosed");
       const opened = Exit.isSuccess(exit) && access === "split" ? (exit.value as { blockIds?: unknown }).blockIds : undefined;
       await settle(caller, id, (doc) => {
         if (Array.isArray(opened)) doc.children.push(...opened.filter((block): block is string => typeof block === "string"));
@@ -303,14 +354,13 @@ export function createRexTools({ harness, actors, gate, server = {}, makeLayer }
   }
 
   const operations: ToolRegistration[] = Object.entries(REX_OPERATIONS).map(([name, access]) => {
-    const operation = rexToolOperations.find((candidate) => candidate.name === name);
-    if (operation === undefined) throw new Error(`rex-sdk has no operation ${name}`);
+    const run = operation(name);
     return defineTool({
-      name: "rex_" + name, description: (DESCRIPTIONS[name] ?? operation.description) + SCOPE[access], deferred: true,
+      name: "rex_" + name, description: (DESCRIPTIONS[name] ?? run.description) + SCOPE[access], deferred: true,
       ...(MUTATES.includes(access) ? {} : { replay: "safe" as const }),
-      parameters: rexToolParametersJsonSchema({ fields: operation.fields, input: operation.input }),
-      structuredOutputSchema: operation.output === "void" ? { type: "null" } : rexToolOutputJsonSchema(operation.output),
-      execute: (args, api, context) => call(operation, access, args as Record<string, unknown>, api.conversationId.toString(), context),
+      parameters: rexToolParametersJsonSchema({ fields: run.fields, input: run.input }),
+      structuredOutputSchema: run.output === "void" ? { type: "null" } : rexToolOutputJsonSchema(run.output),
+      execute: (args, api, context) => call(run, access, args as Record<string, unknown>, api.conversationId.toString(), context),
     });
   });
   const here = defineTool({
@@ -319,7 +369,8 @@ export function createRexTools({ harness, actors, gate, server = {}, makeLayer }
     parameters: Type.Object({ clearUncertain: Type.Optional(Type.String({ minLength: 1 })) }),
     structuredOutputSchema: HereOutput,
     async execute(args, api, context) {
-      let caller = await actor(api.conversationId.toString(), context.abortSignal);
+      const conversationId = api.conversationId.toString();
+      let caller = await actor(conversationId, context);
       const clear = args.clearUncertain;
       if (clear !== undefined) {
         if (running.has(clear)) throw new TaskError(`Write ${clear} is still running; wait for its result`);
@@ -327,15 +378,16 @@ export function createRexTools({ harness, actors, gate, server = {}, makeLayer }
         await harness.commit(async (tx) => {
           const doc = await owned(tx, caller);
           if (doc.uncertain?.id !== clear) return;
-          doc.unconfirmed += doc.uncertain.terminals;
+          if (doc.uncertain.terminals > 0) doc.pending.push({ id: clear, terminals: doc.uncertain.terminals });
           doc.uncertain = null;
         }, BACKGROUND_CONTEXT);
-        caller = await actor(api.conversationId.toString(), context.abortSignal);
+        caller = await actor(conversationId, context);
       }
+      if (caller.pending.length > 0) { await adopt(caller, context.abortSignal); caller = await actor(conversationId, context); }
       const uncertain = caller.uncertain === null ? null
         : { id: caller.uncertain.id, tool: caller.uncertain.tool, blockId: caller.uncertain.block_id, at: caller.uncertain.at };
       const value = { sessionId: caller.binding.session_id, windowId: caller.binding.window_id, blockId: caller.binding.block_id,
-        children: caller.children, unconfirmedTerminals: caller.unconfirmed, uncertain };
+        children: caller.children, unconfirmedTerminals: unconfirmed(caller), uncertain };
       return { output: [{ type: "text", text: JSON.stringify(value) }], structuredOutput: value };
     },
   });

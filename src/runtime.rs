@@ -205,8 +205,16 @@ impl Runtime {
             config.validate()?;
             command.env("AGENT_APNS_CONFIG", serde_json::to_string(config)?);
         }
-        // Only the coordinator's own Rex server, never one inherited.
-        command.env_remove("AGENT_REX_SDK_SERVER");
+        // Only the coordinator's own Rex server, never one inherited. The
+        // SDK reads a terminal's ambient IDs, which mean nothing to the runtime.
+        for name in [
+            "AGENT_REX_SDK_SERVER",
+            "REX_SESSION",
+            "REX_BLOCK",
+            "REX_CLIENT",
+        ] {
+            command.env_remove(name);
+        }
         if let Some(server) = rex_sdk_server {
             command.env("AGENT_REX_SDK_SERVER", server);
         }
