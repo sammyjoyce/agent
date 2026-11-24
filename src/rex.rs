@@ -453,17 +453,25 @@ impl RexClient {
 
     /// The server the runtime's Rex SDK reaches: this process's own Rex, so
     /// SDK calls land where its local workers run. `personal` keeps the SDK's
-    /// own selection, which follows `REX_SERVER` like the CLI. An SSH endpoint
-    /// has no SDK transport, so the runtime gets no Rex tools.
+    /// own selection, which follows `REX_SERVER` like the CLI; a private Unix
+    /// server is its socket path. An SSH endpoint has no SDK transport, so the
+    /// runtime gets no Rex tools.
     pub fn sdk_server(&self) -> Option<&str> {
         match &self.route {
             RexRoute::Personal => Some("personal"),
-            // The SDK percent-decodes a unix:// path, so it could reach
-            // another socket than the CLI does.
-            RexRoute::Private(endpoint)
-                if endpoint.kind == EndpointKind::Unix && !endpoint.as_str().contains('%') =>
-            {
-                Some(endpoint.as_str())
+            // The SDK takes a bare absolute path verbatim, but parses a
+            // unix:// URL: it decodes escapes, resolves `..` and trims. A path
+            // it could read differently gets no SDK at all.
+            RexRoute::Private(endpoint) if endpoint.kind == EndpointKind::Unix => {
+                let path = endpoint.as_str().strip_prefix("unix://")?;
+                let plain = path.trim() == path
+                    && !path.contains('%')
+                    && !path.chars().any(char::is_control)
+                    // Path::components() hides `.`, so read the segments.
+                    && path.strip_prefix('/').is_some_and(|rest| {
+                        rest.split('/').all(|part| !matches!(part, "" | "." | ".."))
+                    });
+                plain.then_some(path)
             }
             RexRoute::Private(_) => None,
         }
@@ -1921,10 +1929,25 @@ esac
         assert_eq!(sdk(None).as_deref(), Some("personal"));
         assert_eq!(
             sdk(Some("unix:///run/example/rex.sock")).as_deref(),
-            Some("unix:///run/example/rex.sock")
+            Some("/run/example/rex.sock")
         );
-        assert_eq!(sdk(Some("unix:///run/example/rex%2Fother.sock")), None);
-        assert_eq!(sdk(Some("ssh://example.invalid")), None);
+        for unclear in [
+            "unix:///run/example/rex%2Fother.sock",
+            "unix:///run/example/../rex.sock",
+            "unix:///run/example/./rex.sock",
+            "unix:///run/example/rex.sock ",
+            "unix:///run/example/re\tx.sock",
+            "ssh://example.invalid",
+        ] {
+            let unclear = unclear.replace("\\t", "\t");
+            assert_eq!(
+                RexClient::for_process(Some(&unclear))
+                    .map(|client| client.sdk_server().map(str::to_owned))
+                    .unwrap_or(None),
+                None,
+                "{unclear:?}"
+            );
+        }
     }
 
     #[test]

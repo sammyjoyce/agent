@@ -11,7 +11,7 @@ import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { Effect, Layer, Option } from "effect";
 import { createRexTools, REX_OPERATIONS, rexServerFromEnv, type RexActor } from "../src/rex.js";
 import { createToolsets, TOOL_ROLES } from "../src/toolsets.js";
-import { RexConnectionError, RexSdk, type IRexSdk } from "../src/vendor/rex-sdk/src/index.js";
+import { RexConnectionError, RexRequestTimeout, RexSdk, type IRexSdk } from "../src/vendor/rex-sdk/src/index.js";
 
 const actor: RexActor = { key: "41", binding: { host_id: "11111111-1111-4111-8111-111111111111",
   session_id: "session:22222222-2222-4222-8222-222222222222", window_id: "window:33333333-3333-4333-8333-333333333333",
@@ -90,6 +90,7 @@ test("a write that may have run is never replayed and fences the actor until it 
   let failure: RexConnectionError | undefined;
   const fake = {
     server: { status: () => Effect.succeed({ instanceId: actor.binding.rex_instance_id, hostId: Option.some(actor.binding.host_id) }) },
+    sessions: { view: () => Effect.succeed({ revision: 1, sessionId: actor.binding.session_id, windows: [] }) },
     blocks: { splitBeside: () => Effect.succeed({ anchorId: actor.binding.block_id, blockIds: [child], splitIds: [], revision: 2 }) },
     terminals: {
       mark: () => Effect.succeed({ lines: [], offset: 0 }),
@@ -128,4 +129,41 @@ test("a write that may have run is never replayed and fences the actor until it 
   await run("rex_terminals_writeLine", { sessionId, blockId: child, text: "printf five" });
   assert.deepEqual(writes, ["printf one", "printf two", "printf four", "printf five"]);
   assert.equal((await run("rex_here", {})).uncertain, null);
+});
+
+test("clearing an uncertain split adopts only terminals that did not exist before it, whatever their label", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-rex-"));
+  const harness = await Harness.open(await SqliteStorage.open(await openNodeSqliteDatabase(join(directory, "session.sqlite"))),
+    { models: createModels(), registry: createRegistry(), identity: { attribution: null } }, BACKGROUND_CONTEXT);
+  const existing = "block:99999999-9999-4999-8999-999999999999", opened = "block:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  let label: string | undefined;
+  const block = (blockId: string, blockLabel?: string) => ({ blockId, label: blockLabel ?? "example", flavor: "com.superlogical.terminal.shell",
+    hostId: actor.binding.host_id });
+  const fake = {
+    server: { status: () => Effect.succeed({ instanceId: actor.binding.rex_instance_id, hostId: Option.some(actor.binding.host_id) }) },
+    sessions: { view: () => Effect.succeed({ revision: 1, sessionId: actor.binding.session_id, windows: [{ layers: [{ blocks: label === undefined
+      ? [block(actor.binding.block_id), block(existing)]
+      // A program relabelled the existing block to look like the split's terminal.
+      : [block(actor.binding.block_id), block(existing, label), block(opened, label)] }] }] }) },
+    blocks: { splitBeside: (input: { layout?: { label?: string } }) => {
+      label = input.layout?.label;
+      return Effect.fail(new RexRequestTimeout("session.new_split", "request-1", 1));
+    } },
+  } as unknown as IRexSdk;
+  const tools = createRexTools({ harness, gate: undefined, actors: async () => actor, makeLayer: () => Layer.succeed(RexSdk, fake) });
+  t.after(async () => { await tools.close(); await harness.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); });
+  const run = async (name: string, args: Record<string, unknown>) => {
+    const tool = (tools.tools ?? []).find((candidate) => candidate.name === name);
+    assert.ok(tool);
+    const result = await tool.execute(args as never, { conversationId: { toString: () => actor.key } } as unknown as ToolExecutionApi, BACKGROUND_CONTEXT as Context);
+    assert.ok("structuredOutput" in result);
+    return result.structuredOutput as Record<string, any>;
+  };
+  await assert.rejects(run("rex_blocks_splitBeside", { sessionId: actor.binding.session_id, placement: "right" }), /uncertain and was not replayed/);
+  const fenced = await run("rex_here", {});
+  assert.match(String(label), new RegExp("beep-boop:" + fenced.uncertain.id + "$"), "the split labelled its terminal with its own id");
+  const cleared = await run("rex_here", { clearUncertain: fenced.uncertain.id });
+  assert.deepEqual(cleared.children, [opened], "only the new terminal is adopted");
+  assert.equal(cleared.unconfirmedTerminals, 0);
+  await assert.rejects(run("rex_terminals_writeLine", { sessionId: actor.binding.session_id, blockId: existing, text: "printf example" }), /RexNotOwned/);
 });

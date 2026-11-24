@@ -49,17 +49,25 @@ export const MAX_REX_CHILDREN = 8;
 const MAX_LAYOUT_TERMINALS = 4, MAX_WAIT_MS = 300_000, MAX_REQUEST_MS = 60_000, MAX_TAIL_BYTES = 262_144, MAX_MARK_OWNERS = 64;
 /** How long a call waits for an actor's terminal that is still opening, or its execution that is still recovering. */
 const BINDING_WAIT_MS = 15_000;
+/** How long a write waits for the failover authority to confirm this coordinator still owns its effects. */
+const GATE_WAIT_MS = 60_000;
+/** At most this many existing blocks are remembered per split; Rex's default limit is 1024 blocks per server. */
+const MAX_BEFORE = 1024;
 const TERMINAL_FLAVOR = "com.superlogical.terminal.shell";
-/** Every child's label ends with this and the id of the split that opened it; actors cannot choose such a label. */
+/**
+ * Every child's label ends with this and the id of the split that opened it. Tools refuse such a label, but a
+ * program in a terminal can still relabel a block, so adoption also skips every block that existed before the split.
+ */
 const CHILD_LABEL = "beep-boop:";
 /** Failures reported before any request was sent, or by a server that refused it. Others leave a write uncertain. */
 const DEFINITE = new Set(["RexNotOwned", "RexInvalidInput", "SchemaError", "RexConfigurationError", "RexConnectionError", "RexHandshakeError",
   "RexUnsupportedApiRevision", "RexMessageTooLarge", "RexBadRequest", "RexNotFound", "RexSessionNotFound", "RexMethodNotFound", "RexConflict",
   "RexNotSupported", "RexRefused", "RexTooLarge", "RexRevisionTooLow", "RexInvalidPattern", "RexUnknownMark", "RexBlockClosed"]);
 
-type Uncertain = { id: string; tool: string; block_id: string | null; at: number; terminals: number };
+/** `before`: the session's blocks when a split started, which it cannot have opened. */
+type Uncertain = { id: string; tool: string; block_id: string | null; at: number; terminals: number; before: string[] };
 /** `pending`: cleared uncertain splits whose terminals were not found yet. They count against the limit until adopted. */
-type Owned = { instance_id: string | null; children: string[]; pending: { id: string; terminals: number }[]; uncertain: Uncertain | null };
+type Owned = { instance_id: string | null; children: string[]; pending: { id: string; terminals: number; before: string[] }[]; uncertain: Uncertain | null };
 const RexOwned = defineDocFamily<Owned, null>({ kind: "agent.rex.owned", scope: "session", family: true, version: 1,
   initial: () => ({ instance_id: null, children: [], pending: [], uncertain: null }), checkpointWhen: () => true });
 
@@ -91,6 +99,7 @@ export function rexServerFromEnv(env: NodeJS.ProcessEnv = process.env): { server
 /** Task workers and their agents only, bound to a terminal whose Rex instance is recorded. */
 export function taskRexActors(tasks: TaskStore, executions: Executions): RexActorResolver {
   return async (conversationId, context) => {
+    const deadline = Date.now() + BINDING_WAIT_MS;
     const recovering = withAbortSignal(AbortSignal.timeout(BINDING_WAIT_MS), context);
     let execution: Awaited<ReturnType<Executions["ready"]>>;
     try { execution = await executions.ready(conversationId, recovering); } catch (error) {
@@ -99,7 +108,6 @@ export function taskRexActors(tasks: TaskStore, executions: Executions): RexActo
     }
     if (execution.role !== "worker") throw refusal("only task workers and their agents reach Rex");
     // An actor's first turn can start while its terminal is still opening.
-    const deadline = Date.now() + BINDING_WAIT_MS;
     for (;;) {
       const { task, agent } = await tasks.owner(conversationId);
       if (tasks.isConfined(task) || tasks.isBackgroundTask(task)) throw refusal("scheduled and confined tasks have no Rex terminal");
@@ -134,7 +142,7 @@ function terminalCount(layout: unknown, seen = 0): number {
 function labelled(layout: unknown, id: string): unknown {
   const node = layout as { _tag?: unknown; label?: unknown; before?: unknown; after?: unknown };
   if (node._tag === "Split") return { ...node, before: labelled(node.before, id), after: labelled(node.after, id) };
-  return { ...node, label: (typeof node.label === "string" ? node.label.slice(0, 64) + " " : "") + CHILD_LABEL + id };
+  return { ...node, label: (typeof node.label === "string" ? [...node.label].slice(0, 64).join("") + " " : "") + CHILD_LABEL + id };
 }
 
 function bounded(params: Record<string, unknown>, key: string, max: number): void {
@@ -209,7 +217,7 @@ export function createRexTools({ harness, actors, gate, server = {}, makeLayer }
     const resolved = await actors(conversationId, context);
     const saved = await harness.snapshot(RexOwned, resolved.key, BACKGROUND_CONTEXT);
     const current = saved?.instance_id === resolved.binding.rex_instance_id;
-    return { ...resolved, children: current ? [...saved.children] : [], pending: current ? saved.pending.map((entry) => ({ ...entry })) : [],
+    return { ...resolved, children: current ? [...saved.children] : [], pending: current ? saved.pending.map((entry) => ({ ...entry, before: [...entry.before] })) : [],
       uncertain: current ? saved.uncertain : null };
   }
   /** The actor's record, reset when its terminal now belongs to another Rex instance. */
@@ -277,20 +285,33 @@ export function createRexTools({ harness, actors, gate, server = {}, makeLayer }
     return value;
   });
 
+  type Block = { blockId?: unknown; label?: unknown; flavor?: unknown; hostId?: unknown };
+  function blocksOf(view: unknown): Block[] {
+    const windows = (view as { windows?: { layers?: { blocks?: Block[] }[] }[] } | null)?.windows ?? [];
+    return windows.flatMap((window) => (window.layers ?? []).flatMap((layer) => layer.blocks ?? []));
+  }
+  /** The blocks of the actor's session now; a split started after this cannot have opened them. */
+  async function existing(caller: RexActor, signal: AbortSignal | undefined): Promise<string[]> {
+    const view = toRexToolResult(await connection.run(Effect.andThen(verify(caller.binding, notOwned),
+      checked(caller, viewOperation, { sessionId: caller.binding.session_id })), signal)).structuredContent;
+    const ids = blocksOf(view).flatMap((block) => typeof block.blockId === "string" ? [block.blockId] : []);
+    if (ids.length > MAX_BEFORE) throw refusal(`this session has more than ${MAX_BEFORE} blocks; close some before opening children`);
+    return ids;
+  }
+
   /** Adopts the terminals of cleared uncertain splits that the actor's session now shows with their label. */
   async function adopt(caller: RexActor, signal: AbortSignal | undefined): Promise<void> {
     const exit = await connection.run(Effect.andThen(verify(caller.binding, notOwned),
       checked(caller, viewOperation, { sessionId: caller.binding.session_id })), signal);
     if (Exit.isFailure(exit)) return;
-    type Block = { blockId?: unknown; label?: unknown; flavor?: unknown; hostId?: unknown };
-    const view = exit.value as { windows?: { layers?: { blocks?: Block[] }[] }[] } | null;
-    const blocks = (view?.windows ?? []).flatMap((window) => (window.layers ?? []).flatMap((layer) => layer.blocks ?? []));
+    const blocks = blocksOf(exit.value);
     await harness.commit(async (tx) => {
       const doc = await owned(tx, caller);
       for (const entry of doc.pending) {
         const found = blocks.filter((block): block is Block & { blockId: string } => typeof block.blockId === "string"
           && typeof block.label === "string" && block.label.endsWith(CHILD_LABEL + entry.id) && block.flavor === TERMINAL_FLAVOR
-          && block.hostId === caller.binding.host_id && block.blockId !== caller.binding.block_id && !doc.children.includes(block.blockId))
+          && block.hostId === caller.binding.host_id && block.blockId !== caller.binding.block_id && !doc.children.includes(block.blockId)
+          && !entry.before.includes(block.blockId))
           .slice(0, entry.terminals).map((block) => block.blockId);
         doc.children.push(...found);
         entry.terminals -= found.length;
@@ -311,6 +332,8 @@ export function createRexTools({ harness, actors, gate, server = {}, makeLayer }
     const id = randomUUID();
     running.add(id);
     try {
+      // Read before the marker: a failure here sends nothing.
+      const before = access === "split" ? await existing(caller, signal) : [];
       // The marker serializes this actor's writes, so the children checked here are current.
       params = await harness.commit(async (tx) => {
         const doc = await owned(tx, caller);
@@ -319,12 +342,12 @@ export function createRexTools({ harness, actors, gate, server = {}, makeLayer }
           throw refusal(`${doc.uncertain.tool} (${doc.uncertain.id}) has no receipt or is still running and was not replayed. Inspect its effect with rex_sessions_view or rex_terminals_readTail, then call rex_here({ clearUncertain: "${doc.uncertain.id}" })`);
         }
         const terminals = access === "split" ? terminalCount(allowed.layout ?? { _tag: "Terminal" }) : 0;
-        doc.uncertain = { id, tool: "rex_" + run.name, block_id: typeof allowed.blockId === "string" ? allowed.blockId : null, at: Date.now(), terminals };
+        doc.uncertain = { id, tool: "rex_" + run.name, block_id: typeof allowed.blockId === "string" ? allowed.blockId : null, at: Date.now(), terminals, before };
         return access === "split" ? { ...allowed, layout: labelled(allowed.layout ?? { _tag: "Terminal" }, id) } : allowed;
       }, BACKGROUND_CONTEXT);
       // Nothing is sent until the owner and the server are confirmed, so failures up to here are definite.
       try {
-        await gate?.fresh(AbortSignal.any([AbortSignal.timeout(MAX_REQUEST_MS), ...(signal === undefined ? [] : [signal])]));
+        await gate?.fresh(AbortSignal.any([AbortSignal.timeout(GATE_WAIT_MS), ...(signal === undefined ? [] : [signal])]));
         toRexToolResult(await connection.run(verify(caller.binding, notOwned), signal));
         signal?.throwIfAborted();
       } catch (error) { await settle(caller, id); throw error; }
@@ -378,7 +401,7 @@ export function createRexTools({ harness, actors, gate, server = {}, makeLayer }
         await harness.commit(async (tx) => {
           const doc = await owned(tx, caller);
           if (doc.uncertain?.id !== clear) return;
-          if (doc.uncertain.terminals > 0) doc.pending.push({ id: clear, terminals: doc.uncertain.terminals });
+          if (doc.uncertain.terminals > 0) doc.pending.push({ id: clear, terminals: doc.uncertain.terminals, before: doc.uncertain.before ?? [] });
           doc.uncertain = null;
         }, BACKGROUND_CONTEXT);
         caller = await actor(conversationId, context);
