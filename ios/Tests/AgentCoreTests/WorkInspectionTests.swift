@@ -713,3 +713,103 @@ private func inspectionJob(
     }
   }
 #endif
+
+@MainActor @Test
+func activeWorkSummaryHidesCurrentlyViewedChatAndKeepsTasksJobsAndOtherSidechats() {
+  let (directory, root) = temporaryProfile()
+  defer { try? FileManager.default.removeItem(at: root) }
+  let model = ChatModel()
+  model.attach(Lane(id: directory.profile, session: nil))
+
+  let mainItem = ActiveWorkItem(
+    conversationId: "1", detail: nil, id: "main", isJob: false,
+    startedAt: 1_798_797_599_000, status: .running, title: "Main")
+  let taskItem = ActiveWorkItem(
+    conversationId: "10", detail: "exec: cargo test", host: "workstation", id: "task:1",
+    isJob: false, startedAt: 1_798_797_600_000, status: .running, taskId: "t1",
+    title: "Build fix", tools: ["exec: cargo test"])
+  let jobItem = ActiveWorkItem(
+    conversationId: "11", detail: "Confirm restart window", host: "workstation", id: "task:job-1",
+    isJob: true, startedAt: 1_798_797_600_500, status: .waitingOwner, taskId: "j1",
+    title: "Nightly backup", tools: [])
+  let sidechatItem = ActiveWorkItem(
+    conversationId: "sc-42", detail: "read_file: sensors.toml", id: "sidechat:sc-42",
+    isJob: false, sidechatSlug: "homelab-ops", startedAt: 1_798_797_601_000, status: .running,
+    title: "Homelab Ops", tools: ["read_file: sensors.toml"])
+
+  // Viewing Main when only Main is running: strip stays empty (in-chat Working… handles it).
+  var onlyMain = ChatSnapshot()
+  onlyMain.connection = .connected
+  onlyMain.conversationID = "1"
+  onlyMain.activeWorkSupported = true
+  onlyMain.busy = true
+  onlyMain.taskGraph = TaskGraphSnapshot(
+    conversations: [], nodes: [], omitted: 0, work: [mainItem])
+  model.apply(onlyMain, lane: directory.profile)
+  #expect(model.busy)
+  #expect(model.activeWorkSummary.isEmpty)
+
+  // Viewing Main while Main, a Task, a waiting Job, and a Side chat run:
+  // Main is hidden, while Task, Job, and Side chat stay visible.
+  var mixed = onlyMain
+  mixed.taskGraph = TaskGraphSnapshot(
+    conversations: [], nodes: [], omitted: 0, work: [mainItem, taskItem, jobItem, sidechatItem])
+  model.apply(mixed, lane: directory.profile)
+  #expect(model.activeWorkSummary.runningCount == 2)
+  #expect(model.activeWorkSummary.waitingOwnerCount == 1)
+  #expect(
+    model.activeWorkSummary.items.map(\.item.id) == ["task:1", "task:job-1", "sidechat:sc-42"])
+
+  // Viewing that Side chat hides the viewed side chat while keeping tasks, jobs, and Main.
+  let sidechatModel = ChatModel()
+  sidechatModel.activeSidechat = SidechatSummary(
+    archivedAt: nil, charter: nil, conversationId: "sc-42", createdAt: 1_798_797_600_000,
+    isolated: false, notifications: .inherit, pinned: false, seed: nil, slug: "homelab-ops",
+    title: "Homelab Ops", updatedAt: 1_798_797_600_000)
+  sidechatModel.attach(Lane(id: directory.profile, session: nil))
+  sidechatModel.apply(mixed, lane: directory.profile)
+  #expect(
+    sidechatModel.activeWorkSummary.items.map(\.item.id) == ["main", "task:1", "task:job-1"])
+}
+
+@Test(.timeLimit(.minutes(1)))
+func liveUserMessageAndWorkingEventDriveChatBusyState() async throws {
+  try await withCoordinator { session, fixture, _ in
+    await session.connect()
+    for await snapshot in session.updates where snapshot.connection == .connected {
+      if !snapshot.busy { break }
+    }
+    // Historical user messages never mark the chat busy.
+    try await fixture.emitOnObserver(
+      .history(
+        .init(
+          messages: [
+            HistoryMessage(
+              continuation: false, entryId: "hist-user-1", finalChunk: true, role: .user,
+              text: "Earlier invented prompt")
+          ],
+          nextCursor: nil, pageComplete: true)))
+    for await snapshot in session.updates
+    where snapshot.rows.contains(where: { $0.text == "Earlier invented prompt" }) {
+      #expect(!snapshot.busy)
+      break
+    }
+    try await fixture.emitOnObserver(.working(.init(working: true)))
+    for await snapshot in session.updates where snapshot.busy { break }
+    try await fixture.emitOnObserver(.working(.init(working: false)))
+    for await snapshot in session.updates where !snapshot.busy { break }
+
+    // Compatibility with older coordinators: a live user message on the observer also marks
+    // the chat busy until worker_idle arrives.
+    try await fixture.emitOnObserver(
+      .message(
+        .init(
+          message: HistoryMessage(
+            continuation: false, entryId: "live-user-1", finalChunk: true, role: .user,
+            text: "Check the invented cluster"))))
+    for await snapshot in session.updates where snapshot.busy { break }
+    try await fixture.emitOnObserver(.idle)
+    for await snapshot in session.updates where !snapshot.busy { break }
+    await session.retire()
+  }
+}

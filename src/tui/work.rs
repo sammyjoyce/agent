@@ -44,6 +44,7 @@ pub(super) struct WorkPanel {
     page_height: u16,
     snapshot: Option<TaskGraphSnapshot>,
     stream: WorkStream,
+    current_conversation_id: Option<String>,
 }
 
 impl WorkPanel {
@@ -76,8 +77,31 @@ impl WorkPanel {
         self.stream = WorkStream::Open;
     }
 
+    pub(super) fn set_current_conversation(&mut self, conversation_id: String) {
+        self.current_conversation_id = Some(conversation_id);
+    }
+
     pub(super) fn take_snapshot(&mut self) -> Option<TaskGraphSnapshot> {
         self.snapshot.take()
+    }
+
+    fn visible_items<'a>(
+        &'a self,
+        snapshot: &'a TaskGraphSnapshot,
+    ) -> impl Iterator<Item = &'a ActiveWorkItem> {
+        let current = self.current_conversation_id.as_deref();
+        snapshot.work.iter().filter(move |item| {
+            current.is_none_or(|current| {
+                let has_children = item
+                    .children
+                    .as_ref()
+                    .is_some_and(|children| !children.is_empty());
+                if has_children {
+                    return true;
+                }
+                item.conversation_id != current && !(current == "1" && item.id == "main")
+            })
+        })
     }
 
     pub(super) fn counts(&self) -> WorkCounts {
@@ -90,7 +114,7 @@ impl WorkPanel {
             waiting_external: 0,
             omitted: usize::try_from(snapshot.omitted).unwrap_or(usize::MAX),
         };
-        for item in &snapshot.work {
+        for item in self.visible_items(snapshot) {
             match item.status {
                 ActiveWorkStatus::Running => counts.running += 1,
                 ActiveWorkStatus::WaitingOwner => counts.waiting_owner += 1,
@@ -273,7 +297,7 @@ impl WorkPanel {
                 dim,
             )];
         };
-        let work = &snapshot.work;
+        let work: Vec<&ActiveWorkItem> = self.visible_items(snapshot).collect();
         if work.is_empty() && snapshot.omitted == 0 {
             return vec![Line::styled("No running or waiting work.", dim)];
         }
@@ -281,10 +305,12 @@ impl WorkPanel {
         let mut lines = Vec::new();
         let running: Vec<&ActiveWorkItem> = work
             .iter()
+            .copied()
             .filter(|item| item.status == ActiveWorkStatus::Running)
             .collect();
         let waiting: Vec<&ActiveWorkItem> = work
             .iter()
+            .copied()
             .filter(|item| {
                 matches!(
                     item.status,
@@ -581,6 +607,138 @@ mod tests {
 
         assert!(panel.input(&Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))));
         assert!(!panel.is_open());
+    }
+
+    #[test]
+    fn work_panel_hides_currently_viewed_conversation_while_keeping_tasks_and_other_sidechats() {
+        let mut panel = WorkPanel::default();
+        panel.set_current_conversation("1".into());
+        panel.set_graph(TaskGraphSnapshot {
+            nodes: vec![],
+            conversations: vec![],
+            omitted: 0,
+            work: vec![
+                ActiveWorkItem {
+                    id: "main".into(),
+                    task_id: None,
+                    conversation_id: "1".into(),
+                    title: "Main".into(),
+                    status: ActiveWorkStatus::Running,
+                    host: None,
+                    is_job: false,
+                    sidechat_slug: None,
+                    detail: None,
+                    started_at: None,
+                    tools: None,
+                    children: None,
+                },
+                ActiveWorkItem {
+                    id: "task:run".into(),
+                    task_id: Some("11111111-1111-4111-8111-111111111111".parse().unwrap()),
+                    conversation_id: "10".into(),
+                    title: "Fix protocol tests".into(),
+                    status: ActiveWorkStatus::Running,
+                    host: None,
+                    is_job: false,
+                    sidechat_slug: None,
+                    detail: None,
+                    started_at: None,
+                    tools: None,
+                    children: None,
+                },
+                ActiveWorkItem {
+                    id: "sidechat:42".into(),
+                    task_id: None,
+                    conversation_id: "42".into(),
+                    title: "Homelab Ops".into(),
+                    status: ActiveWorkStatus::Running,
+                    host: None,
+                    is_job: false,
+                    sidechat_slug: Some("homelab-ops".into()),
+                    detail: None,
+                    started_at: None,
+                    tools: None,
+                    children: None,
+                },
+            ],
+        });
+
+        // Viewing Main hides Main, leaving the delegated task and running side chat.
+        assert_eq!(panel.counts().running, 2);
+        assert_eq!(footer(&panel), " · 2 running (Ctrl+G)");
+        let main_view = drawn(&mut panel);
+        assert!(!main_view.contains("● Main"), "{main_view}");
+        assert!(main_view.contains("Fix protocol tests"), "{main_view}");
+        assert!(main_view.contains("Homelab Ops"), "{main_view}");
+
+        // Viewing the running side chat hides that side chat instead.
+        panel.set_current_conversation("42".into());
+        assert_eq!(panel.counts().running, 2);
+        let sidechat_view = drawn(&mut panel);
+        assert!(!sidechat_view.contains("Homelab Ops"), "{sidechat_view}");
+        assert!(
+            sidechat_view.contains("Fix protocol tests"),
+            "{sidechat_view}"
+        );
+
+        // Viewing a parent task with active child sub-agents still shows it so nested child work
+        // stays visible while viewing the parent conversation.
+        panel.set_current_conversation("10".into());
+        panel.set_graph(TaskGraphSnapshot {
+            nodes: vec![],
+            conversations: vec![],
+            omitted: 0,
+            work: vec![ActiveWorkItem {
+                id: "task:parent".into(),
+                task_id: Some("11111111-1111-4111-8111-111111111111".parse().unwrap()),
+                conversation_id: "10".into(),
+                title: "Parent task".into(),
+                status: ActiveWorkStatus::Running,
+                host: None,
+                is_job: false,
+                sidechat_slug: None,
+                detail: None,
+                started_at: None,
+                tools: None,
+                children: Some(vec![crate::protocol::ActiveWorkChild {
+                    agent_id: "child-1".into(),
+                    conversation_id: "11".into(),
+                    title: "Child worker".into(),
+                    status: ActiveWorkStatus::Running,
+                    host: None,
+                    detail: Some("exec: cargo test".into()),
+                    tools: vec!["exec: cargo test".into()],
+                }]),
+            }],
+        });
+        assert_eq!(panel.counts().running, 1);
+        let parent_view = drawn(&mut panel);
+        assert!(parent_view.contains("Child worker"), "{parent_view}");
+
+        // When only the currently viewed chat is active, the footer stays empty.
+        panel.set_current_conversation("1".into());
+        panel.set_graph(TaskGraphSnapshot {
+            nodes: vec![],
+            conversations: vec![],
+            omitted: 0,
+            work: vec![ActiveWorkItem {
+                id: "main".into(),
+                task_id: None,
+                conversation_id: "1".into(),
+                title: "Main".into(),
+                status: ActiveWorkStatus::Running,
+                host: None,
+                is_job: false,
+                sidechat_slug: None,
+                detail: None,
+                started_at: None,
+                tools: None,
+                children: None,
+            }],
+        });
+        assert!(panel.counts().is_empty());
+        assert_eq!(footer(&panel), "");
+        assert!(drawn(&mut panel).contains("No running or waiting work."));
     }
 
     fn one_running_task() -> TaskGraphSnapshot {

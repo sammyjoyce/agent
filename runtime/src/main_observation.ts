@@ -59,3 +59,59 @@ export async function watchMainNotices(session: Session, root: Conversation, emi
   });
   return observation.close;
 }
+
+export interface WorkingWatch {
+  close(): void;
+  isRunning(): boolean;
+}
+
+function hasActiveRun(value: unknown): boolean {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    && "run" in value && value.run !== undefined && value.run !== null;
+}
+
+/** Observe Pi's LiveDoc.run transitions on a conversation so observers learn when
+ *  a turn starts or finishes (including background wakes with no client turn owner). */
+export async function watchConversationWorking(
+  session: Harness,
+  conversation: Conversation,
+  hasLiveTurn: () => boolean,
+  emit: (event: RuntimeEventKind) => void,
+): Promise<WorkingWatch> {
+  let running = false;
+  let observed = false;
+  const commits = session.observeCommits({
+    advance(publication) {
+      for (const change of publication.changes) {
+        if (change.type !== "document" || change.conversationId !== conversation.id
+          || change.record.kind !== LiveDoc.definition.kind) continue;
+        const next = change.kind === "change" && hasActiveRun(change.value);
+        if (!observed) {
+          observed = true;
+          running = next;
+          if (next) emit({ type: "conversation_state", working: true });
+          continue;
+        }
+        if (next === running) continue;
+        running = next;
+        if (next) emit({ type: "conversation_state", working: true });
+        else if (!hasLiveTurn()) emit({ type: "conversation_state", working: false });
+      }
+    },
+    end() {},
+  });
+  try {
+    const initial = (await session.snapshot(LiveDoc, conversation.id, BACKGROUND_CONTEXT))?.run !== undefined;
+    if (!observed) {
+      observed = true;
+      running = initial;
+    }
+    return {
+      close: () => commits.detach(),
+      isRunning: () => running,
+    };
+  } catch (error) {
+    commits.detach();
+    throw error;
+  }
+}

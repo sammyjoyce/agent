@@ -696,6 +696,10 @@ test("bridge streams ObserveSidechat, SidechatInput, updates, and advertises sid
     assert.equal(observedAnswer.conversation_id, sidechat.conversation_id);
     assert.match(observedAnswer.text, /Side chat reply streamed cleanly/);
     const observerEvents = frames.filter((f) => f.id === 5).map((f) => f.event);
+    assert.ok(
+      observerEvents.some((e) => e.type === "conversation_state" && e.working === true),
+      "Sidechat observer must receive conversation_state working:true when a turn starts",
+    );
     assert.ok(observerEvents.some((e) => e.type === "text_delta"), "Sidechat observer must receive live text_delta streaming events");
     await waitFor(6, (e) => e.type === "done");
 
