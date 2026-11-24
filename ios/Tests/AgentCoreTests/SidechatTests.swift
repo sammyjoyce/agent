@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import Testing
 
 @testable import AgentCore
@@ -560,4 +561,103 @@ func sidechatSendClearsLocalArchivedStateAndPresenceTokenProtectsBannerSuppressi
     notifications.clearActiveSidechat(token: secondToken)
     #expect(notifications.activeSidechat == nil)
   }
+}
+
+@Test(.timeLimit(.minutes(1))) @MainActor
+func rootConversationNotificationRoutesToMainEvenWhenReadyReportsCustomRootID() async throws {
+  let workFixture = FixtureCoordinator()
+  let personalFixture = FixtureCoordinator()
+  let (workListener, workPort) = try await listen(workFixture)
+  let (personalListener, personalPort) = try await listen(personalFixture)
+
+  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  let suite = "sidechat-root-notify-\(UUID())"
+  let defaults = try #require(UserDefaults(suiteName: suite))
+  defaults.set(true, forKey: "notificationsEnabled")
+
+  let notifications = AppNotifications(
+    defaults: defaults, applicationSupport: root, caches: root,
+    transport: CoordinatorTransport { address in
+      LineConnection(
+        connection: NWConnection(to: address.port == 4002 ? personalPort : workPort, using: .tcp))
+    },
+    permission: { true })
+  await notifications.coordinators.setActive(true)
+  defer {
+    workListener.cancel()
+    personalListener.cancel()
+    defaults.removePersistentDomain(forName: suite)
+    try? FileManager.default.removeItem(at: root)
+  }
+
+  do {
+    let (work, personal) = try await addWorkAndPersonal(notifications.coordinators)
+    let chat = notifications.coordinators.chat
+    #expect(chat.snapshots[personal]?.conversationID == "fixture-root")
+    #expect(chat.snapshots[personal]?.sidechatsSupported == false)
+
+    // Connected coordinator without side chats: APNs root payload ("1") routes to Main, not a
+    // dead-end "Side chats unavailable" screen, and preserves the unsent draft.
+    chat.show(.one(work))
+    chat.draft = "Keep this Work draft"
+    let rootPayload = try #require(
+      AppNotifications.payload([
+        "agent": ["conversation_id": "1", "entry_id": "42", "installation_id": "\(personal)"]
+      ]))
+    notifications.open(rootPayload)
+    #expect(notifications.openRequest?.destination == .feed(notice: nil))
+    #expect(chat.scope == .one(personal))
+    #expect(chat.draft == "Keep this Work draft")
+
+    // Foreground banner policy follows Main's visibility rule for that coordinator.
+    notifications.mainVisible = .visible(atLatest: true)
+    #expect(!notifications.presents(payload: rootPayload))
+
+    // Once the coordinator advertises side chats, root ("1" or "fixture-root") still routes to
+    // Main while non-root side chat IDs ("42") route directly to the side chat.
+    await personalFixture.advertiseSidechats(true)
+    await notifications.coordinators.setActive(false)
+    await notifications.coordinators.setActive(true)
+    let reconnectDeadline = ContinuousClock.now + .seconds(15)
+    while chat.snapshots[personal]?.connection != .connected
+      || chat.snapshots[personal]?.sidechatsSupported != true
+    {
+      try #require(
+        ContinuousClock.now < reconnectDeadline, "Timed out waiting for sidechat reconnect")
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    chat.show(.one(work))
+    notifications.open(rootPayload)
+    #expect(notifications.openRequest?.destination == .feed(notice: nil))
+    #expect(chat.scope == .one(personal))
+
+    let customRootPayload = try #require(
+      AppNotifications.payload([
+        "agent": [
+          "conversation_id": "fixture-root", "entry_id": "43", "installation_id": "\(personal)",
+        ]
+      ]))
+    chat.show(.one(work))
+    notifications.open(customRootPayload)
+    #expect(notifications.openRequest?.destination == .feed(notice: nil))
+    #expect(chat.scope == .one(personal))
+
+    let sidechatPayload = try #require(
+      AppNotifications.payload([
+        "agent": ["conversation_id": "42", "entry_id": "99", "installation_id": "\(personal)"]
+      ]))
+    notifications.open(sidechatPayload)
+    #expect(
+      notifications.openRequest?.destination
+        == .sidechat(ScopedEntityID(profile: personal, item: "42")))
+    #expect(notifications.presents(payload: sidechatPayload))
+  } catch {
+    await notifications.coordinators.setActive(false)
+    await workFixture.stop()
+    await personalFixture.stop()
+    throw error
+  }
+  await notifications.coordinators.setActive(false)
+  await workFixture.stop()
+  await personalFixture.stop()
 }

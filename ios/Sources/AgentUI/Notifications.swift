@@ -109,8 +109,11 @@ public final class AppNotifications: NSObject {
 
   private func isSidechatConversation(_ conversationID: String?, on lane: ProfileID) -> Bool {
     guard let conversationID, !conversationID.isEmpty else { return false }
-    let mainID = coordinators.chat.snapshots[lane]?.conversationID ?? "1"
-    return conversationID != mainID
+    if let snapshot = coordinators.chat.snapshots[lane] {
+      if snapshot.connection == .connected && !snapshot.sidechatsSupported { return false }
+      if let mainID = snapshot.conversationID, conversationID == mainID { return false }
+    }
+    return conversationID != "1"
   }
 
   func open(_ payload: AlertPayload) {
