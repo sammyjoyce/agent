@@ -1341,12 +1341,22 @@ impl State {
                 ));
             }
             RuntimeEventKind::ConversationReady { conversation, model, cwd, working } => {
-                self.reset_observed_activity();
-                self.info = TuiInfo { title: conversation.title, model: Some(model), cwd: cwd.clone() };
-                self.set_cwd(cwd);
-                self.worker = false;
-                self.output.banner.ready();
-                self.working(working);
+                self.enter_observed_conversation(
+                    conversation.conversation_id,
+                    conversation.title,
+                    model,
+                    cwd,
+                    working,
+                );
+            }
+            RuntimeEventKind::SidechatReady { conversation_id, sidechat, model, cwd, working, .. } => {
+                self.enter_observed_conversation(
+                    conversation_id,
+                    sidechat.title,
+                    model,
+                    cwd,
+                    working,
+                );
             }
             RuntimeEventKind::ConversationState { working } => self.working(working),
             RuntimeEventKind::History {
@@ -1451,8 +1461,9 @@ impl State {
                     }
                 }
             },
-            RuntimeEventKind::TaskReady { title, .. } => {
+            RuntimeEventKind::TaskReady { conversation_id, title, .. } => {
                 self.output.banner.ready();
+                self.work.set_current_conversation(conversation_id);
                 // Initial history is fetched after readiness. Keep newly
                 // placed input behind that page while the fetch is in flight.
                 self.output.collecting_history = true;
@@ -1462,8 +1473,9 @@ impl State {
                 self.child_agents.clear();
             }
             RuntimeEventKind::ConversationSettings { settings } => self.info.model = Some(settings.model),
-            RuntimeEventKind::MainReady { model, cwd, .. } => {
+            RuntimeEventKind::MainReady { conversation_id, model, cwd, .. } => {
                 self.output.banner.ready();
+                self.work.set_current_conversation(conversation_id);
                 self.info.model = Some(model);
                 self.set_cwd(cwd);
                 self.working(true);
@@ -1673,6 +1685,26 @@ impl State {
         };
         self.picker = Some(ConversationPicker::new(choices, query, labels, reply));
         self.changed = true;
+    }
+    fn enter_observed_conversation(
+        &mut self,
+        conversation_id: String,
+        title: String,
+        model: ModelSelection,
+        cwd: String,
+        working: bool,
+    ) {
+        self.reset_observed_activity();
+        self.work.set_current_conversation(conversation_id);
+        self.info = TuiInfo {
+            title,
+            model: Some(model),
+            cwd: cwd.clone(),
+        };
+        self.set_cwd(cwd);
+        self.worker = false;
+        self.output.banner.ready();
+        self.working(working);
     }
     fn reset_conversation(&mut self, info: TuiInfo) {
         // The task graph watch is coordinator-wide and emits only on change,
@@ -6939,5 +6971,76 @@ mod tests {
         view.work.open();
         let screen = rendered(&mut view, 100, 20);
         assert!(screen.contains("[Side chat: car]"), "{screen}");
+    }
+
+    #[test]
+    fn switching_between_sidechat_and_main_hides_only_the_viewed_conversation_in_work_panel() {
+        let mut view = State::new(TuiInfo {
+            title: "Demo Car".into(),
+            model: Some(ModelSelection::default()),
+            cwd: "/workspace".into(),
+        });
+        view.event(RuntimeEventKind::ConversationReady {
+            conversation: crate::protocol::SavedConversation {
+                conversation_id: "42".into(),
+                task_id: None,
+                agent_id: None,
+                title: "Demo Car".into(),
+                host: None,
+                source_thread_id: None,
+                updated_at: None,
+            },
+            model: ModelSelection::default(),
+            cwd: "/workspace".into(),
+            working: true,
+        });
+        view.event(RuntimeEventKind::TaskGraph {
+            graph: crate::protocol::TaskGraphSnapshot {
+                nodes: vec![],
+                conversations: vec![],
+                omitted: 0,
+                work: vec![crate::protocol::ActiveWorkItem {
+                    id: "sidechat:42".into(),
+                    task_id: None,
+                    conversation_id: "42".into(),
+                    title: "Demo Car".into(),
+                    status: crate::protocol::ActiveWorkStatus::Running,
+                    host: None,
+                    is_job: false,
+                    sidechat_slug: Some("car".into()),
+                    detail: Some("exec: rg".into()),
+                    started_at: None,
+                    tools: Some(vec!["exec: rg".into()]),
+                    children: None,
+                }],
+            },
+        });
+        // While viewing Demo Car, its working spinner runs in-chat and Active work hides it.
+        assert!(view.working);
+        assert!(view.work.footer_spans().is_empty());
+
+        // Switching back to Main reveals Demo Car in the footer and Active work panel.
+        view.reset_conversation(TuiInfo {
+            title: "Main agent".into(),
+            model: Some(ModelSelection::default()),
+            cwd: "/workspace".into(),
+        });
+        view.event(RuntimeEventKind::MainReady {
+            input_origins: None,
+            accepted_input_origins: None,
+            conversation_settings: None,
+            active_work: Some(true),
+            sidechats: Some(true),
+            conversation_id: "1".into(),
+            model: ModelSelection::default(),
+            cwd: "/workspace".into(),
+        });
+        let footer: String = view
+            .work
+            .footer_spans()
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect();
+        assert!(footer.contains("1 running (Ctrl+G)"), "{footer}");
     }
 }

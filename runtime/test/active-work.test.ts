@@ -16,6 +16,7 @@ import type { TaskGraphNode } from "../src/generated/TaskGraphNode.js";
 import type { TaskGraphSnapshot } from "../src/generated/TaskGraphSnapshot.js";
 import type { TaskRecord } from "../src/generated/TaskRecord.js";
 import { Notifications } from "../src/notifications.js";
+import { watchConversationWorking } from "../src/main_observation.js";
 import { readTaskGraph } from "../src/task-graph.js";
 import { openBridgeHarness } from "./bridge-harness.js";
 import { heldCall, host, open, type App } from "./delegation.js";
@@ -184,5 +185,81 @@ test("the push sender makes no active work row while it sends or sleeps, and the
     for (const session of sessions) session.destroy();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("watchConversationWorking emits working true and false for background turns without a live client owner", { timeout: 25_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-watch-working-"));
+  await chmod(directory, 0o700);
+  const app = await open(directory);
+  let releaseMain = () => {};
+  let stopWorking = () => {};
+  try {
+    const root = await app.session.root(BACKGROUND_CONTEXT);
+    releaseMain = app.executions.bind(root.id.toString(), { model: fixtureModel, cwd: host.cwd, hosts: [], call: async () => ({ type: "written" }) });
+    await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [app.tools.main] }, BACKGROUND_CONTEXT);
+
+    const states: boolean[] = [];
+    stopWorking = await watchConversationWorking(app.session, root, () => false, (event) => {
+      if (event.type === "conversation_state") states.push(event.working);
+    });
+
+    const held = heldCall("Background wake answer");
+    app.faux.setResponses([held.step]);
+    const submission = await root.submit({ type: "input", content: "Run a background wake." }, BACKGROUND_CONTEXT);
+    await held.started;
+    await until(() => states.includes(true), "working: true must arrive while the turn is running");
+    assert.deepEqual(states, [true]);
+
+    held.release();
+    assert.equal((await submission.wait(BACKGROUND_CONTEXT)).status, "done");
+    await until(() => states.length >= 2, "working: false must arrive when the background turn ends");
+    assert.deepEqual(states, [true, false]);
+  } finally {
+    stopWorking();
+    releaseMain();
+    await app.session.close(BACKGROUND_CONTEXT);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("observe_main emits conversation_state working:true before output and worker_idle after main_input", { timeout: 25_000 }, async (t) => {
+  const gateDir = await mkdtemp(join(tmpdir(), "agent-working-gate-"));
+  const gateFile = join(gateDir, "release");
+  const bridge = await openBridgeHarness(t, { "Check status": [{ text: "Main answer.", after: gateFile }] });
+  try {
+    bridge.send(3, { type: "observe_main", input_ids: [], task_graph: true });
+    await bridge.waitFor("observe_main idle", () =>
+      bridge.frames.some((frame) => frame.id === 3 && frame.event.type === "worker_idle"));
+    const idleBefore = bridge.frames.filter((frame) => frame.id === 3).length;
+
+    bridge.send(4, { type: "main_input", input_id: "main-spin-1", input: "Check status", mode: "steer" });
+    await bridge.waitFor("observe_main working:true while model is still held", () =>
+      bridge.frames.filter((frame) => frame.id === 3).slice(idleBefore)
+        .some((frame) => frame.event.type === "conversation_state" && frame.event.working === true));
+    assert.equal(
+      bridge.frames.filter((frame) => frame.id === 3).slice(idleBefore).some((frame) => frame.event.type === "answer"),
+      false,
+      "working:true must arrive before the model emits any answer",
+    );
+
+    await writeFile(gateFile, "go");
+    await bridge.collect(4);
+    await bridge.waitFor("observe_main post-turn idle", () =>
+      bridge.frames.filter((frame) => frame.id === 3).slice(idleBefore).some((frame) => frame.event.type === "worker_idle"));
+
+    const turnEvents = bridge.frames.filter((frame) => frame.id === 3).slice(idleBefore).map((frame) => frame.event);
+    const workingIndex = turnEvents.findIndex((event) => event.type === "conversation_state" && event.working === true);
+    const answerIndex = turnEvents.findIndex((event) => event.type === "answer");
+    const idleIndex = turnEvents.findLastIndex((event) => event.type === "worker_idle");
+    assert.ok(workingIndex >= 0, `Expected conversation_state working:true on observe_main, got: ${JSON.stringify(turnEvents.map((e) => e.type))}`);
+    assert.ok(answerIndex > workingIndex, "working:true must precede the answer");
+    assert.ok(idleIndex > answerIndex, "worker_idle must follow the answer");
+
+    bridge.send(3, { type: "detach_main" });
+    await bridge.collect(3);
+  } finally {
+    await bridge.close();
+    await rm(gateDir, { recursive: true, force: true });
   }
 });

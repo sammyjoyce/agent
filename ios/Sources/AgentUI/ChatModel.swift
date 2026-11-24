@@ -312,6 +312,14 @@ final class ChatModel {
       }
     }
   }
+  private func isCurrentlyViewedWorkItem(_ item: ActiveWorkItem, snapshot: ChatSnapshot) -> Bool {
+    if let sidechat = activeSidechat {
+      return item.conversationId == sidechat.conversationId
+    }
+    if item.id == "main" { return true }
+    if let mainID = snapshot.conversationID, item.conversationId == mainID { return true }
+    return false
+  }
   var activeWorkSummary: ActiveWorkSummary {
     guard inspectedConversation == nil else { return .empty }
     var omitted = 0
@@ -323,7 +331,7 @@ final class ChatModel {
       else { continue }
       shownLanes += 1
       omitted += graph.omitted
-      for item in graph.work {
+      for item in graph.work where !isCurrentlyViewedWorkItem(item, snapshot: snapshot) {
         rows.append(
           ActiveWorkRow(
             id: "\(lane.id)-\(item.id)", lane: lane.id, laneName: name(lane.id), item: item

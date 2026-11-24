@@ -1284,7 +1284,7 @@ public actor CoordinatorSession {
         case .history(let frame):
           page.include(frame)
           consume(event, historyRequestID: id)
-        case .message, .answer, .textDelta, .activity, .ready, .idle: break
+        case .message, .answer, .textDelta, .activity, .ready, .idle, .working: break
         case .failure(let failure):
           failed = true
           consume(event, historyRequestID: id)
@@ -1816,7 +1816,9 @@ public actor CoordinatorSession {
           snapshot.includesLatest = true
         }
       }
-    case .message(let value): transcript.message(value.message)
+    case .message(let value):
+      if historyRequestID == nil, value.message.role == .user { snapshot.busy = true }
+      transcript.message(value.message)
     case .answer(let value):
       transcript.answer(value)
       if let entryID = value.entryId { tellEveryVoice(.answer(entryID: entryID, text: value.text)) }

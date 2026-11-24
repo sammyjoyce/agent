@@ -43,7 +43,7 @@ import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import { conversationSettings } from "./settings.js";
 import { createInputOrigins, INPUT_ORIGIN_CAPABILITIES } from "./input_origin.js";
 import { watchInputDelivery } from "./input_delivery.js";
-import { inspectMainWork, reconcileMainInput, watchMainNotices } from "./main_observation.js";
+import { inspectMainWork, reconcileMainInput, watchConversationWorking, watchMainNotices } from "./main_observation.js";
 import { createMainResponsePolicy, MAIN_RESPONSE_INSTRUCTIONS, mainResponse } from "./main_response.js";
 import { BackgroundScheduler } from "./background.js";
 import { openJobActor, runScheduled } from "./scheduled.js";
@@ -519,6 +519,7 @@ async function runConversationTurn(options: {
   let submissionAttempted = reclaimedInput !== undefined;
   const turnPromise = enqueueConversationTurn(conversationId, async () => {
     if (interrupted.has(id)) { emit(id, { type: "interrupted" }); return; }
+    publishToObservers(conversationId, { type: "conversation_state", working: true });
     if (command.model !== null) await inference.preflight(command.model);
     const application = await app();
     const { harness, tasks, sidechats, environment, executions, toolsets } = application;
@@ -971,6 +972,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
         const observerEntry = { conversationId: command.conversation_id, observation };
         sidechatObservers.set(id, observerEntry);
         let stopNotices: (() => void) | undefined;
+        let stopWorking: (() => void) | undefined;
         try {
           const application = await app();
           if (observation.closed) break;
@@ -980,6 +982,12 @@ async function handle(request: RuntimeRequest): Promise<void> {
           const conversation = await application.tasks.conversation(summary.conversation_id);
           if (observation.closed) break;
           stopNotices = await watchMainNotices(application.harness, conversation, (event) => observation.publish(event));
+          stopWorking = await watchConversationWorking(
+            application.harness,
+            conversation,
+            () => liveTurnFor(summary.conversation_id) !== undefined,
+            (event) => observation.publish(event),
+          );
           const initialWork = await inspectMainWork(application.harness, conversation);
           const working = initialWork.type !== "idle" || liveTurnFor(summary.conversation_id) !== undefined;
           observation.snapshot({
@@ -1006,8 +1014,11 @@ async function handle(request: RuntimeRequest): Promise<void> {
           await observation.finished;
         } finally {
           observation.close();
-          try { stopNotices?.(); }
-          finally { sidechatObservers.delete(id); }
+          try { stopWorking?.(); }
+          finally {
+            try { stopNotices?.(); }
+            finally { sidechatObservers.delete(id); }
+          }
         }
         break;
       }
@@ -1182,6 +1193,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
         const observer = new Observation((event) => writeEvent(id, event));
         mainObservers.set(id, observer);
         let stopNotices: (() => void) | undefined;
+        let stopWorking: (() => void) | undefined;
         let stopSources: (() => Promise<void>) | undefined;
         let stopTaskGraph: (() => Promise<void>) | undefined;
         try {
@@ -1190,6 +1202,12 @@ async function handle(request: RuntimeRequest): Promise<void> {
           const root = await application.harness.root(BACKGROUND_CONTEXT);
           if (observer.closed) break;
           stopNotices = await watchMainNotices(application.harness, root, (event) => observer.publish(event));
+          stopWorking = await watchConversationWorking(
+            application.harness,
+            root,
+            () => liveTurnFor(ROOT_CONVERSATION_ID.toString()) !== undefined,
+            (event) => observer.publish(event),
+          );
           observer.snapshot({ type: "main_ready", ...MAIN_CAPABILITIES,
             conversation_id: root.id.toString(), model: await inference.legacy(root, await application.environment.model(null)), cwd: "" });
           // Reconcile optimistic rows before history exposes their saved copies.
@@ -1225,7 +1243,10 @@ async function handle(request: RuntimeRequest): Promise<void> {
           try { await stopSources?.(); }
           finally {
             try { await stopTaskGraph?.(); }
-            finally { stopNotices?.(); mainObservers.delete(id); }
+            finally {
+              try { stopWorking?.(); }
+              finally { stopNotices?.(); mainObservers.delete(id); }
+            }
           }
         }
         break;
