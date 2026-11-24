@@ -92,6 +92,13 @@ impl WorkPanel {
         let current = self.current_conversation_id.as_deref();
         snapshot.work.iter().filter(move |item| {
             current.is_none_or(|current| {
+                let has_children = item
+                    .children
+                    .as_ref()
+                    .is_some_and(|children| !children.is_empty());
+                if has_children {
+                    return true;
+                }
                 item.conversation_id != current && !(current == "1" && item.id == "main")
             })
         })
@@ -673,6 +680,40 @@ mod tests {
             sidechat_view.contains("Fix protocol tests"),
             "{sidechat_view}"
         );
+
+        // Viewing a parent task with active child sub-agents still shows it so nested child work
+        // stays visible while viewing the parent conversation.
+        panel.set_current_conversation("10".into());
+        panel.set_graph(TaskGraphSnapshot {
+            nodes: vec![],
+            conversations: vec![],
+            omitted: 0,
+            work: vec![ActiveWorkItem {
+                id: "task:parent".into(),
+                task_id: Some("11111111-1111-4111-8111-111111111111".parse().unwrap()),
+                conversation_id: "10".into(),
+                title: "Parent task".into(),
+                status: ActiveWorkStatus::Running,
+                host: None,
+                is_job: false,
+                sidechat_slug: None,
+                detail: None,
+                started_at: None,
+                tools: None,
+                children: Some(vec![crate::protocol::ActiveWorkChild {
+                    agent_id: "child-1".into(),
+                    conversation_id: "11".into(),
+                    title: "Child worker".into(),
+                    status: ActiveWorkStatus::Running,
+                    host: None,
+                    detail: Some("exec: cargo test".into()),
+                    tools: vec!["exec: cargo test".into()],
+                }]),
+            }],
+        });
+        assert_eq!(panel.counts().running, 1);
+        let parent_view = drawn(&mut panel);
+        assert!(parent_view.contains("Child worker"), "{parent_view}");
 
         // When only the currently viewed chat is active, the footer stays empty.
         panel.set_current_conversation("1".into());

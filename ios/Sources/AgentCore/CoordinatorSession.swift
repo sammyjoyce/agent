@@ -1817,7 +1817,9 @@ public actor CoordinatorSession {
         }
       }
     case .message(let value):
-      if historyRequestID == nil, value.message.role == .user { snapshot.busy = true }
+      if historyRequestID == nil, inspectedConversation == nil, value.message.role == .user {
+        snapshot.busy = true
+      }
       transcript.message(value.message)
     case .answer(let value):
       transcript.answer(value)

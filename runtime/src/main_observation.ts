@@ -60,6 +60,11 @@ export async function watchMainNotices(session: Session, root: Conversation, emi
   return observation.close;
 }
 
+export interface WorkingWatch {
+  close(): void;
+  isRunning(): boolean;
+}
+
 function hasActiveRun(value: unknown): boolean {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     && "run" in value && value.run !== undefined && value.run !== null;
@@ -72,7 +77,7 @@ export async function watchConversationWorking(
   conversation: Conversation,
   hasLiveTurn: () => boolean,
   emit: (event: RuntimeEventKind) => void,
-): Promise<() => void> {
+): Promise<WorkingWatch> {
   let running = false;
   let observed = false;
   const commits = session.observeCommits({
@@ -101,7 +106,10 @@ export async function watchConversationWorking(
       observed = true;
       running = initial;
     }
-    return () => commits.detach();
+    return {
+      close: () => commits.detach(),
+      isRunning: () => running,
+    };
   } catch (error) {
     commits.detach();
     throw error;

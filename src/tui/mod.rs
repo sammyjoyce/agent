@@ -7019,12 +7019,60 @@ mod tests {
         assert!(view.working);
         assert!(view.work.footer_spans().is_empty());
 
-        // Switching back to Main reveals Demo Car in the footer and Active work panel.
+        // Switching back to Main via ConversationReady (as chat_tui does) reveals Demo Car.
         view.reset_conversation(TuiInfo {
             title: "Main agent".into(),
             model: Some(ModelSelection::default()),
             cwd: "/workspace".into(),
         });
+        view.event(RuntimeEventKind::ConversationReady {
+            conversation: crate::protocol::SavedConversation {
+                conversation_id: "1".into(),
+                task_id: None,
+                agent_id: None,
+                title: "Main agent".into(),
+                host: None,
+                source_thread_id: None,
+                updated_at: None,
+            },
+            model: ModelSelection::default(),
+            cwd: "/workspace".into(),
+            working: false,
+        });
+        let footer: String = view
+            .work
+            .footer_spans()
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect();
+        assert!(footer.contains("1 running (Ctrl+G)"), "{footer}");
+
+        // SidechatReady also hides the viewed side chat until switching back to MainReady.
+        view.event(RuntimeEventKind::SidechatReady {
+            input_origins: None,
+            accepted_input_origins: None,
+            conversation_settings: None,
+            conversation_id: "42".into(),
+            sidechat: crate::protocol::SidechatSummary {
+                conversation_id: "42".into(),
+                slug: "car".into(),
+                title: "Demo Car".into(),
+                charter: None,
+                isolated: false,
+                notifications: crate::protocol::SidechatNotificationPreference::Inherit,
+                pinned: false,
+                archived_at: None,
+                seed: None,
+                created_at: 1,
+                updated_at: 1,
+            },
+            model: ModelSelection::default(),
+            cwd: "/workspace".into(),
+            working: true,
+        });
+        assert!(view.working);
+        assert!(view.work.footer_spans().is_empty());
+
         view.event(RuntimeEventKind::MainReady {
             input_origins: None,
             accepted_input_origins: None,
@@ -7035,12 +7083,12 @@ mod tests {
             model: ModelSelection::default(),
             cwd: "/workspace".into(),
         });
-        let footer: String = view
+        let main_footer: String = view
             .work
             .footer_spans()
             .into_iter()
             .map(|span| span.content.into_owned())
             .collect();
-        assert!(footer.contains("1 running (Ctrl+G)"), "{footer}");
+        assert!(main_footer.contains("1 running (Ctrl+G)"), "{main_footer}");
     }
 }

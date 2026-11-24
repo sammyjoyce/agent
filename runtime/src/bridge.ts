@@ -43,7 +43,7 @@ import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import { conversationSettings } from "./settings.js";
 import { createInputOrigins, INPUT_ORIGIN_CAPABILITIES } from "./input_origin.js";
 import { watchInputDelivery } from "./input_delivery.js";
-import { inspectMainWork, reconcileMainInput, watchConversationWorking, watchMainNotices } from "./main_observation.js";
+import { inspectMainWork, reconcileMainInput, watchConversationWorking, watchMainNotices, type WorkingWatch } from "./main_observation.js";
 import { createMainResponsePolicy, MAIN_RESPONSE_INSTRUCTIONS, mainResponse } from "./main_response.js";
 import { BackgroundScheduler } from "./background.js";
 import { openJobActor, runScheduled } from "./scheduled.js";
@@ -147,7 +147,9 @@ function writeEvent(id: number, event: RuntimeEventKind): void {
   const turn = activeTurns.get(id);
   if (turn !== undefined) {
     const update = event.type === "done" ? { type: "worker_idle" } satisfies RuntimeEventKind : event;
-    if (["main_ready", "sidechat_ready", "text_delta", "activity", "message", "answer", "input_accepted", "input_placed", "input_rejected", "interrupted", "failure", "conversation_settings", "worker_idle"].includes(update.type)) {
+    if (update.type === "worker_idle" && liveTurnFor(turn.conversationId) !== undefined) {
+      // Another live turn is already running or queued on this conversation; let it own idle.
+    } else if (["main_ready", "sidechat_ready", "text_delta", "activity", "message", "answer", "input_accepted", "input_placed", "input_rejected", "interrupted", "failure", "conversation_settings", "worker_idle"].includes(update.type)) {
       publishToObservers(turn.conversationId, update);
     }
   }
@@ -972,7 +974,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
         const observerEntry = { conversationId: command.conversation_id, observation };
         sidechatObservers.set(id, observerEntry);
         let stopNotices: (() => void) | undefined;
-        let stopWorking: (() => void) | undefined;
+        let workingWatch: WorkingWatch | undefined;
         try {
           const application = await app();
           if (observation.closed) break;
@@ -982,7 +984,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
           const conversation = await application.tasks.conversation(summary.conversation_id);
           if (observation.closed) break;
           stopNotices = await watchMainNotices(application.harness, conversation, (event) => observation.publish(event));
-          stopWorking = await watchConversationWorking(
+          workingWatch = await watchConversationWorking(
             application.harness,
             conversation,
             () => liveTurnFor(summary.conversation_id) !== undefined,
@@ -1010,11 +1012,11 @@ async function handle(request: RuntimeRequest): Promise<void> {
           if (!observation.open()) break;
           const work = await inspectMainWork(application.harness, conversation);
           if (work.type === "blocked") failure(id, "invalid_request", "Side chat paused. Worker/runtime update required before it can resume.");
-          else if (work.type === "idle" && liveTurnFor(summary.conversation_id) === undefined) emit(id, { type: "worker_idle" });
+          else if (work.type === "idle" && !workingWatch.isRunning() && liveTurnFor(summary.conversation_id) === undefined) emit(id, { type: "worker_idle" });
           await observation.finished;
         } finally {
           observation.close();
-          try { stopWorking?.(); }
+          try { workingWatch?.close(); }
           finally {
             try { stopNotices?.(); }
             finally { sidechatObservers.delete(id); }
@@ -1193,7 +1195,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
         const observer = new Observation((event) => writeEvent(id, event));
         mainObservers.set(id, observer);
         let stopNotices: (() => void) | undefined;
-        let stopWorking: (() => void) | undefined;
+        let workingWatch: WorkingWatch | undefined;
         let stopSources: (() => Promise<void>) | undefined;
         let stopTaskGraph: (() => Promise<void>) | undefined;
         try {
@@ -1202,7 +1204,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
           const root = await application.harness.root(BACKGROUND_CONTEXT);
           if (observer.closed) break;
           stopNotices = await watchMainNotices(application.harness, root, (event) => observer.publish(event));
-          stopWorking = await watchConversationWorking(
+          workingWatch = await watchConversationWorking(
             application.harness,
             root,
             () => liveTurnFor(ROOT_CONVERSATION_ID.toString()) !== undefined,
@@ -1236,7 +1238,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
           // after history makes the observer ready, so it stays connected.
           const work = await inspectMainWork(application.harness, root);
           if (work.type === "blocked") failure(id, "invalid_request", "Main conversation paused. Worker/runtime update required before it can resume.");
-          else if (work.type === "idle" && liveTurnFor(ROOT_CONVERSATION_ID.toString()) === undefined) emit(id, { type: "worker_idle" });
+          else if (work.type === "idle" && !workingWatch.isRunning() && liveTurnFor(ROOT_CONVERSATION_ID.toString()) === undefined) emit(id, { type: "worker_idle" });
           await observer.finished;
         } finally {
           observer.close();
@@ -1244,7 +1246,7 @@ async function handle(request: RuntimeRequest): Promise<void> {
           finally {
             try { await stopTaskGraph?.(); }
             finally {
-              try { stopWorking?.(); }
+              try { workingWatch?.close(); }
               finally { stopNotices?.(); mainObservers.delete(id); }
             }
           }

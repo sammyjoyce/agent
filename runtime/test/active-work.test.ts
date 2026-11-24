@@ -188,7 +188,7 @@ test("the push sender makes no active work row while it sends or sleeps, and the
   }
 });
 
-test("watchConversationWorking emits working true and false for background turns without a live client owner", { timeout: 25_000 }, async () => {
+test("watchConversationWorking tracks isRunning, emits for background turns, and defers idle when a live client owns the turn", { timeout: 25_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-watch-working-"));
   await chmod(directory, 0o700);
   const app = await open(directory);
@@ -199,22 +199,41 @@ test("watchConversationWorking emits working true and false for background turns
     releaseMain = app.executions.bind(root.id.toString(), { model: fixtureModel, cwd: host.cwd, hosts: [], call: async () => ({ type: "written" }) });
     await root.configure({ model: { provider: "openai", modelId: "fixture" }, extensions: [app.tools.main] }, BACKGROUND_CONTEXT);
 
+    let liveOwner = false;
     const states: boolean[] = [];
-    stopWorking = await watchConversationWorking(app.session, root, () => false, (event) => {
+    const watch = await watchConversationWorking(app.session, root, () => liveOwner, (event) => {
       if (event.type === "conversation_state") states.push(event.working);
     });
+    stopWorking = () => watch.close();
+    assert.equal(watch.isRunning(), false);
 
     const held = heldCall("Background wake answer");
     app.faux.setResponses([held.step]);
     const submission = await root.submit({ type: "input", content: "Run a background wake." }, BACKGROUND_CONTEXT);
     await held.started;
     await until(() => states.includes(true), "working: true must arrive while the turn is running");
+    assert.equal(watch.isRunning(), true);
     assert.deepEqual(states, [true]);
 
     held.release();
     assert.equal((await submission.wait(BACKGROUND_CONTEXT)).status, "done");
     await until(() => states.length >= 2, "working: false must arrive when the background turn ends");
+    assert.equal(watch.isRunning(), false);
     assert.deepEqual(states, [true, false]);
+
+    // When a live client turn owns the conversation, watchConversationWorking must suppress
+    // premature working: false on endRun so worker_idle remains the single terminal boundary.
+    liveOwner = true;
+    const heldLive = heldCall("Live owned answer");
+    app.faux.setResponses([heldLive.step]);
+    const liveSubmission = await root.submit({ type: "input", content: "Run a live owned turn." }, BACKGROUND_CONTEXT);
+    await heldLive.started;
+    await until(() => states.length >= 3, "working: true must arrive when the second turn starts");
+    assert.equal(watch.isRunning(), true);
+    heldLive.release();
+    assert.equal((await liveSubmission.wait(BACKGROUND_CONTEXT)).status, "done");
+    await until(() => !watch.isRunning(), "watch must report idle once the run ends");
+    assert.deepEqual(states, [true, false, true]);
   } finally {
     stopWorking();
     releaseMain();
@@ -223,10 +242,14 @@ test("watchConversationWorking emits working true and false for background turns
   }
 });
 
-test("observe_main emits conversation_state working:true before output and worker_idle after main_input", { timeout: 25_000 }, async (t) => {
+test("observe_main emits conversation_state working:true before output and preserves busy state across back-to-back turns", { timeout: 25_000 }, async (t) => {
   const gateDir = await mkdtemp(join(tmpdir(), "agent-working-gate-"));
-  const gateFile = join(gateDir, "release");
-  const bridge = await openBridgeHarness(t, { "Check status": [{ text: "Main answer.", after: gateFile }] });
+  const gateA = join(gateDir, "release-a");
+  const gateB = join(gateDir, "release-b");
+  const bridge = await openBridgeHarness(t, {
+    "Check status": [{ text: "Main answer A.", after: gateA }],
+    "Follow status": [{ text: "Main answer B.", after: gateB }],
+  });
   try {
     bridge.send(3, { type: "observe_main", input_ids: [], task_graph: true });
     await bridge.waitFor("observe_main idle", () =>
@@ -243,18 +266,52 @@ test("observe_main emits conversation_state working:true before output and worke
       "working:true must arrive before the model emits any answer",
     );
 
-    await writeFile(gateFile, "go");
-    await bridge.collect(4);
-    await bridge.waitFor("observe_main post-turn idle", () =>
-      bridge.frames.filter((frame) => frame.id === 3).slice(idleBefore).some((frame) => frame.event.type === "worker_idle"));
+    await writeFile(gateA, "go");
+    await bridge.waitFor("first answer observed on observe_main", () =>
+      bridge.frames.filter((frame) => frame.id === 3).slice(idleBefore)
+        .some((frame) => frame.event.type === "answer" && frame.event.text.includes("Main answer A.")));
+
+    // Immediately fire a second turn while the first turn is completing so any stale worker_idle
+    // from turn 1 cannot clobber turn 2's working:true.
+    bridge.send(5, { type: "main_input", input_id: "main-spin-2", input: "Follow status", mode: "steer" });
+    await bridge.waitFor("second input placed while gateB holds turn 2", () =>
+      bridge.frames.filter((frame) => frame.id === 3).slice(idleBefore)
+        .some((frame) => frame.event.type === "input_placed" && frame.event.input_id === "main-spin-2"));
+    const busyStatesWhileGateBHeld = bridge.frames
+      .filter((frame) => frame.id === 3)
+      .slice(idleBefore)
+      .flatMap((frame) => {
+        if (frame.event.type === "conversation_state") return [frame.event.working];
+        if (frame.event.type === "worker_idle") return [false];
+        return [];
+      });
+    assert.equal(
+      busyStatesWhileGateBHeld.at(-1),
+      true,
+      `observe_main must stay working:true while turn 2 is held, got states: ${JSON.stringify(busyStatesWhileGateBHeld)}`,
+    );
+
+    await writeFile(gateB, "go");
+    await Promise.all([bridge.collect(4), bridge.collect(5)]);
+    await bridge.waitFor("observe_main post-turn idle after second answer", () => {
+      const events = bridge.frames.filter((frame) => frame.id === 3).slice(idleBefore).map((frame) => frame.event);
+      const secondAnswerIndex = events.findIndex((event) => event.type === "answer" && event.text.includes("Main answer B."));
+      const lastIdleIndex = events.findLastIndex((event) => event.type === "worker_idle");
+      return secondAnswerIndex >= 0 && lastIdleIndex > secondAnswerIndex;
+    });
 
     const turnEvents = bridge.frames.filter((frame) => frame.id === 3).slice(idleBefore).map((frame) => frame.event);
     const workingIndex = turnEvents.findIndex((event) => event.type === "conversation_state" && event.working === true);
-    const answerIndex = turnEvents.findIndex((event) => event.type === "answer");
+    const firstAnswerIndex = turnEvents.findIndex((event) => event.type === "answer" && event.text.includes("Main answer A."));
+    const secondAnswerIndex = turnEvents.findIndex((event) => event.type === "answer" && event.text.includes("Main answer B."));
     const idleIndex = turnEvents.findLastIndex((event) => event.type === "worker_idle");
-    assert.ok(workingIndex >= 0, `Expected conversation_state working:true on observe_main, got: ${JSON.stringify(turnEvents.map((e) => e.type))}`);
-    assert.ok(answerIndex > workingIndex, "working:true must precede the answer");
-    assert.ok(idleIndex > answerIndex, "worker_idle must follow the answer");
+    assert.ok(workingIndex >= 0 && firstAnswerIndex > workingIndex, "working:true must precede the first answer");
+    assert.equal(
+      turnEvents.slice(workingIndex, firstAnswerIndex).some((event) => event.type === "conversation_state" && !event.working),
+      false,
+      "no premature working:false may precede the first answer",
+    );
+    assert.ok(idleIndex > secondAnswerIndex, "worker_idle must follow the final answer");
 
     bridge.send(3, { type: "detach_main" });
     await bridge.collect(3);
