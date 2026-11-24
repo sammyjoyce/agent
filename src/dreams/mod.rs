@@ -17,8 +17,7 @@ use anyhow::{Context, Result};
 use tokio::sync::watch;
 
 pub use evidence::{
-    CheckPhase, EvidenceItem, EvidenceKind, Finding, check_lines, escape_controls, quote,
-    review_summary,
+    CheckPhase, EvidenceItem, EvidenceKind, check_lines, escape_controls, quote, review_summary,
 };
 pub use policy::{
     CheckSpec, DreamsCheckFile, DreamsPolicy, DreamsPolicyFile, DreamsPolicySource, EditablePath,
@@ -29,9 +28,9 @@ pub use store::{AppliedRecord, DreamsStore, RunView};
 use store::{ReviewSeal, Verdict};
 pub use types::{
     Abstention, CheckResult, ContentDigest, Coverage, DreamsAbstainReason, DreamsFileEdit,
-    DreamsReply, DreamsRequest, DreamsTaskSummary, EvidenceId, FileChange, Gap, GapCause, Interval,
-    Outcome, PolicyDigest, Proposal, ProposedFile, ReceiptCoverage, Review, Revision, RunId,
-    SealedOutcome, SummarySnapshot, UntrustedText, count, format_utc,
+    DreamsReply, DreamsRequest, DreamsTaskSummary, EvidenceId, FileChange, Finding, Gap, GapCause,
+    Interval, Outcome, PolicyDigest, Proposal, ProposedFile, ReceiptCoverage, Review, Revision,
+    RunId, SealedOutcome, SummarySnapshot, UntrustedText, count, format_utc,
 };
 
 use crate::{protocol::HostResult, runtime::diagnostics};

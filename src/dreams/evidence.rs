@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     dreams::{
-        CheckResult, Coverage, DreamsTaskSummary, EvidenceId, Gap, GapCause, Interval,
+        CheckResult, Coverage, DreamsTaskSummary, EvidenceId, Finding, Gap, GapCause, Interval,
         ReceiptCoverage, Review, SummarySnapshot, count, format_utc,
     },
     protocol::{ErrorCode, TASK_SUMMARY_MAX_UTF16_UNITS},
@@ -16,14 +16,6 @@ const SLOW_HOST_CALL_MS: u64 = 30_000;
 const MAX_TITLE_CHARS: usize = 200;
 const PAGE_BYTES: usize = 12_000;
 const QUOTED_LINE_CHARS: usize = 1_000;
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Finding {
-    pub kind: String,
-    pub count: u32,
-    pub detail: String,
-    pub evidence: Vec<EvidenceId>,
-}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

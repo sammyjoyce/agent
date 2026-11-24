@@ -6,8 +6,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ts_rs::TS;
 
-use super::evidence::Finding;
-
 /// Everything a Dreams actor can ask the coordinator to do.
 /// Invariant: no variant applies, executes a caller-chosen command, names a
 /// target, or carries policy. Adding one is a security change, not a feature.
@@ -474,6 +472,15 @@ impl CheckResult {
             None => "did not start".into(),
         }
     }
+}
+
+/// A pattern in the sealed evidence, with the receipts that show it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Finding {
+    pub kind: String,
+    pub count: u32,
+    pub detail: String,
+    pub evidence: Vec<EvidenceId>,
 }
 
 /// Sealed once per run. Window, base and evidence never change after this exists.
