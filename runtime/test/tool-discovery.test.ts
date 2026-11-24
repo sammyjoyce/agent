@@ -85,6 +85,16 @@ const startRole: Record<ToolRole, (app: DiscoveryApp, input: string) => Promise<
       } finally { release(); }
     } };
   },
+  async sidechat(app, input) {
+    const created = await app.sidechats.create({ title: "Discovery sidechat" });
+    return { responsesFromFirstRequest: [done], async run() {
+      const conversation = await app.tasks.conversation(created.conversation_id), release = app.bind(conversation, "sidechat");
+      try {
+        await app.inference.configure(conversation, fixtureModel, { extensions: app.toolsets.sidechat });
+        assert.equal((await (await conversation.submit({ type: "input", content: input }, BACKGROUND_CONTEXT)).wait(BACKGROUND_CONTEXT)).status, "done");
+      } finally { release(); }
+    } };
+  },
   async triage(app, input) {
     await app.sources.admit({ source: { provider: "mail", account: "example" }, checkpoint: null, coverage: { status: "complete" },
       events: [{ id: "example-event", version: "one", source: { provider: "mail", account: "example", thread_id: "example-thread" }, title: "Example", text: input }] }, null);

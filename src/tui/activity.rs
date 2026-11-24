@@ -24,7 +24,17 @@ pub struct ToolDetailRequest {
 }
 impl ToolDetailRequest {
     pub fn command(&self, task_id: Option<TaskId>, agent_id: Option<String>) -> RuntimeCommand {
+        self.command_in(task_id, agent_id, None)
+    }
+
+    pub fn command_in(
+        &self,
+        task_id: Option<TaskId>,
+        agent_id: Option<String>,
+        conversation_id: Option<String>,
+    ) -> RuntimeCommand {
         RuntimeCommand::ReadToolDetails {
+            conversation_id,
             task_id,
             agent_id,
             entry_id: self.entry_id.clone(),
@@ -624,7 +634,7 @@ mod tests {
         history(&mut view, vec![tool()]);
         let request = request(&mut view);
         assert!(
-            matches!(request.command(None, None), RuntimeCommand::ReadToolDetails { task_id: None, agent_id: None, entry_id, call_id } if entry_id == "42" && call_id == "call-example")
+            matches!(request.command(None, None), RuntimeCommand::ReadToolDetails { conversation_id: None, task_id: None, agent_id: None, entry_id, call_id } if entry_id == "42" && call_id == "call-example")
         );
         // Consume the actual shared event payload rather than a separate UI wire shape.
         let bytes = serde_json::to_vec(&RuntimeEventKind::ToolDetails {

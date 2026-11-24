@@ -20,6 +20,7 @@ import { createInputOrigins } from "../src/input_origin.js";
 import { createMainResponsePolicy } from "../src/main_response.js";
 import { ConversationModels } from "../src/models.js";
 import { createResourceTools, ResourceStore } from "../src/resources.js";
+import { createSidechatTools, SidechatStore } from "../src/sidechats.js";
 import { createSourceTools, SourceJournal } from "../src/sources.js";
 import { TaskStore } from "../src/tasks.js";
 import { applyToolSurfaces, createToolDiscovery, createToolsets, TOOL_SURFACES, withActorPolicies, type ToolRole, type ToolSurfaces } from "../src/toolsets.js";
@@ -42,7 +43,11 @@ const taskNames = ["search_tasks", "read_task", "revoke_allocation", "transfer_t
 const sourceDecisions = ["link_source_events", "dismiss_source_events", "notify"];
 const ADOPTED_SURFACES: Record<ToolRole, readonly string[]> = {
   main: ["exec", "read_attachment", "read_file", "write_file", "edit_file", "search_tasks", "read_task", "delegate_task", "record_task",
+    "list_sidechats", "create_sidechat", "update_sidechat", "post_to_sidechat",
     "list_jobs", "read_job", "run_job", "finish_without_reply", "tool_search", "browser_screenshot"],
+  sidechat: ["exec", "read_attachment", "read_file", "write_file", "edit_file", "search_tasks", "read_task", "delegate_task", "record_task",
+    "list_sidechats", "create_sidechat", "update_sidechat", "post_to_sidechat",
+    "list_jobs", "read_job", "run_job", "tool_search", "browser_screenshot"],
   triage: ["read_attachment", "read_file", "browser_screenshot", "record_task", "codemode"],
   worker: ["read_attachment", "read_file", "browser_screenshot", "record_task", "complete_goal", "codemode"],
   agent: ["read_attachment", "read_file", "browser_screenshot", "codemode"],
@@ -59,17 +64,18 @@ function offered(app: App, input: Context, role: ToolRole): void {
   if (role === "triage" || role === "worker") assert.ok(names.includes("record_task"), `${role} offers record_task directly`);
   assert.equal(names.includes("complete_goal"), role === "worker", `${role} offers complete_goal directly only as the worker`);
   const owned = [...new Set(app.toolsets[role].flatMap((extension) => extension.tools ?? []).map((tool) => tool.name))];
-  const expected = role === "main" || role === "triage"
+  const expected = role === "main" || role === "sidechat" || role === "triage"
     ? ["search_tasks", "read_task", "revoke_allocation", "transfer_task", "delegate_task", "record_task"]
     : role === "worker" ? ["record_task", "search_tasks", "read_task", "continue_agent", "spawn_agent", "read_agents", "wait_agents"]
     : ["search_tasks", "read_task", "read_agents", "report_result"];
   assert.deepEqual(owned.filter((name) => taskNames.includes(name)).sort(), expected.sort());
   assert.ok(["exec", "read_file", "browser_status", "read_source_events"].every((name) => owned.includes(name)));
-  assert.deepEqual(owned.filter((name) => sourceDecisions.includes(name)).sort(), role === "main" || role === "triage" ? [...sourceDecisions].sort() : []);
+  assert.deepEqual(owned.filter((name) => sourceDecisions.includes(name)).sort(), role === "main" || role === "sidechat" || role === "triage" ? [...sourceDecisions].sort() : []);
   assert.equal(owned.includes("read_resources"), role !== "triage");
-  assert.equal(owned.includes("collect_worktrees"), role === "main");
+  assert.equal(owned.includes("collect_worktrees"), role === "main" || role === "sidechat");
   assert.equal(owned.includes("allocate_worktree"), role === "worker" || role === "agent");
-  assert.equal(owned.includes("list_jobs"), role === "main" || role === "triage");
+  assert.equal(owned.includes("list_jobs"), role === "main" || role === "sidechat" || role === "triage");
+  assert.equal(owned.includes("list_sidechats"), role === "main" || role === "sidechat" || role === "triage");
   assert.equal(owned.includes("complete_goal"), role === "worker");
 }
 function callTools(input: Context, ...calls: [string, ToolArguments][]): AssistantMessage {
@@ -97,15 +103,17 @@ async function open(directory: string, guidanceText = "CURRENT_PROFILE_GUIDANCE"
     models, registry, identity: { attribution: null }, settings: { retry: { enabled: false }, compaction: { enabled: false } },
   }, BACKGROUND_CONTEXT);
   const inference = new ConversationModels(models), tasks = new TaskStore(session, inference), executions = new Executions();
-  const sources = new SourceJournal(session, tasks, executions), resources = new ResourceStore(session, tasks); tasks.guardResources(resources);
+  const sidechats = new SidechatStore(session); tasks.useSidechats(sidechats);
+  const sources = new SourceJournal(session, tasks, executions), resources = new ResourceStore(session, tasks); tasks.guardResources(resources); sources.useSidechats(sidechats);
   const tools = createAppTools(tasks, executions), sourceTools = createSourceTools(sources, executions);
+  const sidechatTools = createSidechatTools(sidechats, tasks, session, executions);
   const background = new BackgroundScheduler(session, registry, tasks, {
     async plan() { throw new Error("No timer is started by this fixture"); }, async refreshSources() {}, async triageSources() {}, async collectResources() {}, async indexHistory() {},
     async runJob() { throw new Error("No scheduled execution is requested by this fixture"); },
   });
   const discovery = createToolDiscovery();
   const goals = new GoalStore(session, tasks, new CoordinatorEnvironment(session));
-  const { toolsets, installed } = applyToolSurfaces(withActorPolicies(createToolsets({ guidance: createGuidance(executions), tools, sourceTools,
+  const { toolsets, installed } = applyToolSurfaces(withActorPolicies(createToolsets({ guidance: createGuidance(executions), tools, sidechatTools, sourceTools,
     resourceTools: createResourceTools(resources, tasks, executions), browserTools: createBrowserTools(new BrowserStore(session), executions, new AttachmentStore(new LocalFiles(directory))),
     jobTools: createJobTools(background, executions), goalTools: createGoalTools(goals, executions) }),
   { responsePolicy: createMainResponsePolicy(session), inputOrigins: createInputOrigins(session) }),

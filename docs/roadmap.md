@@ -249,9 +249,10 @@ branching conversations legible directly from the main chat.
     5. Carry bounded tool-argument context in the task graph if rows should show
        more than bare tool names such as `exec`.
   - **Decided.** Strip sits under the chat title; idle open tasks stay hidden;
-    tapping a row opens the read-only conversation inspection view (whether a
-    "needs you" row should later lead to an answer surface stays open and
-    read-only for now).
+    tapping a row opens the read-only conversation inspection view, except side
+    chat rows which open the interactive side chat itself (whether a "needs
+    you" row should later lead to an answer surface stays open and read-only
+    for now).
   - **Acceptance.** On a real iPhone against a coordinator with running and
     waiting work, strip counts match sheet rows and update live without refresh;
     the strip hides when idle or when connected to a coordinator without the
@@ -295,11 +296,12 @@ branching conversations legible directly from the main chat.
   the draft composer until sent or cancelled, attaches that message's identity
   to the submitted input, renders the quoted message with the reply in the
   transcript, and tells the model which earlier message is being answered.
-- [ ] **Sidechats** (inspired by Meta's Muse). Open a side conversation anchored
-  to a message to explore a follow-up without interrupting or expanding the main
-  chat. Return to the anchor message when done and bring an answer back into the
-  main conversation only on explicit choice (revisiting Pi Durable conversation
-  forks if needed; see [architecture](architecture.md#tasks-and-execution)).
+- [ ] **Sidechats** (standing topic conversations, inspired by Meta's Muse).
+  Implemented across the Rust protocol/CLI/TUI, TypeScript runtime and iOS app
+  (fresh ownerless conversations with slug, charter, optional retrieval
+  isolation, `delivery_sidechat` scheduled-job routing with auto-unarchive,
+  agent tools and per-topic APNs `inherit`/`on`/`off` overrides); pending
+  real-iPhone verification.
 - [x] **First-class transcript items for nested `codemode` calls.** Render
   nested `exec`, `write_file` and `edit_file` calls recorded in a `codemode`
   script's `details.calls` as standalone **Command** and **File changes** items

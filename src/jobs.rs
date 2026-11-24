@@ -179,6 +179,11 @@ pub struct ScheduledJob {
     pub schedules: Vec<JobSchedule>,
     pub revision: String,
     pub cwd: String,
+    /// Optional target side chat (by slug or conversation ID) where job
+    /// briefings and updates land instead of Main.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub delivery_sidechat: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
@@ -203,6 +208,7 @@ struct JobFile {
     timezone: TimezoneId,
     #[serde(default = "enabled")]
     enabled: bool,
+    delivery_sidechat: Option<String>,
     schedules: Vec<JobSchedule>,
 }
 
@@ -427,6 +433,21 @@ pub fn load(directories: &[PathBuf]) -> Result<Vec<ScheduledJob>> {
             fast: raw.fast,
         };
         model.validate()?;
+        let delivery_sidechat = match raw.delivery_sidechat {
+            Some(target) => {
+                let trimmed = target.trim().to_owned();
+                ensure!(
+                    !trimmed.is_empty()
+                        && trimmed.len() <= 128
+                        && !trimmed
+                            .chars()
+                            .any(|ch| ch.is_whitespace() || ch.is_control()),
+                    "delivery_sidechat must be a non-empty side chat slug or conversation ID without whitespace or control characters"
+                );
+                Some(trimmed)
+            }
+            None => None,
+        };
         let mut job = ScheduledJob {
             title: raw
                 .title
@@ -438,6 +459,7 @@ pub fn load(directories: &[PathBuf]) -> Result<Vec<ScheduledJob>> {
             schedules,
             revision: String::new(),
             cwd: working_directory(&file)?,
+            delivery_sidechat,
         };
         ensure!(
             !job.title.trim().is_empty(),
@@ -892,5 +914,29 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn delivery_sidechat_is_validated_trimmed_and_included_in_revision() {
+        let directory = tempdir().unwrap();
+        let rec = recurrence(
+            "20261102T090000",
+            "Europe/London",
+            "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;BYSECOND=0",
+        );
+        let base = definition(&rec, "Europe/London");
+        fs::write(directory.path().join("review.toml"), &base).unwrap();
+        let without = load(&[directory.path().to_owned()]).unwrap().remove(0);
+        assert_eq!(without.delivery_sidechat, None);
+
+        let with_target = format!("delivery_sidechat = \" morning-brief \"\n{base}");
+        fs::write(directory.path().join("review.toml"), &with_target).unwrap();
+        let with = load(&[directory.path().to_owned()]).unwrap().remove(0);
+        assert_eq!(with.delivery_sidechat.as_deref(), Some("morning-brief"));
+        assert_ne!(without.revision, with.revision);
+
+        let invalid = format!("delivery_sidechat = \"bad target\"\n{base}");
+        fs::write(directory.path().join("review.toml"), &invalid).unwrap();
+        assert!(load(&[directory.path().to_owned()]).is_err());
     }
 }

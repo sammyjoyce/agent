@@ -62,6 +62,22 @@ actor FixtureCoordinator {
     dreamsDetails = Dictionary(uniqueKeysWithValues: details.map { ($0.run, $0) })
   }
   func appliedDreams() -> [NativeRequestDreamsApply] { dreamsApplyRequests }
+  private var sidechatsAdvertised: Bool?
+  func advertiseSidechats(_ value: Bool?) { sidechatsAdvertised = value }
+  private var servedSidechats: [SidechatSummary] = []
+  func serveSidechats(_ items: [SidechatSummary]) { servedSidechats = items }
+  private var sidechatObservers: [String: NWConnection] = [:]
+  private var sidechatHistory: [String: NativeEventHistory] = [:]
+  func replyToSidechatHistory(_ cid: String, page: NativeEventHistory) {
+    sidechatHistory[cid] = page
+  }
+  private var receivedSidechatSubmits: [NativeRequestSidechatInput] = []
+  func sidechatSubmissions() -> [NativeRequestSidechatInput] { receivedSidechatSubmits }
+  private var receivedSidechatInterrupts: [String] = []
+  func sidechatInterrupts() -> [String] { receivedSidechatInterrupts }
+  func emitOnSidechatObserver(_ cid: String, event: NativeEvent) async throws {
+    try await emit(event, on: #require(sidechatObservers[cid]))
+  }
   private var servedJobs: [ScheduledJobStatus] = []
   private var servedConversations: [SavedConversation] = []
   private var pageSize = 10
@@ -94,6 +110,7 @@ actor FixtureCoordinator {
   private var notificationRequests: [NotificationRequest] = []
   /// Each installation this coordinator holds a registration for, with its device token.
   private var registrations: [String: String] = [:]
+  private var registrationMainEnabled: [String: Bool] = [:]
   private var notificationsHeld = false
   private var dropNotificationRemoval = false
   private var notificationRelease: CheckedContinuation<Void, Never>?
@@ -146,12 +163,23 @@ actor FixtureCoordinator {
   func holds(_ installation: String) -> Bool { registrations[installation.lowercased()] != nil }
   /// Registers `installation` as a client that never identifies does, such as the single-address
   /// build.
-  func register(_ installation: String, token: String) { enroll(installation, token: token) }
+  func register(_ installation: String, token: String, mainEnabled: Bool? = nil) {
+    enroll(installation, token: token, mainEnabled: mainEnabled)
+  }
   /// A token names one app on one device, so it moves to the installation that registered it
   /// last, as `runtime/src/notifications.ts` does.
-  private func enroll(_ installation: String, token: String) {
-    registrations = registrations.filter { $0.value != token.lowercased() }
-    registrations[installation.lowercased()] = token.lowercased()
+  private func enroll(_ installation: String, token: String, mainEnabled: Bool? = nil) {
+    let key = installation.lowercased()
+    let normalizedToken = token.lowercased()
+    if registrations[key] != normalizedToken {
+      registrations = registrations.filter { $0.value != normalizedToken }
+      registrations[key] = normalizedToken
+      registrationMainEnabled[key] = mainEnabled
+    } else if let mainEnabled {
+      registrationMainEnabled[key] = mainEnabled
+    } else if registrationMainEnabled[key] == false {
+      registrationMainEnabled[key] = nil
+    }
   }
   func dropNextNotificationRemoval() { dropNotificationRemoval = true }
   func holdNotificationRegistration() { notificationsHeld = true }
@@ -354,16 +382,21 @@ actor FixtureCoordinator {
         switch request.request {
         case .register(let value):
           if notificationsHeld { await withCheckedContinuation { notificationRelease = $0 } }
-          enroll(value.installationId, token: value.token)
+          enroll(value.installationId, token: value.token, mainEnabled: value.mainEnabled)
           installation = value.installationId
         case .unregister(let value):
           registrations[value.installationId.lowercased()] = nil
+          registrationMainEnabled[value.installationId.lowercased()] = nil
           installation = value.installationId
         case .status(let value): installation = value.installationId
         }
         try await emit(
           .notifications(
-            .init(status: .init(configured: true, registered: holds(installation)))), on: socket)
+            .init(
+              status: .init(
+                configured: true,
+                mainEnabled: registrationMainEnabled[installation.lowercased()],
+                registered: holds(installation)))), on: socket)
         try await emit(.done, on: socket)
       case .toolDetails(let request):
         toolRequests.append(request)
@@ -410,6 +443,7 @@ actor FixtureCoordinator {
               acceptedInputOrigins: acceptedInputOrigins,
               conversationId: "fixture-root", conversationSettings: conversationSettings,
               dreams: dreamsSupported, inputOrigins: inputOrigins, model: "fixture/model",
+              sidechats: sidechatsAdvertised,
               workInspection: workInspection)),
           on: socket)
         if delaySnapshot { await withCheckedContinuation { release = $0 } }
@@ -512,6 +546,113 @@ actor FixtureCoordinator {
         try await emit(
           .dreamsApplied(.init(alreadyApplied: alreadyApplied, commit: commit, run: request.run)),
           on: socket)
+        try await emit(.done, on: socket)
+        return
+      case .listSidechats(let request):
+        let items =
+          request.includeArchived
+          ? servedSidechats : servedSidechats.filter { $0.archivedAt == nil }
+        try await emit(.sidechats(.init(items: items)), on: socket)
+        try await emit(.done, on: socket)
+        return
+      case .createSidechat(let request):
+        let slug =
+          request.slug
+          ?? request.title.lowercased().replacingOccurrences(of: " ", with: "-")
+        let now = Int(Date().timeIntervalSince1970 * 1000)
+        let created = SidechatSummary(
+          archivedAt: nil,
+          charter: request.charter,
+          conversationId: "sc-\(servedSidechats.count + 2)",
+          createdAt: now,
+          isolated: request.isolated ?? false,
+          notifications: request.notifications ?? .inherit,
+          pinned: false,
+          seed: request.seed,
+          slug: slug,
+          title: request.title,
+          updatedAt: now)
+        servedSidechats.append(created)
+        try await emit(.sidechat(.init(sidechat: created)), on: socket)
+        try await emit(.done, on: socket)
+        return
+      case .updateSidechat(let request):
+        guard
+          let index = servedSidechats.firstIndex(where: {
+            $0.conversationId == request.conversationId
+          })
+        else {
+          try await emit(.failure(.init(message: "Side chat not found")), on: socket)
+          try await emit(.done, on: socket)
+          return
+        }
+        var updated = servedSidechats[index]
+        if let title = request.title { updated.title = title }
+        if let slug = request.slug { updated.slug = slug }
+        if let pinned = request.pinned { updated.pinned = pinned }
+        if let archived = request.archived {
+          updated.archivedAt = archived ? Int(Date().timeIntervalSince1970 * 1000) : nil
+        }
+        if request.clearCharter == true {
+          updated.charter = nil
+        } else if let charter = request.charter {
+          updated.charter = charter
+        }
+        if let isolated = request.isolated { updated.isolated = isolated }
+        if let alerts = request.notifications { updated.notifications = alerts }
+        updated.updatedAt = Int(Date().timeIntervalSince1970 * 1000)
+        servedSidechats[index] = updated
+        try await emit(.sidechat(.init(sidechat: updated)), on: socket)
+        try await emit(.done, on: socket)
+        return
+      case .observeSidechat(let request):
+        sidechatObservers[request.conversationId] = socket
+        let summary = servedSidechats.first { $0.conversationId == request.conversationId }
+        try await emit(
+          .ready(
+            .init(
+              acceptedInputOrigins: acceptedInputOrigins,
+              conversationId: request.conversationId, conversationSettings: conversationSettings,
+              inputOrigins: inputOrigins, model: "fixture/model", sidechat: summary,
+              sidechats: true, working: false)),
+          on: socket)
+        try await emit(
+          .history(
+            sidechatHistory[request.conversationId]
+              ?? .init(messages: [], nextCursor: nil, pageComplete: true)),
+          on: socket)
+        try await emit(.idle, on: socket)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+          socket.receive(minimumIncompleteLength: 1, maximumLength: 1) { _, _, _, _ in
+            continuation.resume()
+          }
+        }
+        if sidechatObservers[request.conversationId] === socket {
+          sidechatObservers[request.conversationId] = nil
+        }
+        inspectionsClosed.continuation.yield(request.conversationId)
+        return
+      case .sidechatInput(let request):
+        receivedSidechatSubmits.append(request)
+        try await emit(.accepted(.init(inputId: request.inputId)), on: socket)
+        if placesEachSubmit {
+          try await emit(
+            .placed(.init(entryId: "sc-placed-\(request.inputId)", inputId: request.inputId)),
+            on: socket)
+          try? await emit(.done, on: socket)
+          if let answer, let sidechatObserver = sidechatObservers[request.conversationId] {
+            try await emit(.textDelta(.init(text: answer)), on: sidechatObserver)
+            try await emit(
+              .answer(.init(entryId: "sc-answer-\(request.inputId)", text: answer)),
+              on: sidechatObserver)
+            try await emit(.idle, on: sidechatObserver)
+          }
+          return
+        }
+        try await emit(.done, on: socket)
+        return
+      case .sidechatInterrupt(let request):
+        receivedSidechatInterrupts.append(request.conversationId)
         try await emit(.done, on: socket)
         return
       case .inspect(let request):

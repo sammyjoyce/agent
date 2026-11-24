@@ -19,6 +19,7 @@ import { createInputOrigins } from "../../src/input_origin.js";
 import { createMainResponsePolicy } from "../../src/main_response.js";
 import { ConversationModels } from "../../src/models.js";
 import { createResourceTools, ResourceStore } from "../../src/resources.js";
+import { createSidechatTools, SidechatStore } from "../../src/sidechats.js";
 import { openJobActor, runScheduled } from "../../src/scheduled.js";
 import { createSourceTools, SourceJournal } from "../../src/sources.js";
 import { TaskStore } from "../../src/tasks.js";
@@ -31,6 +32,7 @@ export type DiscoveryArm = ToolSurfaces;
 
 const RARE_TOOLS: Record<ToolRole, readonly string[]> = {
   main: [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "read_resources", "collect_worktrees", "revoke_allocation"],
+  sidechat: [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "read_resources", "collect_worktrees", "revoke_allocation"],
   triage: [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "revoke_allocation"],
   worker: [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "allocate_worktree", "read_resources"],
   agent: [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "allocate_worktree", "read_resources"],
@@ -38,6 +40,7 @@ const RARE_TOOLS: Record<ToolRole, readonly string[]> = {
 
 const LEAN_TOOLS: Record<ToolRole, readonly string[]> = {
   main: ["record_task"],
+  sidechat: ["record_task"],
   triage: ["exec", "edit_file", "write_file", "read_job", "run_job"],
   worker: [],
   agent: [],
@@ -91,20 +94,22 @@ export async function openDiscoveryApp(directory: string, { models, model, arm, 
   environment.setConnected([host.node.host_id]);
   const worker = await environment.defaultHost(await environment.hosts(host.node.home_directory, null, []));
   if (worker === null) throw new Error("The invented host must be the default worker host");
-  const sources = new SourceJournal(session, tasks, executions), resources = new ResourceStore(session, tasks); tasks.guardResources(resources);
+  const sidechats = new SidechatStore(session); tasks.useSidechats(sidechats);
+  const sources = new SourceJournal(session, tasks, executions), resources = new ResourceStore(session, tasks); tasks.guardResources(resources); sources.useSidechats(sidechats);
   const tools = createAppTools(tasks, executions), sourceTools = createSourceTools(sources, executions);
-  const bind = (conversation: Conversation, role?: "worker" | "triage") => executions.bind(conversation.id.toString(), {
+  const sidechatTools = createSidechatTools(sidechats, tasks, session, executions);
+  const bind = (conversation: Conversation, role?: "worker" | "triage" | "sidechat") => executions.bind(conversation.id.toString(), {
     model, cwd: worker.cwd, hosts: [worker], default_host: worker, ...(role === undefined ? {} : { role }), call: host.call, notify: () => {},
   });
   const scheduler = new BackgroundScheduler(session, registry, tasks, {
     plan: async () => ({ due: null, next: Date.now() + 86_400_000 }),
     async refreshSources() {}, async triageSources() {}, async collectResources() {}, async indexHistory() {},
-    jobActor: (job) => openJobActor(job, tasks), runJob: (occurrence, signal, id) => runScheduled(occurrence, signal, { session, tasks, sources }, id),
+    jobActor: (job) => openJobActor(job, tasks), runJob: (occurrence, signal, id) => runScheduled(occurrence, signal, { session, tasks, sources, sidechats }, id),
   });
   const jobTools = createJobTools(scheduler, executions);
   const attachments = new AttachmentStore(new LocalFiles(directory));
   const goals = new GoalStore(session, tasks, environment);
-  const production = withActorPolicies(createToolsets({ guidance: createGuidance(executions), tools, sourceTools,
+  const production = withActorPolicies(createToolsets({ guidance: createGuidance(executions), tools, sidechatTools, sourceTools,
     resourceTools: createResourceTools(resources, tasks, executions), browserTools: createBrowserTools(new BrowserStore(session), executions, attachments), jobTools,
     goalTools: createGoalTools(goals, executions),
   }), { responsePolicy: createMainResponsePolicy(session), inputOrigins: createInputOrigins(session) });
@@ -121,6 +126,6 @@ export async function openDiscoveryApp(directory: string, { models, model, arm, 
     const detached = tasks.detachActors();
     await session.close(BACKGROUND_CONTEXT); await detached; await discovery.close();
   }
-  return { session, registry, inference, tasks, environment, sources, resources, scheduler, executions, attachments, tools, toolsets, worker, bind, close };
+  return { session, registry, inference, tasks, sidechats, environment, sources, resources, scheduler, executions, attachments, tools, toolsets, worker, bind, close };
 }
 export type DiscoveryApp = Awaited<ReturnType<typeof openDiscoveryApp>>;

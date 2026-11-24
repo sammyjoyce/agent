@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { defineDoc, defineExtension, defineTool, ROOT_CONVERSATION_ID, type Extension, type Harness, type Tx } from "@earendil-works/pi-durable";
+import { defineDoc, defineExtension, defineTool, type Extension, type Harness, type Tx } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
 import type { CleanupPlan } from "./generated/CleanupPlan.js";
 import type { CleanupReceipt } from "./generated/CleanupReceipt.js";
@@ -154,9 +154,10 @@ export function createResourceTools(resources: ResourceStore, tasks: TaskStore, 
     } });
   const read = defineTool({ name: "read_resources", description: "Read the owned worktree inventory and cleanup state.", replay: "safe", parameters: Type.Object({}),
     async execute(_args, api) {
-      executions.get(api.conversationId.toString());
+      const callerId = api.conversationId.toString();
+      executions.get(callerId);
       const all = await resources.list();
-      const owner = api.conversationId === ROOT_CONVERSATION_ID ? undefined : await tasks.owner(api.conversationId.toString());
+      const owner = executions.isCoordinator(callerId) ? undefined : await tasks.owner(callerId);
       const visible = owner === undefined ? all : all.filter((resource) => resource.task_id === owner.task.id);
       return { output: [{ type: "text", text: JSON.stringify(visible) }] };
     } });

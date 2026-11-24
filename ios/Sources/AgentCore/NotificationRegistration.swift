@@ -29,6 +29,7 @@ public final class NotificationRegistration {
   private struct Enrollment {
     let id: UUID
     let token: String
+    let mainEnabled: Bool?
     let operation: Task<Void, any Error>
   }
   /// Present while that profile's session is connected. Replacing it invalidates its work.
@@ -38,6 +39,12 @@ public final class NotificationRegistration {
     var enrollment: Enrollment?
   }
   @ObservationIgnored private var links: [ProfileID: Link] = [:]
+  /// Profiles where at least one side chat explicitly opts in (`notifications == .on`).
+  /// While true, the device stays registered with `main_enabled: false` even when Main alerts are off.
+  private var sidechatOverrides: [ProfileID: Bool] = [:]
+  /// Profiles whose server registration last reported `main_enabled == false`, so re-enabling Main
+  /// sends an explicit `main_enabled: true` even after the last side chat override turns off.
+  @ObservationIgnored private var serverMainMuted: Set<ProfileID> = []
   /// Profiles whose installation Remove withdrew. Profile IDs are never reused, so none of
   /// these connects or enrolls again.
   @ObservationIgnored private var forgotten: Set<ProfileID> = []
@@ -64,9 +71,66 @@ public final class NotificationRegistration {
 
   public func status(_ profile: ProfileID) -> ChannelStatus { channels[profile] ?? ChannelStatus() }
 
+  public func hasSidechatOverrides(_ profile: ProfileID) -> Bool {
+    sidechatOverrides[profile] == true
+  }
+
+  private var anySidechatOverrides: Bool { sidechatOverrides.values.contains(true) }
+
+  private func wantsRegistration(_ profile: ProfileID) -> Bool {
+    enabled || sidechatOverrides[profile] == true
+  }
+
+  /// Omits `main_enabled` when no side chat override is active and the server never reported Main
+  /// muted, so wire requests stay compatible with coordinators built before side chats.
+  private func registrationMainEnabled(_ profile: ProfileID) -> Bool? {
+    (sidechatOverrides[profile] == true || serverMainMuted.contains(profile)) ? enabled : nil
+  }
+
   public func start() async {
     guard enabled, authorization == .unchecked else { return }
     await setEnabled(true)
+  }
+
+  /// Updates whether `profile` has any side chat explicitly set to push alerts `.on`.
+  /// When Main alerts are off, keeping at least one side chat `.on` enrolls the device with
+  /// `main_enabled: false`; clearing the last `.on` override unregisters the device.
+  public func setSidechatAlertsOn(_ hasOn: Bool, for profile: ProfileID) async {
+    guard !forgotten.contains(profile), sidechatOverrides[profile] != hasOn else { return }
+    sidechatOverrides[profile] = hasOn
+    if hasOn {
+      do {
+        if authorization == .unchecked {
+          let allowed = try await permission()
+          authorization = allowed ? .allowed : .denied
+          guard allowed else {
+            sidechatOverrides[profile] = false
+            error = RegistrationError.permission.localizedDescription
+            return
+          }
+        }
+        guard authorization == .allowed else {
+          sidechatOverrides[profile] = false
+          return
+        }
+        guard sidechatOverrides[profile] == true else { return }
+        registerWithApple()
+        if let link = links[profile], status(profile).configured, let token {
+          try await enroll(token, on: profile, link: link)
+          if current(profile, link) { channels[profile]?.error = nil }
+        }
+      } catch {
+        if links[profile] != nil { channels[profile]?.error = error.localizedDescription }
+      }
+    } else if !enabled {
+      links[profile]?.enrollment = nil
+      do {
+        try await unregister(profile)
+        channels[profile]?.error = nil
+      } catch {
+        channels[profile]?.error = removalError(error)
+      }
+    }
   }
 
   /// Keeps the last known `registered`, so a later opt-out can report an unconfirmed removal.
@@ -87,12 +151,32 @@ public final class NotificationRegistration {
       guard current(profile, link) else { return }
       channels[profile] = ChannelStatus(
         configured: status.configured, registered: status.registered)
+      if status.registered, status.mainEnabled == false {
+        serverMainMuted.insert(profile)
+        if !enabled { sidechatOverrides[profile] = true }
+      } else {
+        serverMainMuted.remove(profile)
+      }
       if enabled {
         await start()
         guard current(profile, link) else { return }
         if enabled, authorization == .allowed, status.configured {
           registerWithApple()
+          if let token, links[profile]?.enrollment == nil {
+            try await enroll(token, on: profile, link: link)
+          }
+        }
+      } else if hasSidechatOverrides(profile) {
+        if authorization == .unchecked {
+          let allowed = try await permission()
+          authorization = allowed ? .allowed : .denied
+        }
+        guard current(profile, link) else { return }
+        if authorization == .allowed, status.configured {
+          registerWithApple()
           if let token { try await enroll(token, on: profile, link: link) }
+        } else if authorization == .denied, status.registered {
+          try await unregister(profile)
         }
       } else if status.registered {
         // A lost withdrawal receipt must not silently re-enable alerts after
@@ -103,7 +187,7 @@ public final class NotificationRegistration {
       guard current(profile, link) else { return }
       let registered = status(profile).registered
       channels[profile]?.error =
-        enabled || !registered ? error.localizedDescription : removalError(error)
+        wantsRegistration(profile) || !registered ? error.localizedDescription : removalError(error)
     }
   }
 
@@ -119,7 +203,7 @@ public final class NotificationRegistration {
         let allowed = try await permission()
         authorization = allowed ? .allowed : .denied
         guard allowed else {
-          await withdraw()
+          await withdraw(permissionDenied: true)
           throw RegistrationError.permission
         }
         enabled = true
@@ -127,7 +211,7 @@ public final class NotificationRegistration {
         registerWithApple()
         if let token { await enrollLinked(token) }
       } else {
-        await withdraw()
+        await withdraw(permissionDenied: false)
       }
       error = nil
     } catch {
@@ -139,6 +223,8 @@ public final class NotificationRegistration {
   /// once its coordinator confirmed it holds no registration for it.
   @discardableResult public func forget(_ profile: ProfileID) async -> Bool {
     forgotten.insert(profile)
+    sidechatOverrides[profile] = nil
+    serverMainMuted.remove(profile)
     // Without a configured status, a token arriving during the withdrawal skips this profile.
     channels[profile] = nil
     defer {
@@ -154,14 +240,14 @@ public final class NotificationRegistration {
   public func received(token: String) async {
     self.token = token
     apple = .ready
-    guard enabled, authorization == .allowed else { return }
+    guard enabled || anySidechatOverrides, authorization == .allowed else { return }
     await enrollLinked(token)
   }
 
   public func failed() {
     apple = .failed
     // A late OS callback cannot confirm an earlier coordinator withdrawal.
-    guard enabled else { return }
+    guard enabled || anySidechatOverrides else { return }
     error =
       "This device could not register with Apple. Check the app's Push Notifications signing capability and network connection."
   }
@@ -177,7 +263,7 @@ public final class NotificationRegistration {
   }
 
   private func enrollLinked(_ token: String) async {
-    for (profile, link) in links where status(profile).configured {
+    for (profile, link) in links where status(profile).configured && wantsRegistration(profile) {
       do {
         try await enroll(token, on: profile, link: link)
         if current(profile, link) { channels[profile]?.error = nil }
@@ -187,12 +273,25 @@ public final class NotificationRegistration {
     }
   }
 
-  private func withdraw() async {
+  private func withdraw(permissionDenied: Bool) async {
     // Persist intent before a receipt: late token callbacks cannot re-enroll.
     enabled = false
     save(false)
     for profile in Array(channels.keys) {
       links[profile]?.enrollment = nil
+      if !permissionDenied, hasSidechatOverrides(profile) {
+        if let link = links[profile], status(profile).configured, authorization == .allowed,
+          let token
+        {
+          do {
+            try await enroll(token, on: profile, link: link)
+            if current(profile, link) { channels[profile]?.error = nil }
+          } catch {
+            if current(profile, link) { channels[profile]?.error = error.localizedDescription }
+          }
+        }
+        continue
+      }
       do {
         try await unregister(profile)
         channels[profile]?.error = nil
@@ -211,26 +310,36 @@ public final class NotificationRegistration {
       .value
     guard current(profile, link) else { return }
     channels[profile]?.registered = status.registered
+    if !status.registered { serverMainMuted.remove(profile) }
   }
 
   private func enroll(_ token: String, on profile: ProfileID, link: Link) async throws {
+    let mainEnabled = registrationMainEnabled(profile)
     let pending: Enrollment
     if let current = links[profile]?.enrollment, self.current(profile, link),
-      current.token == token
+      current.token == token,
+      current.mainEnabled == mainEnabled
+        || (enabled && current.mainEnabled == true && mainEnabled == nil)
     {
       pending = current
     } else {
       let id = UUID()
       let response = try request(
-        .register(.init(installationId: "\(profile)", token: token)), on: profile)
+        .register(.init(installationId: "\(profile)", mainEnabled: mainEnabled, token: token)),
+        on: profile)
       let operation = Task { [weak self] in
         let status = try await response.value
         guard let self, self.current(profile, link), self.links[profile]?.enrollment?.id == id
         else { return }
         self.channels[profile]?.registered = status.registered
+        if status.registered, status.mainEnabled == false {
+          self.serverMainMuted.insert(profile)
+        } else {
+          self.serverMainMuted.remove(profile)
+        }
         if !status.registered { throw RegistrationError.coordinatorSetup }
       }
-      pending = Enrollment(id: id, token: token, operation: operation)
+      pending = Enrollment(id: id, token: token, mainEnabled: mainEnabled, operation: operation)
       links[profile]?.enrollment = pending
     }
     do {

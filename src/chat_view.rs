@@ -3,7 +3,7 @@
 use crate::{ClientContext, UiSession, connection, exchange, write_command};
 use agent_cli::{
     config::ClientConfig,
-    protocol::{ErrorCode, RuntimeCommand, RuntimeEventKind, SavedConversation},
+    protocol::{ErrorCode, RuntimeCommand, RuntimeEventKind, SavedConversation, SidechatSummary},
     rex::RexClient,
     runtime::{FrameReader, decode_coordinator_event},
     tui::{HistoryReplay, ObservationState, TuiInfo},
@@ -218,15 +218,20 @@ pub(crate) fn exact<'a>(
         })
 }
 
+async fn save_draft(ui: &mut UiSession) -> Result<()> {
+    if let Some(current) = &ui.conversation_id {
+        ui.drafts
+            .insert(current.clone(), ui.handle.composer_draft().await?);
+    }
+    Ok(())
+}
+
 pub(crate) async fn resume(
     client: ClientContext<'_>,
     ui: &mut UiSession,
     query: String,
 ) -> Result<bool> {
-    if let Some(current) = &ui.conversation_id {
-        ui.drafts
-            .insert(current.clone(), ui.handle.composer_draft().await?);
-    }
+    save_draft(ui).await?;
     let items = choices(client, query.clone()).await?;
     let selected = if !query.is_empty() {
         exact(&items, &query).map(|item| item.conversation_id.clone())
@@ -246,6 +251,101 @@ pub(crate) async fn resume(
         .context("The selected conversation is unavailable")?;
     open(client, ui, item).await?;
     Ok(true)
+}
+
+pub(crate) fn sidechat_to_saved(summary: &SidechatSummary) -> SavedConversation {
+    SavedConversation {
+        conversation_id: summary.conversation_id.clone(),
+        title: format!("{} ({})", summary.title, summary.slug),
+        updated_at: Some(summary.updated_at),
+        source_thread_id: None,
+        task_id: None,
+        agent_id: None,
+        host: None,
+    }
+}
+
+pub(crate) async fn list_sidechats(
+    client: ClientContext<'_>,
+    include_archived: bool,
+) -> Result<Vec<SidechatSummary>> {
+    exchange(client, RuntimeCommand::ListSidechats { include_archived })
+        .await?
+        .into_iter()
+        .find_map(|event| match event {
+            RuntimeEventKind::Sidechats { items } => Some(items),
+            _ => None,
+        })
+        .context("The coordinator returned no side chat list")
+}
+
+pub(crate) async fn resolve_sidechat(
+    client: ClientContext<'_>,
+    slug_or_id: &str,
+) -> Result<SidechatSummary> {
+    let wanted = slug_or_id.trim();
+    anyhow::ensure!(
+        !wanted.is_empty(),
+        "Choose a side chat slug or conversation ID"
+    );
+    let items = list_sidechats(client, true).await?;
+    items
+        .iter()
+        .find(|item| item.conversation_id == wanted)
+        .or_else(|| {
+            items
+                .iter()
+                .find(|item| item.slug.eq_ignore_ascii_case(wanted))
+        })
+        .cloned()
+        .with_context(|| format!("Unknown side chat: {wanted}"))
+}
+
+pub(crate) async fn open_sidechat(
+    client: ClientContext<'_>,
+    ui: &mut UiSession,
+    target: Option<String>,
+) -> Result<bool> {
+    save_draft(ui).await?;
+    let chosen = if let Some(target) = target {
+        resolve_sidechat(client, &target).await?
+    } else {
+        let items = list_sidechats(client, false).await?;
+        if items.is_empty() {
+            ui.handle.notice(
+                "No standing side chats yet. Create one with `beep-boop sidechats create`.".into(),
+            )?;
+            return Ok(false);
+        }
+        let choices: Vec<SavedConversation> = items.iter().map(sidechat_to_saved).collect();
+        let Some(selected_id) = ui.handle.choose_sidechat(choices, String::new()).await? else {
+            return Ok(false);
+        };
+        items
+            .into_iter()
+            .find(|item| item.conversation_id == selected_id)
+            .context("The selected side chat is unavailable")?
+    };
+    open(client, ui, sidechat_to_saved(&chosen)).await?;
+    Ok(true)
+}
+
+pub(crate) async fn open_main(client: ClientContext<'_>, ui: &mut UiSession) -> Result<()> {
+    save_draft(ui).await?;
+    open(
+        client,
+        ui,
+        SavedConversation {
+            conversation_id: "1".into(),
+            title: "Main agent".into(),
+            updated_at: None,
+            source_thread_id: None,
+            task_id: None,
+            agent_id: None,
+            host: None,
+        },
+    )
+    .await
 }
 
 pub(crate) async fn open(

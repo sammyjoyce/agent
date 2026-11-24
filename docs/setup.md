@@ -148,6 +148,31 @@ press Enter to choose, or Esc to keep the current chat and draft. Browsing
 history does not start work. A new message reuses the selected conversation's
 worker, reopening its Rex session in the background when needed.
 
+Standing **side chats** separate ongoing topics from the main conversation while
+keeping shared knowledge available to Main and tasks (unless marked isolated).
+Marking a side chat **isolated** excludes it and its delegated tasks from
+cross-conversation search and the conversation catalog, but is a search
+boundary only: another chat can still list its title, charter and seed via
+`list_sidechats`, read its transcript directly by ID with `read_task`, or switch
+isolation off via `update_sidechat`. Routine updates from a side chat's delegated
+tasks land back in that side chat, while blocking questions waiting on you
+(`waiting` with `target: "owner"`) automatically surface in the main
+conversation:
+
+```sh
+beep-boop sidechats list
+beep-boop sidechats create "Release Prep" --charter "Track release blockers." --notifications on
+beep-boop sidechats update release-prep --pin --notifications inherit
+beep-boop chat --sidechat release-prep
+```
+
+Inside `beep-boop chat`, use `/sidechat` to list active topics,
+`/sidechat <slug-or-id>` to switch into one, and `/main` to return to the main
+conversation. On iOS, tap the **Side chats** toolbar button (or **Connection →
+Side chats**) to browse, create, pin, archive or configure per-topic charter,
+isolation, model and push-notification settings, or long-press a message in Main
+and choose **Start side chat from this**.
+
 Use `/model`, `/reasoning` or `/fast` to change the current conversation, and
 `/status` to inspect its effective settings, connection and available plan usage.
 `/model` without an argument lists models; `/fast` alone toggles fast mode.
@@ -399,11 +424,16 @@ from the native daemon identity used by agent.
 
 Keep jobs in Git and configure `job_directories = ["~/automation/scheduled_jobs"]`
 on the coordinator. A job file contains a readable stable `id`, `prompt`,
-`model`, `reasoning_effort`, IANA `timezone`, and one or more `[[schedules]]`,
+`model`, `reasoning_effort`, IANA `timezone`, optional `delivery_sidechat`
+(a side chat slug or conversation ID), and one or more `[[schedules]]`,
 each with its own stable `id` and anchored DTSTART/RRULE `recurrence`. See the
 [example job](../examples/scheduled_jobs/daily-review.toml). IDs are unique
 across jobs and within each job's schedules; renames retain their IDs. Optional
-schedule `focus` and `prompt` narrow a pass while retaining the main rules.
+schedule `focus` and `prompt` narrow a pass while retaining the main rules. When
+`delivery_sidechat` is set, completed job output and `notify_user` notices land
+in that side chat (automatically unarchiving it if archived); if the target side
+chat no longer exists, delivery falls back to the main conversation with a
+warning.
 
 Run check and sync in the coordinator's checkout after editing or pulling the
 files. Sync rejects remote clients so their local paths cannot select a

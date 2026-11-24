@@ -5,6 +5,7 @@ use crate::protocol::{
 
 pub(crate) fn label(text: &str) -> String {
     text.chars()
+        .filter(|character| !crate::sidechats::is_unsafe_terminal_format(*character))
         .map(|character| {
             if character.is_control() {
                 ' '
@@ -110,13 +111,21 @@ fn actor(
     indent: usize,
     lines: &mut Vec<String>,
 ) {
-    let heading = match &conversation.actor {
-        TaskGraphActor::Main => "Main agent".into(),
-        TaskGraphActor::Task { task_id, title } => format!("Task {task_id}  {}", label(title)),
-        TaskGraphActor::Agent {
-            agent_id, title, ..
-        } => format!("Agent {}  {}", label(agent_id), label(title)),
-        TaskGraphActor::Other => format!("Conversation {}", conversation.conversation_id),
+    let heading = if let Some(sidechat) = &conversation.sidechat {
+        format!(
+            "Sidechat {}  {}",
+            label(&sidechat.slug),
+            label(&sidechat.title)
+        )
+    } else {
+        match &conversation.actor {
+            TaskGraphActor::Main => "Main agent".into(),
+            TaskGraphActor::Task { task_id, title } => format!("Task {task_id}  {}", label(title)),
+            TaskGraphActor::Agent {
+                agent_id, title, ..
+            } => format!("Agent {}  {}", label(agent_id), label(title)),
+            TaskGraphActor::Other => format!("Conversation {}", conversation.conversation_id),
+        }
     };
     lines.push(format!("{}{heading}", "  ".repeat(indent)));
     work(
@@ -251,5 +260,37 @@ Task 6f1d2c3e-8a4b-4c5d-9e6f-7a8b9c0d1e2f  Board review
             {"id":1,"kind":{"type":"generation"},"conversation_id":"1","owner":null,"background":false,"abort_requested":false,
              "state":{"status":"paused","phase":"request"},"blocked":null,"conversations":[]}]}}"#;
         assert!(serde_json::from_str::<RuntimeEventKind>(unknown).is_err());
+    }
+
+    #[test]
+    fn sidechat_conversations_format_with_slug_and_title_and_keep_actor_wire_compatible() {
+        let payload = r#"{"type":"task_graph","graph":{"omitted":0,"nodes":[
+            {"id":4,"kind":{"type":"generation"},"conversation_id":"12","owner":null,"background":false,"abort_requested":false,
+             "state":{"status":"running","phase":"stream"},"blocked":null,"conversations":[]}
+            ],"conversations":[
+            {"conversation_id":"12","actor":{"type":"other"},"sidechat":{"slug":"morning-brief","title":"Morning Brief"}}
+            ]}}"#;
+        let graph = graph(payload);
+        assert_eq!(
+            super::format(&graph),
+            "Sidechat morning-brief  Morning Brief\n  #4 generation  running"
+        );
+        // Verify the actor stays `other` so older decoders without `sidechat` decode cleanly.
+        assert!(matches!(
+            graph.conversations[0].actor,
+            crate::protocol::TaskGraphActor::Other
+        ));
+    }
+
+    #[test]
+    fn label_strips_bidi_and_invisible_format_chars_while_preserving_joined_emoji() {
+        assert_eq!(
+            super::label("Evil\u{202e}gnp.exe \u{200b}zero\nline"),
+            "Evilgnp.exe zero line"
+        );
+        assert_eq!(
+            super::label("Kitchen \u{1f9d1}\u{200d}\u{1f373}"),
+            "Kitchen \u{1f9d1}\u{200d}\u{1f373}"
+        );
     }
 }

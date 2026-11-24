@@ -20,12 +20,14 @@ extension View {
 
   func messageTextActions(
     _ text: String,
-    onReply: (() -> Void)? = nil
+    onReply: (() -> Void)? = nil,
+    onStartSidechat: (() -> Void)? = nil
   ) -> some View {
     modifier(
       MessageTextActions(
         text: text,
-        onReply: onReply))
+        onReply: onReply,
+        onStartSidechat: onStartSidechat))
   }
 }
 
@@ -37,6 +39,7 @@ private struct MessageTextActions: ViewModifier {
 
   let text: String
   let onReply: (() -> Void)?
+  let onStartSidechat: (() -> Void)?
   @State private var selection: Selection?
 
   func body(content: Content) -> some View {
@@ -61,6 +64,11 @@ private struct MessageTextActions: ViewModifier {
           selection = Selection(text: text)
         }.disabled(text.isEmpty)
         ShareLink(item: text) { Label("Share text", systemImage: "square.and.arrow.up") }
+        if let onStartSidechat {
+          Button("Start side chat from this", systemImage: "bubble.left.and.bubble.right") {
+            onStartSidechat()
+          }
+        }
       }
       .sheet(item: $selection) { snapshot in
         NavigationStack {

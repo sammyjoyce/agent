@@ -18,6 +18,7 @@ const SAFE_UNDER_OVERLAP: Readonly<Record<string, string>> = {
   read_resources: READS_OWN_STORE,
   read_source_events: READS_OWN_STORE,
   list_jobs: READS_OWN_STORE,
+  list_sidechats: READS_OWN_STORE,
   read_job: READS_OWN_STORE,
   read_task: READS_OWN_STORE,
   read_agents: READS_OWN_STORE,

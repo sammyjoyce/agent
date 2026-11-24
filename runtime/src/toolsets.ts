@@ -9,12 +9,12 @@ import type { createResourceTools } from "./resources.js";
 import type { createSourceTools } from "./sources.js";
 import type { createAppTools, createJobTools } from "./tools.js";
 
-export type ToolRole = "main" | "triage" | "worker" | "agent";
+export type ToolRole = "main" | "sidechat" | "triage" | "worker" | "agent";
 export type Toolsets = Record<ToolRole, readonly Extension[]>;
-export const TOOL_ROLES: readonly ToolRole[] = ["main", "triage", "worker", "agent"];
+export const TOOL_ROLES: readonly ToolRole[] = ["main", "sidechat", "triage", "worker", "agent"];
 
 /** Compose existing tools by actor ownership; execution guards remain on the tools. */
-export function createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools, goalTools }: {
+export function createToolsets({ guidance, tools, sourceTools, resourceTools, browserTools, jobTools, goalTools, sidechatTools }: {
   guidance: ReturnType<typeof createGuidance>;
   tools: ReturnType<typeof createAppTools>;
   sourceTools: ReturnType<typeof createSourceTools>;
@@ -22,10 +22,13 @@ export function createToolsets({ guidance, tools, sourceTools, resourceTools, br
   browserTools: ReturnType<typeof createBrowserTools>;
   jobTools: ReturnType<typeof createJobTools>;
   goalTools: ReturnType<typeof createGoalTools>;
+  sidechatTools?: Extension;
 }): Toolsets {
+  const sidechats = sidechatTools === undefined ? [] : [sidechatTools];
   return {
-    main: [guidance, tools.host, tools.main, sourceTools.main, resourceTools.main, browserTools, jobTools],
-    triage: [guidance, tools.host, tools.main, sourceTools.main, browserTools, jobTools],
+    main: [guidance, tools.host, tools.main, ...sidechats, sourceTools.main, resourceTools.main, browserTools, jobTools],
+    sidechat: [guidance, tools.host, tools.main, ...sidechats, sourceTools.main, resourceTools.main, browserTools, jobTools],
+    triage: [guidance, tools.host, tools.main, ...sidechats, sourceTools.main, browserTools, jobTools],
     worker: [guidance, tools.host, tools.worker, sourceTools.worker, resourceTools.worker, browserTools, goalTools],
     agent: [guidance, tools.host, tools.agent, sourceTools.worker, resourceTools.worker, browserTools],
   };
@@ -34,8 +37,13 @@ export function createToolsets({ guidance, tools, sourceTools, resourceTools, br
 export function withActorPolicies(toolsets: Toolsets, { responsePolicy, inputOrigins }: {
   responsePolicy: Extension; inputOrigins: Extension;
 }): Toolsets {
-  return { ...toolsets, main: [...toolsets.main, responsePolicy, inputOrigins],
-    worker: [...toolsets.worker, inputOrigins], agent: [...toolsets.agent, inputOrigins] };
+  return {
+    ...toolsets,
+    main: [...toolsets.main, responsePolicy, inputOrigins],
+    sidechat: [...toolsets.sidechat, inputOrigins],
+    worker: [...toolsets.worker, inputOrigins],
+    agent: [...toolsets.agent, inputOrigins],
+  };
 }
 
 export type ToolSurface = {
@@ -51,11 +59,13 @@ export const BROWSER_TOOLS: readonly string[] = ["browser_user_tabs", "browser_c
   "browser_action", "browser_run_code", "browser_release"];
 export const CONTEXT_TOOLS: readonly string[] = ["read_context", "search_context"];
 
+const MAIN_DEFERRED: readonly string[] = [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "read_resources", "collect_worktrees", "revoke_allocation", "transfer_task",
+  "read_source_events", "notify_user", "notify", "link_source_events", "dismiss_source_events"];
 const CHILD_DEFERRED: readonly string[] = [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "allocate_worktree", "read_resources", "read_source_events", "notify_user"];
 export const WORKER_CODEMODE_INLINE_BUDGET = 350;
 export const TOOL_SURFACES = {
-  main: { deferred: [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "read_resources", "collect_worktrees", "revoke_allocation", "transfer_task",
-    "read_source_events", "notify_user", "notify", "link_source_events", "dismiss_source_events"] },
+  main: { deferred: MAIN_DEFERRED },
+  sidechat: { deferred: MAIN_DEFERRED },
   triage: { deferred: [...BROWSER_TOOLS, ...CONTEXT_TOOLS, "revoke_allocation", "transfer_task"], codemode: { keepDirect: ["record_task"] } },
   worker: { deferred: CHILD_DEFERRED, codemode: { keepDirect: ["record_task", "complete_goal"], inlineBudget: WORKER_CODEMODE_INLINE_BUDGET } },
   agent: { deferred: CHILD_DEFERRED, codemode: { keepDirect: [] } },

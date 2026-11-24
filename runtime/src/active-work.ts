@@ -6,6 +6,7 @@ import type { TaskAgentRecord } from "./generated/TaskAgentRecord.js";
 import type { TaskGraphActor } from "./generated/TaskGraphActor.js";
 import type { TaskGraphBlocked } from "./generated/TaskGraphBlocked.js";
 import type { TaskGraphNode } from "./generated/TaskGraphNode.js";
+import type { TaskGraphSidechat } from "./generated/TaskGraphSidechat.js";
 import type { TaskRecord } from "./generated/TaskRecord.js";
 import type { TaskState } from "./generated/TaskState.js";
 import type { WorkerState } from "./generated/WorkerState.js";
@@ -97,6 +98,7 @@ function conversationRow(
   conversationId: string,
   title: string,
   nodes: readonly TaskGraphNode[],
+  sidechatSlug?: string,
 ): ActiveWorkItem {
   const tools = formatConversationTools(nodes);
   const running = nodes.some(isRunningLiveNode);
@@ -108,6 +110,7 @@ function conversationRow(
     title,
     status: running ? "running" : "waiting_external",
     is_job: false,
+    ...(sidechatSlug === undefined ? {} : { sidechat_slug: sidechatSlug }),
     ...(detail === undefined ? {} : { detail }),
     ...(startedAt === undefined ? {} : { started_at: startedAt }),
     ...(tools.length === 0 ? {} : { tools }),
@@ -201,6 +204,7 @@ export function buildActiveWork(
   nodes: readonly TaskGraphNode[],
   records: readonly TaskRecord[],
   actors: ReadonlyMap<string, TaskGraphActor>,
+  sidechats?: ReadonlyMap<string, TaskGraphSidechat>,
 ): ActiveWorkItem[] {
   const visibleNodes = nodes.filter((node) => !node.background);
   const nodesByConv = new Map<string, TaskGraphNode[]>();
@@ -227,10 +231,16 @@ export function buildActiveWork(
   for (const [conversationId, convNodes] of nodesByConv) {
     if (handledConversations.has(conversationId)) continue;
     const actor = actors.get(conversationId);
-    const title = actor?.type === "task" || actor?.type === "agent"
-      ? actor.title
-      : `Conversation ${conversationId}`;
-    items.push(conversationRow(`conv:${conversationId}`, conversationId, title, convNodes));
+    const sidechat = sidechats?.get(conversationId);
+    const title = sidechat !== undefined
+      ? sidechat.title
+      : actor?.type === "task" || actor?.type === "agent"
+        ? actor.title
+        : `Conversation ${conversationId}`;
+    const sidechatSlug = sidechat?.slug;
+    items.push(conversationRow(
+      sidechatSlug === undefined ? `conv:${conversationId}` : `sidechat:${conversationId}`,
+      conversationId, title, convNodes, sidechatSlug));
   }
 
   const rank = (status: ActiveWorkStatus): number => status === "running" ? 0 : status === "waiting_owner" ? 1 : 2;

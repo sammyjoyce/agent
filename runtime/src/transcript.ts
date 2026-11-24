@@ -31,6 +31,8 @@ export type UserNoticeData = {
   task_id: string | null; source_conversation_id: string; source_entry_id: string; text?: string; notice_origin?: NoticeOrigin;
 };
 export const UserNoticeEntry = defineEntry<UserNoticeData>("agent.user_notice");
+export type SidechatSeedData = { text: string; seed?: ReplyReference };
+export const SidechatSeedEntry = defineEntry<SidechatSeedData>("agent.sidechat_seed");
 /** Display-only correction keyed by the settled native answer, not a later entry.
  * This keeps its causal position without adding model context or a second answer. */
 export const MainResponses = defineDocFamily<{ text: string }, string>({ kind: "agent.main_response", scope: "conversation", family: true,
@@ -182,6 +184,9 @@ function nativeTranscript(entry: EntryRecord, tools?: Map<string, ToolCall>): Hi
   }
   if (TaskTransferEntry.is(entry)) {
     return messageRows(entry, { role: "notice", text: formatTaskTransferNotice(entry.data) });
+  }
+  if (SidechatSeedEntry.is(entry)) {
+    return messageRows(entry, { role: "notice", text: entry.data.text });
   }
   if (ImportedItemEntry.is(entry)) {
     const { source, item } = entry.data;

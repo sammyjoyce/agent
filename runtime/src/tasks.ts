@@ -33,7 +33,8 @@ import type { TaskAgentRecord } from "./generated/TaskAgentRecord.js";
 import type { WorkerHost } from "./generated/WorkerHost.js";
 import type { WorkerRef } from "./generated/WorkerRef.js";
 import type { WorkerPresence } from "./generated/WorkerPresence.js";
-import { noticeMetadata, UserNoticeEntry, type UserNoticeData } from "./transcript.js";
+import { noticeMetadata, SidechatSeedEntry, UserNoticeEntry, type UserNoticeData } from "./transcript.js";
+import type { SidechatStore } from "./sidechats.js";
 import { entryThread, historyKey, HistoryStore, ImportedItemEntry, importedSourceRef, importedSummary, importedText, importedThread, shownInConversation } from "./history.js";
 import { REVISION_AMBIGUOUS, REVISION_PENDING, revisionStatus, type RevisionView } from "./history-revisions.js";
 import type { SavedMatch } from "./generated/SavedMatch.js";
@@ -53,7 +54,7 @@ export type HostCall = (command: HostCommand) => Promise<HostResult>;
 export type SearchQuery = (query: string, sourceRefs: string[], limit: number, mode?: SearchMode) => Promise<SearchResult>;
 export function sourceReference(source: SourceRef): string { return JSON.stringify([source.provider, source.account, source.thread_id]); }
 type TaskIndex = { tasks: TaskRecord[] };
-type TaskCreate = { id?: string; title: string; outcome: string; sources?: SourceRef[]; job_id?: string; model?: ModelSelection; scheduled_run?: JobRunReceipt };
+type TaskCreate = { id?: string; title: string; outcome: string; sources?: SourceRef[]; job_id?: string; model?: ModelSelection; scheduled_run?: JobRunReceipt; delivery_conversation_id?: string };
 type WorkerInput = Extract<RuntimeCommand, { type: "run_task" }>;
 type ActorRef = { task_id: string; agent_id?: string };
 export type ActorMode = "job" | "interactive";
@@ -124,6 +125,21 @@ const ConversationOwner = defineDocFamily<{ task_id: string | null; agent_id: st
   initial: () => ({ task_id: null, agent_id: null }), checkpointWhen: () => true });
 const ConfinedConversation = defineDocFamily<{ confined: boolean }, null>({ kind: "agent.task.confined", scope: "session", family: true, version: 1,
   initial: () => ({ confined: false }), checkpointWhen: () => true });
+type PendingSidechatNotice = { call_id: string; source_conversation_id: string; source_entry_id: EntryId; text: string };
+type PendingOwnerWaitEscalation = { episode: number; conversation_id: string; origin_entry_id: EntryId; call_id: string; notice_text: string };
+type OwnerWaitState = {
+  episode: number;
+  active: boolean;
+  escalated_episode: number;
+  main_texts_in_episode: string[];
+  pending_sidechat_notices: PendingSidechatNotice[];
+  pending_escalation?: PendingOwnerWaitEscalation;
+};
+const OwnerWait = defineDocFamily<OwnerWaitState, null>({
+  kind: "agent.task.owner_wait", scope: "session", family: true, version: 1,
+  initial: () => ({ episode: 0, active: false, escalated_episode: 0, main_texts_in_episode: [], pending_sidechat_notices: [] }),
+  checkpointWhen: () => true,
+});
 // Session scope is the durable coordinator namespace; host keys never select
 // user sessions. A claim without a binding survives an unanswered create.
 const WorkerWorkspace = defineDocFamily<{ claim: string | null; owner: string | null; session_id: string | null; binding: WorkerRef | null; retired: string[]; revision: number }, null>({
@@ -168,18 +184,21 @@ export type OutcomeSink = {
   assertSourceRemovalIn(tx: Tx, taskId: string, sources: readonly SourceRef[]): Promise<void>;
 };
 /** Only an explicit coordinator notification becomes user-visible context. */
-export async function publishMainNotice(session: Harness, conversation: Conversation, entry: EntryRecord,
+export async function publishConversationNotice(session: Harness, targetConversationId: ConversationId, conversation: Conversation, entry: EntryRecord,
   taskId: string | null, sources: readonly SourceRef[],
   notice: { key: string; text: string; events: readonly SourceEvent[]; taskTitle?: string; origin?: NoticeOrigin }): Promise<NoticePublication> {
-  const root = await session.root(BACKGROUND_CONTEXT);
+  const target = targetConversationId === ROOT_CONVERSATION_ID
+    ? await session.root(BACKGROUND_CONTEXT)
+    : await session.conversation(targetConversationId, BACKGROUND_CONTEXT);
+  if (target === undefined) throw new TaskError("The target conversation is unavailable");
   const requestId = "notice:" + entry.id.toString() + ":" + notice.key;
   // Legacy model-bearing notices already own their eventual visible entry.
   // Never create a second display entry while that original write is queued.
   const legacy = await session.commit(async (tx) => {
-    const prior = await tx.submissionByRequest(root.id, requestId);
+    const prior = await tx.submissionByRequest(target.id, requestId);
     if (prior === undefined) return undefined;
     if (prior.entry !== undefined) return (await tx.entry(prior.entry))?.model === undefined ? undefined : prior;
-    const pending = (await tx.doc(InboxDoc, root.id)).items.find((item) => item.id === prior.id);
+    const pending = (await tx.doc(InboxDoc, target.id)).items.find((item) => item.id === prior.id);
     return pending?.mode === "write" && pending.entry.model !== undefined ? prior : undefined;
   }, BACKGROUND_CONTEXT);
   if (legacy !== undefined) {
@@ -198,15 +217,20 @@ export async function publishMainNotice(session: Harness, conversation: Conversa
       source_conversation_id: conversation.id.toString(), source_entry_id: entry.id.toString(),
       sources: notice.events.map((event) => ({ provider: event.source.provider, account: event.source.account, thread_id: event.source.thread_id,
         title: event.title, event_id: event.id, event_version: event.version })) }, ...(notice.origin === undefined ? {} : { notice_origin: notice.origin }) };
-  // Pi can publish display-only writes while main is busy.
-  const display = await root.submit({ type: "write", requestId, entry: {
+  // Pi can publish display-only writes while the target conversation is busy.
+  const display = await target.submit({ type: "write", requestId, entry: {
     kind: UserNoticeEntry.kind, data,
   } }, BACKGROUND_CONTEXT);
-  await placeNoticeContext(session, root, entry, "notice-context:" + JSON.stringify([entry.id.toString(), notice.key]), context);
+  await placeNoticeContext(session, target, entry, "notice-context:" + JSON.stringify([target.id.toString(), entry.id.toString(), notice.key]), context);
   const status = await display.status(BACKGROUND_CONTEXT);
   if (status.status === "done") return "published";
   if (status.status === "queued") return "queued";
   throw new TaskError("The notification did not publish");
+}
+export async function publishMainNotice(session: Harness, conversation: Conversation, entry: EntryRecord,
+  taskId: string | null, sources: readonly SourceRef[],
+  notice: { key: string; text: string; events: readonly SourceEvent[]; taskTitle?: string; origin?: NoticeOrigin }): Promise<NoticePublication> {
+  return publishConversationNotice(session, ROOT_CONVERSATION_ID, conversation, entry, taskId, sources, notice);
 }
 function key(value: string): string { return value.normalize("NFKC").trim().toLocaleLowerCase(); }
 function related(left: SourceRef, right: SourceRef): boolean {
@@ -216,6 +240,7 @@ function text(entry: EntryRecord, toolLimit?: number): string {
   if (entry.kind === "agent.notice_context") return "";
   if (UserNoticeEntry.is(entry) && typeof entry.data?.text === "string") return entry.data.text;
   if (TaskTransferEntry.is(entry)) return formatTaskTransferNotice(entry.data);
+  if (SidechatSeedEntry.is(entry)) return entry.data.text;
   const imported = importedText(entry); if (imported !== undefined) return imported;
   return entry.model?.filter((message) => message.role !== "system").map((message) => {
     const content = typeof message.content === "string" ? message.content : message.content.flatMap((part, index) =>
@@ -256,6 +281,7 @@ export class TaskStore {
   private outcomes: OutcomeSink | undefined;
   private environment: CoordinatorEnvironment | undefined;
   private histories: HistoryStore | undefined;
+  private sidechats: SidechatStore | undefined;
   private attachments: AttachmentStore | undefined;
   private execution: ActorExecution | undefined;
   private goals: GoalPolicy | undefined;
@@ -297,10 +323,15 @@ export class TaskStore {
   }
   useEnvironment(environment: CoordinatorEnvironment): void { this.environment = environment; }
   useHistory(history: HistoryStore): void { this.histories = history; }
+  useSidechats(sidechats: SidechatStore): void { this.sidechats = sidechats; }
   useAttachments(attachments: AttachmentStore): void { this.attachments = attachments; }
   useActorExecution(execution: ActorExecution): void { this.execution = execution; }
   useConfinement(rule: ActorConfinement): void { this.confinement = rule; }
   isConfined(task: Pick<TaskRecord, "sources">): boolean { return this.confinement(task) !== undefined; }
+  async isIsolatedTask(task: Pick<TaskRecord, "delivery_conversation_id">): Promise<boolean> {
+    if (task.delivery_conversation_id === undefined) return false;
+    return (await this.sidechats?.get(task.delivery_conversation_id))?.isolated === true;
+  }
   async predatesConfinementIn(tx: Tx, id: string): Promise<boolean> {
     const task = await this.taskIn(tx, id);
     return task !== undefined && this.isConfined(task) && !(await tx.doc(ConfinedConversation, task.conversation_id, null)).confined;
@@ -656,10 +687,166 @@ export class TaskStore {
       const outcome = this.outcome(task, provenance.conversation_id, origin.id.toString(), provenance.call_id);
       if (reconciliation !== undefined) outcome.reconciliation = reconciliation;
       await this.outcomes?.recordIn(tx, outcome, provenance.settled);
+      if (this.hasSidechatDelivery(task)) {
+        if (state.state === "waiting" && state.target === "owner") {
+          const wait = await tx.doc(OwnerWait, task.id, null);
+          if (!wait.active) {
+            wait.episode += 1;
+            wait.active = true;
+          }
+          const pendingTexts: string[] = [];
+          for (const item of wait.pending_sidechat_notices) {
+            const trimmed = item.text.trim();
+            if (trimmed.length > 0 && pendingTexts.at(-1) !== trimmed) pendingTexts.push(trimmed);
+          }
+          const summary = task.summary.trim();
+          const alreadyContainsSummary = summary.length > 0 &&
+            wait.main_texts_in_episode.some((sent) => sent.includes(summary));
+          if (wait.escalated_episode < wait.episode || pendingTexts.length > 0) {
+            let noticeText: string | undefined;
+            if (pendingTexts.length > 0) {
+              const questionsText = pendingTexts.join("\n\n");
+              noticeText = summary.length === 0 || questionsText.includes(summary) || alreadyContainsSummary
+                ? questionsText
+                : summary.includes(questionsText)
+                  ? summary
+                  : `${questionsText}\n\n${summary}`;
+            } else if (alreadyContainsSummary) {
+              wait.escalated_episode = wait.episode;
+              delete wait.pending_escalation;
+            } else {
+              noticeText = summary.length > 0
+                ? summary
+                : `Task "${task.title}" is waiting for your reply.`;
+            }
+            if (noticeText !== undefined) {
+              wait.pending_escalation = {
+                episode: wait.episode,
+                conversation_id: provenance.conversation_id,
+                origin_entry_id: origin.id,
+                call_id: provenance.call_id,
+                notice_text: noticeText,
+              };
+            }
+          }
+        } else {
+          // Staying open preserves pending sidechat notices across progress checkpoints;
+          // leaving waiting(owner), resolving, or waiting externally resets episode state.
+          await this.resetOwnerWaitIn(tx, task, state.state !== "open");
+        }
+      }
       return undefined;
     }, BACKGROUND_CONTEXT);
     if (refused !== undefined) throw new TaskError(refused);
-    return this.get(id);
+    const saved = await this.get(id);
+    if (this.hasSidechatDelivery(saved) && saved.state.state === "waiting" && saved.state.target === "owner") {
+      await this.flushOwnerWait(saved.id);
+    }
+    return saved;
+  }
+  private hasSidechatDelivery(task: Pick<TaskRecord, "delivery_conversation_id">): boolean {
+    return task.delivery_conversation_id !== undefined && task.delivery_conversation_id !== ROOT_CONVERSATION_ID.toString();
+  }
+  private async resetOwnerWaitIn(
+    tx: Tx,
+    task: Pick<TaskRecord, "id" | "delivery_conversation_id">,
+    clearPending = true,
+  ): Promise<void> {
+    if (!this.hasSidechatDelivery(task)) return;
+    const wait = await tx.doc(OwnerWait, task.id, null);
+    const wasActive = wait.active;
+    wait.active = false;
+    delete wait.pending_escalation;
+    if (clearPending || wasActive) {
+      wait.main_texts_in_episode = [];
+      wait.pending_sidechat_notices = [];
+    }
+  }
+  async recordSidechatNotice(taskId: string, notice: PendingSidechatNotice): Promise<void> {
+    const task = await this.get(taskId);
+    if (!this.hasSidechatDelivery(task) || notice.source_conversation_id !== task.conversation_id) return;
+    const trimmed = notice.text.trim();
+    if (trimmed.length === 0) return;
+    await this.session.commit(async (tx) => {
+      const wait = await tx.doc(OwnerWait, task.id, null);
+      if (wait.pending_sidechat_notices.some((item) => item.call_id === notice.call_id)) return;
+      wait.pending_sidechat_notices.push({ ...notice, text: trimmed });
+      if (wait.pending_sidechat_notices.length > 4) {
+        wait.pending_sidechat_notices.splice(0, wait.pending_sidechat_notices.length - 4);
+      }
+    }, BACKGROUND_CONTEXT);
+  }
+  async hasMainNoticeInEpisode(taskId: string, text: string): Promise<boolean> {
+    const trimmed = text.trim();
+    if (trimmed.length === 0) return false;
+    const wait = await this.session.snapshot(OwnerWait, taskId, BACKGROUND_CONTEXT);
+    return wait?.main_texts_in_episode.some((sent) => sent === trimmed || sent.split("\n\n").includes(trimmed)) === true;
+  }
+  async recordMainNotice(taskId: string, text: string, options?: { markEpisodeEscalated?: boolean }): Promise<void> {
+    const task = await this.get(taskId);
+    if (!this.hasSidechatDelivery(task)) return;
+    const trimmed = text.trim();
+    if (trimmed.length === 0) return;
+    await this.session.commit(async (tx) => {
+      const wait = await tx.doc(OwnerWait, task.id, null);
+      if (!wait.main_texts_in_episode.includes(trimmed)) {
+        wait.main_texts_in_episode.push(trimmed);
+        if (wait.main_texts_in_episode.length > 8) {
+          wait.main_texts_in_episode.splice(0, wait.main_texts_in_episode.length - 8);
+        }
+      }
+      if (options?.markEpisodeEscalated === true && wait.active) {
+        wait.escalated_episode = Math.max(wait.escalated_episode, wait.episode);
+        wait.pending_sidechat_notices = [];
+        delete wait.pending_escalation;
+      }
+    }, BACKGROUND_CONTEXT);
+  }
+  async flushOwnerWait(taskId: string): Promise<void> {
+    const snapshot = await this.session.snapshot(OwnerWait, taskId, BACKGROUND_CONTEXT);
+    const pending = snapshot?.pending_escalation;
+    if (pending === undefined) return;
+    const task = await this.get(taskId);
+    if (!this.hasSidechatDelivery(task)) return;
+    const conversation = await this.conversation(pending.conversation_id);
+    const origin = await conversation.commit((tx) => tx.entry(pending.origin_entry_id), BACKGROUND_CONTEXT);
+    if (origin === undefined) {
+      await this.session.commit(async (tx) => {
+        const wait = await tx.doc(OwnerWait, taskId, null);
+        if (wait.pending_escalation?.episode === pending.episode && wait.pending_escalation.call_id === pending.call_id) {
+          delete wait.pending_escalation;
+        }
+      }, BACKGROUND_CONTEXT);
+      return;
+    }
+    const lineage = await this.noticeOrigin(conversation, origin.id);
+    await publishMainNotice(this.session, conversation, origin, task.id, task.sources, {
+      key: "owner-wait:ep:" + pending.episode + ":" + pending.call_id,
+      text: pending.notice_text,
+      events: [],
+      taskTitle: task.title,
+      ...(lineage === undefined ? {} : { origin: lineage }),
+    });
+    await this.session.commit(async (tx) => {
+      const wait = await tx.doc(OwnerWait, taskId, null);
+      if (wait.pending_escalation?.episode === pending.episode && wait.pending_escalation.call_id === pending.call_id) {
+        wait.escalated_episode = Math.max(wait.escalated_episode, pending.episode);
+        wait.pending_sidechat_notices = [];
+        delete wait.pending_escalation;
+        if (!wait.main_texts_in_episode.includes(pending.notice_text)) {
+          wait.main_texts_in_episode.push(pending.notice_text);
+          if (wait.main_texts_in_episode.length > 8) {
+            wait.main_texts_in_episode.splice(0, wait.main_texts_in_episode.length - 8);
+          }
+        }
+      }
+    }, BACKGROUND_CONTEXT);
+  }
+  /** Recovery safety net if a process crashed between record_task's commit and its Main publish. */
+  async flushWorkerOwnerWait(conversationId: ConversationId): Promise<void> {
+    const owner = await this.findOwner(conversationId.toString());
+    if (owner === undefined || owner.agent !== undefined || !this.hasSidechatDelivery(owner.task)) return;
+    await this.flushOwnerWait(owner.task.id);
   }
   async assertCheckUncancelledIn(tx: Tx, conversationId: ConversationId, invocation: NativeTaskId | undefined): Promise<void> {
     if (!await this.uncancelledIn(tx, conversationId, invocation)) {
@@ -835,12 +1022,15 @@ export class TaskStore {
   async search(query: string, sources: readonly SourceRef[] = [], limit = 8): Promise<TaskRecord[]> {
     return this.rank(query, sources, limit, true);
   }
-  private async rank(query: string, sources: readonly SourceRef[], limit: number, originals: boolean): Promise<TaskRecord[]> {
+  private searchTokens(query: string): string[] {
     const stop = ["the", "and", "for", "you", "our", "this", "that", "with", "please", "can", "have", "from"];
-    const tokens = (key(query).match(/[\p{L}\p{N}]+/gu) ?? []).filter((token) => token.length > 1 && !stop.includes(token));
+    return (key(query).match(/[\p{L}\p{N}]+/gu) ?? []).filter((token) => token.length > 1 && !stop.includes(token));
+  }
+  private async rank(query: string, sources: readonly SourceRef[], limit: number, originals: boolean): Promise<TaskRecord[]> {
+    const tokens = this.searchTokens(query);
     const scored: { task: TaskRecord; score: number }[] = [];
     for (const task of await this.list()) {
-      if (this.isConfined(task)) continue;
+      if (this.isConfined(task) || await this.isIsolatedTask(task)) continue;
       const sourceMatch = sources.some((source) =>
         (source.provider === "task_outcomes" && source.account === "local" && source.thread_id === task.id) ||
         task.sources.some((saved) => related(saved, source)));
@@ -857,22 +1047,29 @@ export class TaskStore {
     return scored.sort((a, b) => b.score - a.score || b.task.updated_at - a.task.updated_at)
       .slice(0, Math.min(20, Math.max(1, limit))).map((item) => item.task);
   }
-  async find(query: string, sources: readonly SourceRef[] = [], limit = 8, search?: SearchQuery, mode: SearchMode = "semantic"): Promise<{ matches: SavedMatch[]; gaps: string[] }> {
+  async find(query: string, sources: readonly SourceRef[] = [], limit = 8, search?: SearchQuery, mode: SearchMode = "semantic",
+    options?: { includeSidechats?: boolean; excludeConversationId?: string }): Promise<{ matches: SavedMatch[]; gaps: string[] }> {
     const indexed = search === undefined ? { candidates: [], gaps: this.histories === undefined ? [] : ["Semantic history search is unavailable"] }
       : await search(query, sources.map(sourceReference), limit, mode);
     const tasks = await this.list(); const matches = new Map<string, SavedMatch>(); const exact = new Set<string>();
     const refs = new Set([...sources.map(sourceReference), query.trim()]);
+    const includeSidechats = options?.includeSidechats !== false;
+    const excludeConversationId = options?.excludeConversationId;
     // Fuse the independent rankings so current task metadata stays discoverable
     // while a large history import has not yet indexed those conversations.
     const add = (match: SavedMatch, rank: number) => {
+      if (match.conversation_id === excludeConversationId) return;
       const saved = matches.get(match.conversation_id) ?? { ...match, score: 0 };
       saved.score += 1 / (60 + rank + 1); matches.set(saved.conversation_id, saved);
     };
     for (const [rank, candidate] of indexed.candidates.entries()) {
+      if (candidate.conversation_id === excludeConversationId) continue;
       const task = tasks.find((task) => task.conversation_id === candidate.conversation_id || task.agents.some((agent) => agent.conversation_id === candidate.conversation_id));
-      if (task !== undefined && this.isConfined(task)) continue;
+      if (task !== undefined && (this.isConfined(task) || await this.isIsolatedTask(task))) continue;
+      const sidechat = await this.sidechats?.get(candidate.conversation_id);
+      if (sidechat !== undefined && (sidechat.isolated || !includeSidechats)) continue;
       const imported = await this.histories?.byConversation(candidate.conversation_id) ?? null;
-      add({ conversation_id: candidate.conversation_id, title: task?.title ?? imported?.thread.title ?? "Main conversation",
+      add({ conversation_id: candidate.conversation_id, title: task?.title ?? sidechat?.title ?? imported?.thread.title ?? "Main conversation",
         excerpt: candidate.matches.map((match) => match.text).join("\n").slice(0, 24_000), score: candidate.score,
         entry_ids: [...new Set(candidate.matches.map((match) => match.entry_id))],
         task_id: task?.id ?? imported?.adopted_task_id ?? null, imported: imported === null ? null : importedSummary(imported) }, rank);
@@ -884,16 +1081,51 @@ export class TaskStore {
         exact.add(candidate.conversation_id);
       }
     }
+    if (includeSidechats && this.sidechats !== undefined) {
+      const tokens = this.searchTokens(query);
+      const exactQuery = key(query).trim();
+      if (tokens.length > 0 || exactQuery.length > 0) {
+        const rankedSidechats = (await this.sidechats.list(true))
+          .filter((item) => !item.isolated && item.conversation_id !== excludeConversationId)
+          .map((item) => {
+            const slugText = key(item.slug);
+            const titleTokens = new Set(this.searchTokens(item.title));
+            const slugTokens = new Set(this.searchTokens(item.slug));
+            const charterTokens = new Set(this.searchTokens(item.charter ?? ""));
+            let score = exactQuery.length > 0 && slugText === exactQuery ? 6 : 0;
+            for (const token of tokens) {
+              if (slugText === token) score += 6;
+              else if (titleTokens.has(token) || slugTokens.has(token)) score += 4;
+              else if (charterTokens.has(token)) score += 2;
+            }
+            return { item, score };
+          })
+          .filter((entry) => entry.score > 0)
+          .sort((left, right) => right.score - left.score || right.item.updated_at - left.item.updated_at)
+          .slice(0, limit);
+        for (const [rank, entry] of rankedSidechats.entries()) {
+          add({
+            conversation_id: entry.item.conversation_id,
+            title: entry.item.title,
+            excerpt: entry.item.charter ?? `Standing side chat (${entry.item.slug})`,
+            entry_ids: [],
+            score: 1,
+            task_id: null,
+            imported: null,
+          }, rank);
+        }
+      }
+    }
     for (const [rank, task] of (await this.rank(query, sources, limit, search === undefined)).entries()) add({
       conversation_id: task.conversation_id, title: task.title, excerpt: task.summary || task.outcome, entry_ids: [], score: 1, task_id: task.id, imported: null,
     }, rank);
-    for (const task of tasks) if (sources.some((source) =>
+    for (const task of tasks) if (!this.isConfined(task) && !await this.isIsolatedTask(task) && sources.some((source) =>
       (source.provider === "task_outcomes" && source.account === "local" && source.thread_id === task.id) ||
       task.sources.some((saved) => related(saved, source)))) exact.add(task.conversation_id);
     return { matches: [...matches.values()].sort((left, right) => Number(exact.has(right.conversation_id)) - Number(exact.has(left.conversation_id)) || right.score - left.score)
       .slice(0, Math.min(20, Math.max(1, limit))), gaps: indexed.gaps };
   }
-  async adopt(conversationId: string, input: { id: string; title?: string; outcome: string; evidence: string; model: ModelSelection; sources?: SourceRef[] }): Promise<TaskRecord> {
+  async adopt(conversationId: string, input: { id: string; title?: string; outcome: string; evidence: string; model: ModelSelection; sources?: SourceRef[]; delivery_conversation_id?: string }): Promise<TaskRecord> {
     refuseScheduledJobSources(input.sources ?? []);
     await this.prepare();
     const imported = await this.histories?.byConversation(conversationId);
@@ -903,7 +1135,8 @@ export class TaskStore {
       if (await this.taskIn(tx, input.id) !== undefined) throw new TaskError("This task ID already belongs to another conversation");
       const { value: task } = await this.recordsStore.insertIn(tx, input.id, { id: input.id, model: input.model, conversation_id: native.toString(), title: input.title?.trim() || record.thread.title.trim() || "Imported conversation",
         outcome: input.outcome.trim(), summary: "", state: { state: "open" }, worker: { state: "unassigned" },
-        sources: [importedSourceRef(record), ...input.sources ?? []], pending: [], agents: [], updated_at: Date.now() });
+        sources: [importedSourceRef(record), ...input.sources ?? []], pending: [], agents: [], updated_at: Date.now(),
+        ...(input.delivery_conversation_id === undefined ? {} : { delivery_conversation_id: input.delivery_conversation_id }) });
       await this.indexTaskIn(tx, task);
     });
     return this.get(id);
@@ -911,7 +1144,10 @@ export class TaskStore {
   async *records(conversationId: string): AsyncIterable<SearchRecord> {
     const task = (await this.findOwner(conversationId))?.task;
     const imported = await this.histories?.byConversation(conversationId);
-    if (conversationId !== ROOT_CONVERSATION_ID.toString() && task === undefined && imported === undefined) return;
+    const sidechat = await this.sidechats?.get(conversationId);
+    if (sidechat?.isolated) return;
+    if (task !== undefined && (this.isConfined(task) || await this.isIsolatedTask(task))) return;
+    if (conversationId !== ROOT_CONVERSATION_ID.toString() && task === undefined && imported === undefined && sidechat === undefined) return;
     const conversation = await this.conversation(conversationId);
     const refs = (task?.sources ?? []).map(sourceReference);
     if (imported !== undefined) refs.push(sourceReference(importedSourceRef(imported)));
@@ -964,10 +1200,18 @@ export class TaskStore {
     const now = Date.now();
     const task: TaskRecord = { id, model: input.model ?? null, conversation_id: conversation.id.toString(), title: input.title.trim(), outcome: input.outcome.trim(),
       summary: "", state: { state: "open" }, worker: { state: "unassigned" }, sources, pending: [], agents: [], started_at: now, updated_at: now,
-      ...(input.scheduled_run === undefined ? {} : { scheduled_run: input.scheduled_run }) };
+      ...(input.scheduled_run === undefined ? {} : { scheduled_run: input.scheduled_run }),
+      ...(input.delivery_conversation_id === undefined ? {} : { delivery_conversation_id: input.delivery_conversation_id }) };
     const { value: saved } = await this.recordsStore.insertIn(tx, id, task); await this.indexTaskIn(tx, saved);
     if (this.isConfined(task)) (await tx.doc(ConfinedConversation, task.conversation_id, null)).confined = true;
     return { id, native: conversation.id };
+  }
+  async setDeliveryConversation(taskId: string, conversationId: string | undefined): Promise<void> {
+    await this.prepare();
+    await this.session.commit((tx) => this.updateIn(tx, taskId, (task) => {
+      if (conversationId === undefined) delete task.delivery_conversation_id;
+      else task.delivery_conversation_id = conversationId;
+    }), BACKGROUND_CONTEXT);
   }
   async create(input: TaskCreate): Promise<TaskRecord> {
     await this.prepare();
@@ -1089,7 +1333,7 @@ export class TaskStore {
       await this.admit(attachments, () => this.session.commit(async (tx) => {
       await this.updateIn(tx, id, async (task) => {
         if (delivered !== undefined) this.assertSource(delivered.conversation_id);
-        this.pushIn(task, this.actor(task, agentId), input);
+        await this.pushIn(tx, task, this.actor(task, agentId), input);
       });
       if (delivered !== undefined) await this.outcomes?.deliveredIn(tx, delivered);
       }, BACKGROUND_CONTEXT));
@@ -1101,10 +1345,11 @@ export class TaskStore {
     if (active !== undefined) { active.revision += 1; active.wake?.(); }
     return task;
   }
-  private pushIn(task: TaskRecord, actor: TaskRecord | TaskAgentRecord, input: TaskInput): void {
+  private async pushIn(tx: Tx, task: TaskRecord, actor: TaskRecord | TaskAgentRecord, input: TaskInput): Promise<void> {
     if (queuedInput(actor, input) === undefined) actor.pending.push(input);
     actor.state = { state: "open" };
     task.state = { state: "open" };
+    await this.resetOwnerWaitIn(tx, task, actor === task);
   }
   /** Commit the caller's change and the primary-actor input it returns in one transaction, then let an attached actor
    * see the input. The change may create the task. */
@@ -1118,7 +1363,7 @@ export class TaskStore {
       admitted = await this.session.commit(async (tx) => {
         const result = await change(tx);
         const input = result.input;
-        if (input !== undefined) await this.updateIn(tx, id, (task) => this.pushIn(task, task, input));
+        if (input !== undefined) await this.updateIn(tx, id, (task) => this.pushIn(tx, task, task, input));
         return result;
       }, BACKGROUND_CONTEXT);
       if (admitted.input?.mode !== undefined && active !== undefined) await this.admitActiveInputs(active);
@@ -1187,6 +1432,7 @@ export class TaskStore {
         started_at: now, updated_at: now });
       await this.indexTaskIn(tx, task);
       task.state = { state: "open" };
+      await this.resetOwnerWaitIn(tx, task, false);
       task.updated_at = Date.now();
       return conversation.id;
     }, BACKGROUND_CONTEXT));
@@ -1793,7 +2039,7 @@ export class TaskStore {
       if (task.pending.length > 0) return true;
       const input = await goals.continuationIn(tx, task, nativeConversationId(task.conversation_id));
       if (input === undefined) return false;
-      await this.updateIn(tx, id, (current) => this.pushIn(current, current, input));
+      await this.updateIn(tx, id, (current) => this.pushIn(tx, current, current, input));
       return true;
     }, BACKGROUND_CONTEXT);
   }
@@ -2241,6 +2487,9 @@ export class TaskStore {
         await this.reportAgent(input.task_id, input.agent_id, answer, "Agent execution did not complete; its conversation is retained");
       }
       const task = await this.get(input.task_id);
+      if (input.agent_id === undefined && this.hasSidechatDelivery(task)) {
+        await this.flushOwnerWait(task.id).catch(() => {});
+      }
       const failed = this.outcome(task, this.actor(task, input.agent_id).conversation_id, null, null,
         active.mode === "job" && (error instanceof TaskError || error instanceof ModelTurnError) ? error.message
           : "Worker execution did not complete; inspect the retained task and its pending input");

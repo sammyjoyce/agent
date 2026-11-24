@@ -2,6 +2,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { CommitObservation, Harness } from "@earendil-works/pi-durable";
 import type { HostCall, TaskStore } from "./tasks.js";
 import type { HistoryStore } from "./history.js";
+import { SIDECHAT_RECORDS_KIND, type SidechatStore } from "./sidechats.js";
 import { SearchIndex, type Embed, type SearchResult } from "./search.js";
 import type { SearchMode } from "./generated/SearchMode.js";
 
@@ -10,14 +11,31 @@ export class Retrieval {
   private index: SearchIndex | undefined;
   private ready = false;
   private readonly dirty = new Map<string, string>();
+  private readonly isolatedByConversation = new Map<string, boolean>();
+  private readonly policyDirtySidechats = new Set<string>();
+  private policyVersion = 0;
   private readonly commits: CommitObservation;
   private syncing = Promise.resolve();
   private pendingSyncs = 0;
   private closing: Promise<void> | undefined;
-  constructor(session: Harness, private readonly histories: HistoryStore, private readonly tasks: TaskStore, private readonly path: string) {
+  constructor(session: Harness, private readonly histories: HistoryStore, private readonly tasks: TaskStore, private readonly path: string,
+    private readonly sidechats?: SidechatStore) {
     this.commits = session.observeCommits({ advance: (publication) => {
-      for (const change of publication.changes) if (change.type === "entry") {
-        this.dirty.set(change.value.conversationId.toString(), change.value.id.toString());
+      for (const change of publication.changes) {
+        if (change.type === "entry") {
+          this.dirty.set(change.value.conversationId.toString(), change.value.id.toString());
+        } else if (change.type === "document" && change.kind === "change" &&
+          change.record.kind === SIDECHAT_RECORDS_KIND && typeof change.record.key === "string") {
+          const slot = change.value.value;
+          const isolated = slot !== null && typeof slot === "object" && !Array.isArray(slot) && slot.isolated === true;
+          const previous = this.isolatedByConversation.get(change.record.key);
+          this.isolatedByConversation.set(change.record.key, isolated);
+          if (previous === undefined || previous !== isolated) {
+            this.policyVersion += 1;
+            this.dirty.set(change.record.key, "policy:" + this.policyVersion.toString());
+            this.policyDirtySidechats.add(change.record.key);
+          }
+        }
       }
     }, end() {} });
   }
@@ -56,7 +74,35 @@ export class Retrieval {
       this.assertOpen(); signal?.throwIfAborted(); yield item;
     }
   }
+  private async watermarkFor(id: string, base: string): Promise<string> {
+    const sidechat = await this.sidechats?.get(id);
+    if (sidechat !== undefined) {
+      this.isolatedByConversation.set(id, sidechat.isolated);
+      return sidechat.isolated ? `${base}:isolated` : base;
+    }
+    const owner = await this.tasks.findOwner(id);
+    if (owner !== undefined && await this.tasks.isIsolatedTask(owner.task)) {
+      return `${base}:isolated`;
+    }
+    return base;
+  }
+  private async *inventory(signal?: AbortSignal): AsyncGenerator<{ conversation_id: string; watermark: string }> {
+    for await (const item of this.scan(this.histories.inventory(), signal)) {
+      yield { conversation_id: item.conversation_id, watermark: await this.watermarkFor(item.conversation_id, item.watermark) };
+    }
+  }
   private async changed(call: HostCall, signal?: AbortSignal): Promise<void> {
+    if (this.policyDirtySidechats.size > 0) {
+      const changedSidechats = new Set(this.policyDirtySidechats);
+      this.policyDirtySidechats.clear();
+      for (const task of await this.tasks.list()) {
+        if (task.delivery_conversation_id === undefined || !changedSidechats.has(task.delivery_conversation_id)) continue;
+        this.policyVersion += 1;
+        const marker = "policy:" + this.policyVersion.toString();
+        this.dirty.set(task.conversation_id, marker);
+        for (const agent of task.agents) this.dirty.set(agent.conversation_id, marker);
+      }
+    }
     const index = this.open(), embed = this.embed(call, signal);
     for (const [id, queued] of [...this.dirty]) {
       this.assertOpen(); signal?.throwIfAborted();
@@ -67,9 +113,9 @@ export class Retrieval {
       }
       const conversation = await this.tasks.conversation(id);
       const tail = await conversation.entries({ order: "descending" }, 1, undefined, BACKGROUND_CONTEXT);
-      const watermark = tail.items[0]?.id.toString() ?? "empty";
+      const watermark = await this.watermarkFor(id, tail.items[0]?.id.toString() ?? "empty");
       await index.upsert(id, watermark, this.scan(this.tasks.records(id), signal), embed);
-      if (this.dirty.get(id) === watermark) this.dirty.delete(id);
+      if (this.dirty.get(id) === queued || this.dirty.get(id) === watermark) this.dirty.delete(id);
     }
   }
   /** Full catchup keeps the explicit import request's host-call ownership. */
@@ -77,7 +123,7 @@ export class Retrieval {
     return this.queue(async () => {
       signal?.throwIfAborted();
       if (!this.ready || all) {
-        await this.open().reconcile(this.scan(this.histories.inventory(), signal),
+        await this.open().reconcile(this.inventory(signal),
           (id) => this.scan(this.tasks.records(id), signal), this.embed(call, signal));
         this.ready = true;
       }

@@ -14,9 +14,15 @@ enum AlertOrigin: Equatable {
   case malformed
 }
 
+struct AlertPayload: Equatable {
+  let origin: AlertOrigin
+  let conversationID: String?
+}
+
 enum OpenDestination: Hashable {
   case feed(notice: String?)
   case job(ScopedEntityID)
+  case sidechat(ScopedEntityID)
 }
 
 struct OpenRequest: Equatable {
@@ -36,7 +42,21 @@ public final class AppNotifications: NSObject {
   public let registration: NotificationRegistration
   public let coordinators: Coordinators
   public var mainVisible: MainVisibility = .hidden
+  public var activeSidechat: ScopedEntityID?
+  private var activeSidechatToken: UUID?
   private(set) var openRequest: OpenRequest?
+
+  func setActiveSidechat(_ id: ScopedEntityID, token: UUID) {
+    activeSidechat = id
+    activeSidechatToken = token
+  }
+
+  func clearActiveSidechat(token: UUID) {
+    if activeSidechatToken == token {
+      activeSidechat = nil
+      activeSidechatToken = nil
+    }
+  }
   #if DEBUG
     /// What a Debug launch asked for.
     public enum InteractionLaunch {
@@ -87,6 +107,30 @@ public final class AppNotifications: NSObject {
     #endif
   }
 
+  private func isSidechatConversation(_ conversationID: String?, on lane: ProfileID) -> Bool {
+    guard let conversationID, !conversationID.isEmpty else { return false }
+    if let snapshot = coordinators.chat.snapshots[lane] {
+      if snapshot.connection == .connected && !snapshot.sidechatsSupported { return false }
+      if let mainID = snapshot.conversationID, conversationID == mainID { return false }
+    }
+    return conversationID != "1"
+  }
+
+  func open(_ payload: AlertPayload) {
+    let lane =
+      coordinators.route(payload.origin)
+      ?? (payload.origin == .unnamed && coordinators.profiles.count == 1
+        ? coordinators.profiles.first?.id : nil)
+    if let lane, let conversationID = payload.conversationID,
+      isSidechatConversation(conversationID, on: lane)
+    {
+      openRequest = OpenRequest(
+        destination: .sidechat(ScopedEntityID(profile: lane, item: conversationID)))
+      return
+    }
+    open(payload.origin)
+  }
+
   func open(_ origin: AlertOrigin) {
     openRequest = OpenRequest(destination: .feed(notice: coordinators.show(opening: origin)))
   }
@@ -97,6 +141,21 @@ public final class AppNotifications: NSObject {
 
   func showNotice(_ notice: String) {
     openRequest = OpenRequest(destination: .feed(notice: notice))
+  }
+
+  func presents(payload: AlertPayload?) -> Bool {
+    guard let payload else { return presents(nil) }
+    let lane =
+      coordinators.route(payload.origin)
+      ?? (payload.origin == .unnamed && coordinators.profiles.count == 1
+        ? coordinators.profiles.first?.id : nil)
+    if let lane, let conversationID = payload.conversationID,
+      isSidechatConversation(conversationID, on: lane)
+    {
+      guard registration.enabled || registration.hasSidechatOverrides(lane) else { return false }
+      return activeSidechat != ScopedEntityID(profile: lane, item: conversationID)
+    }
+    return presents(payload.origin)
   }
 
   func presents(_ origin: AlertOrigin?) -> Bool {
@@ -182,19 +241,24 @@ public final class AppNotifications: NSObject {
     await registration.start()
   }
 
-  nonisolated static func origin(_ userInfo: [AnyHashable: Any]) -> AlertOrigin? {
+  nonisolated static func payload(_ userInfo: [AnyHashable: Any]) -> AlertPayload? {
     guard var agent = userInfo["agent"] as? [String: Any] else { return nil }
     let key = agent.removeValue(forKey: "installation_id")
     guard JSONSerialization.isValidJSONObject(agent),
       let data = try? JSONSerialization.data(withJSONObject: agent),
-      (try? JSONDecoder().decode(NotificationTarget.self, from: data)) != nil
+      let target = try? JSONDecoder().decode(NotificationTarget.self, from: data)
     else { return nil }
-    switch key {
-    case .none, .some(is NSNull): return .unnamed
-    case .some(let wire as String):
-      return ProfileID(wire: wire).map(AlertOrigin.named) ?? .malformed
-    case .some: return .malformed
-    }
+    let origin: AlertOrigin =
+      switch key {
+      case .none, .some(is NSNull): .unnamed
+      case .some(let wire as String): ProfileID(wire: wire).map(AlertOrigin.named) ?? .malformed
+      case .some: .malformed
+      }
+    return AlertPayload(origin: origin, conversationID: target.conversationId)
+  }
+
+  nonisolated static func origin(_ userInfo: [AnyHashable: Any]) -> AlertOrigin? {
+    payload(userInfo)?.origin
   }
 }
 
@@ -231,9 +295,9 @@ public final class AppNotifications: NSObject {
       withCompletionHandler completionHandler:
         @escaping @Sendable (UNNotificationPresentationOptions) -> Void
     ) {
-      let origin = Self.origin(notification.request.content.userInfo)
+      let payload = Self.payload(notification.request.content.userInfo)
       DispatchQueue.main.async {
-        let presents = (try? self.receiver())?.presents(origin) ?? false
+        let presents = (try? self.receiver())?.presents(payload: payload) ?? false
         completionHandler(presents ? [.banner, .sound] : [])
       }
     }
@@ -243,9 +307,9 @@ public final class AppNotifications: NSObject {
       didReceive response: UNNotificationResponse,
       withCompletionHandler completionHandler: @escaping @Sendable () -> Void
     ) {
-      let origin = Self.origin(response.notification.request.content.userInfo)
+      let payload = Self.payload(response.notification.request.content.userInfo)
       DispatchQueue.main.async {
-        if let origin { try? self.receiver().open(origin) }
+        if let payload { try? self.receiver().open(payload) }
         completionHandler()
       }
     }

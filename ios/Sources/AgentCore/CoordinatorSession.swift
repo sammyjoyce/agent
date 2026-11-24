@@ -63,6 +63,8 @@ public struct ChatSnapshot: Sendable {
   public var activeWorkSupported = false
   public var dreamsSupported = false
   public var taskGraph: TaskGraphSnapshot?
+  public var sidechatsSupported = false
+  public var sidechat: SidechatSummary?
   public var settings: NativeSettingsSnapshot?
   public var error: String?
   /// The coordinator this profile's address answers as, while that is not its pin. The session
@@ -260,6 +262,14 @@ public actor CoordinatorSession {
   private let attachments: AttachmentStore
   private let previews: AttachmentStore
   private let inspectedConversation: SavedConversation?
+  private let sidechatTarget: SidechatSummary?
+  /// True when the owning coordinator advertised `sidechats` (which also added optional
+  /// `conversation_id` on `tool_details`), preventing unknown-field disconnects against older
+  /// coordinators during read-only inspection of saved conversations without a task.
+  private let supportsConversationToolDetails: Bool
+  private var activeConversationID: String? {
+    sidechatTarget?.conversationId ?? inspectedConversation?.conversationId
+  }
   private let stamps: StampSource
   private var ledger: Ledger
   /// true while the saved ledger exists but could not be read, as after a launch while the iPhone
@@ -270,6 +280,8 @@ public actor CoordinatorSession {
   private struct WeakSession { weak var session: CoordinatorSession? }
   /// The inspections this session minted. Their screens own them, and this session ends them.
   private var inspectors: [WeakSession] = []
+  /// Live side chat sessions keyed by conversation ID so two views never touch one outbox at once.
+  private var sidechatSessions: [String: WeakSession] = [:]
   private var liveInspectors: [CoordinatorSession] { inspectors.compactMap { $0.session } }
 
   /// Every socket reaches `address` and must name `pin`. A profile without a pin has no session.
@@ -281,28 +293,62 @@ public actor CoordinatorSession {
     self.init(
       directory: directory,
       dialer: CoordinatorDialer(address: address, pin: pin, transport: transport), stamps: stamps,
-      inspecting: nil)
+      inspecting: nil, sidechat: nil, supportsConversationToolDetails: false)
   }
   /// A read-only session for one saved conversation on this session's coordinator, or nil once
-  /// this session is retired or is itself an inspection. Its sockets prove the same pinned
-  /// coordinator, and it never reads or writes the profile's outbox or ledger. This session's
-  /// connect, disconnect and retire carry over to it.
+  /// this session is retired or is itself an inspection or side chat. Its sockets prove the same
+  /// pinned coordinator, and it never reads or writes the profile's outbox or ledger. This
+  /// session's connect, disconnect and retire carry over to it.
   public func inspector(_ conversation: SavedConversation) -> CoordinatorSession? {
-    guard !retired, inspectedConversation == nil else { return nil }
+    guard !retired, inspectedConversation == nil, sidechatTarget == nil else { return nil }
     inspectors.removeAll { $0.session == nil }
     let inspector = CoordinatorSession(
-      directory: directory, dialer: dialer, stamps: stamps, inspecting: conversation)
+      directory: directory, dialer: dialer, stamps: stamps, inspecting: conversation, sidechat: nil,
+      supportsConversationToolDetails: snapshot.sidechatsSupported)
     inspectors.append(WeakSession(session: inspector))
     return inspector
   }
+  /// An interactive session for one standing side chat on this session's coordinator, or nil once
+  /// this session is retired or is itself an inspection or side chat. Its sockets prove the same
+  /// pinned coordinator, and its outbox, attachments and ledger live in a subfolder under this
+  /// profile's directory so they never mix with Main. This session's connect, disconnect and retire
+  /// carry over to it.
+  public func sidechatSession(_ summary: SidechatSummary) async -> CoordinatorSession? {
+    guard !retired, inspectedConversation == nil, sidechatTarget == nil else { return nil }
+    inspectors.removeAll { $0.session == nil }
+    if let previous = sidechatSessions.removeValue(forKey: summary.conversationId)?.session {
+      await previous.retire()
+      inspectors.removeAll { $0.session === previous || $0.session == nil }
+    }
+    guard !retired else { return nil }
+    let session = CoordinatorSession(
+      directory: directory.sidechat(summary.conversationId), dialer: dialer, stamps: stamps,
+      inspecting: nil, sidechat: summary, supportsConversationToolDetails: true)
+    let weakRef = WeakSession(session: session)
+    inspectors.append(weakRef)
+    sidechatSessions[summary.conversationId] = weakRef
+    return session
+  }
+
+  /// Keeps a side chat session's cached metadata in sync after a local settings save so later
+  /// transcript or streaming snapshots never overwrite the updated summary.
+  public func updateActiveSidechat(_ summary: SidechatSummary) {
+    guard sidechatTarget?.conversationId == summary.conversationId else { return }
+    snapshot.sidechat = summary
+    publish()
+  }
   private init(
     directory: ProfileDirectory, dialer: CoordinatorDialer, stamps: StampSource,
-    inspecting conversation: SavedConversation?
+    inspecting conversation: SavedConversation?, sidechat: SidechatSummary?,
+    supportsConversationToolDetails: Bool
   ) {
     self.directory = directory
     profile = directory.profile
     self.dialer = dialer
     inspectedConversation = conversation
+    sidechatTarget = sidechat
+    self.supportsConversationToolDetails = supportsConversationToolDetails
+    snapshot.sidechat = sidechat
     attachments = AttachmentStore(directory: directory.outboxAttachments)
     previews = AttachmentStore(directory: directory.previews)
     self.stamps = stamps
@@ -406,6 +452,7 @@ public actor CoordinatorSession {
     retired = true
     let satellites = liveInspectors
     inspectors = []
+    sidechatSessions = [:]
     await disconnect(generation: UUID())
     for inspector in satellites { await inspector.retire() }
     return cancelled
@@ -485,8 +532,9 @@ public actor CoordinatorSession {
       publish()
       return nil
     }
-    let feedback = text.split(whereSeparator: \.isWhitespace).first == "/feedback"
-    let control = Self.isControlInput(text)
+    let feedback =
+      sidechatTarget == nil && text.split(whereSeparator: \.isWhitespace).first == "/feedback"
+    let control = sidechatTarget == nil && Self.isControlInput(text)
     guard files.isEmpty || !control || feedback else {
       snapshot.error = "Files can be sent with messages or /feedback."
       publish()
@@ -574,7 +622,7 @@ public actor CoordinatorSession {
 
   /// What this phone holds of earlier Siri copies of `message`.
   public func siriEarlier(_ message: SiriMessage) throws(SiriNotSent) -> SiriEarlier {
-    guard !retired, inspectedConversation == nil else { throw .removed }
+    guard !retired, inspectedConversation == nil, sidechatTarget == nil else { throw .removed }
     guard loadOutbox() else { throw .outboxUnreadable }
     return .find(message, pending: pending, receipts: siriReceipts, now: Date())
   }
@@ -588,7 +636,9 @@ public actor CoordinatorSession {
     _ message: SiriMessage, confirmed: SiriEarlier, newInputID: String,
     until deadline: ContinuousClock.Instant
   ) async -> SiriSendResult {
-    guard !retired, inspectedConversation == nil else { return .notSent(.unanswered) }
+    guard !retired, inspectedConversation == nil, sidechatTarget == nil else {
+      return .notSent(.unanswered)
+    }
     let inputID: String
     var copy: NativeRequestSubmit?
     switch confirmed {
@@ -655,7 +705,9 @@ public actor CoordinatorSession {
     _ message: SiriMessage, inputID: String, limits: VoiceTurnLimits = .car
   ) async throws(CancellationError) -> VoiceReply {
     guard !Task.isCancelled else { throw CancellationError() }
-    guard !retired, inspectedConversation == nil else { return .notSent(.removed) }
+    guard !retired, inspectedConversation == nil, sidechatTarget == nil else {
+      return .notSent(.removed)
+    }
     guard snapshot.connection == .connected else { return .notSent(.unanswered) }
     guard accepts(.carplay) else { return .notSent(.notAdvertised) }
     guard actions.count < 32, voiceTickets[inputID] == nil else { return .notSent(.busy) }
@@ -684,6 +736,17 @@ public actor CoordinatorSession {
     for wait in voiceTickets.values { wait.ticket.hear(word) }
   }
 
+  private func submitRequest(for request: NativeRequestSubmit) -> NativeRequest {
+    if let sidechatTarget {
+      return .sidechatInput(
+        .init(
+          attachments: request.attachments, conversationId: sidechatTarget.conversationId,
+          inputId: request.inputId, mode: request.mode, origin: request.origin,
+          replyTo: request.replyTo, text: request.text))
+    }
+    return .submit(request)
+  }
+
   /// Sends a staged input on this coordinator's own verified socket. While this lane is not
   /// connected, a durable one waits and goes once it connects. One this session is too busy to
   /// send stays queued as unconfirmed, for Check.
@@ -709,9 +772,9 @@ public actor CoordinatorSession {
       return .started
     }
     if let control = staged.control {
-      perform(.submit(control), sending: staged)
+      perform(submitRequest(for: control), sending: staged)
     } else if let item = pending.first(where: { $0.request.inputId == staged.inputID }) {
-      perform(.submit(item.request), inputID: staged.inputID, sending: staged)
+      perform(submitRequest(for: item.request), inputID: staged.inputID, sending: staged)
     }
     snapshot.error = nil
     publish()
@@ -784,7 +847,7 @@ public actor CoordinatorSession {
     else { return nil }
     unsent[inputID] = nil
     transcript.delivery(inputID, .sending)
-    let action = perform(.submit(item.request), inputID: inputID)
+    let action = perform(submitRequest(for: item.request), inputID: inputID)
     publish()
     return action
   }
@@ -925,8 +988,7 @@ public actor CoordinatorSession {
       transcript.beginLatestHistory(id)
       await exchange(
         id: id,
-        request: .history(
-          .init(conversationId: inspectedConversation?.conversationId, cursor: nil)),
+        request: .history(.init(conversationId: activeConversationID, cursor: nil)),
         inputID: nil, generation: generation)
     }
   }
@@ -950,8 +1012,7 @@ public actor CoordinatorSession {
       guard
         let page = await exchange(
           id: id,
-          request: .history(
-            .init(conversationId: inspectedConversation?.conversationId, cursor: cursor)),
+          request: .history(.init(conversationId: activeConversationID, cursor: cursor)),
           inputID: nil, generation: generation)
       else { return }
       rows += page.rows
@@ -968,7 +1029,11 @@ public actor CoordinatorSession {
     }
   }
   public func interrupt() {
-    if inspectedConversation == nil, actions.count < 32, snapshot.connection == .connected {
+    guard inspectedConversation == nil, actions.count < 32, snapshot.connection == .connected
+    else { return }
+    if let sidechatTarget {
+      perform(.sidechatInterrupt(.init(conversationId: sidechatTarget.conversationId)))
+    } else {
       perform(.interrupt)
     }
   }
@@ -995,6 +1060,9 @@ public actor CoordinatorSession {
         let request: NativeRequest =
           if let inspectedConversation {
             .inspect(.init(conversationId: inspectedConversation.conversationId))
+          } else if let sidechatTarget {
+            .observeSidechat(
+              .init(conversationId: sidechatTarget.conversationId, inputIds: watched))
           } else {
             .observe(
               .init(
@@ -1019,6 +1087,11 @@ public actor CoordinatorSession {
           }
           if case .ready(let value) = event {
             ready = true
+            if let sidechatTarget {
+              guard value.conversationId == sidechatTarget.conversationId else {
+                throw ConnectionError.incompleteFrame
+              }
+            }
             if let inspectedConversation {
               guard value.conversationId == inspectedConversation.conversationId else {
                 throw ConnectionError.incompleteFrame
@@ -1052,7 +1125,9 @@ public actor CoordinatorSession {
             snapshot.answeredAs = nil
             for item in pending where unsent[item.request.inputId] == .waiting {
               unsent[item.request.inputId] = nil
-              perform(.submit(item.request), inputID: item.request.inputId, sending: staged(item))
+              perform(
+                submitRequest(for: item.request), inputID: item.request.inputId,
+                sending: staged(item))
             }
           }
           if case .done = event { throw ConnectionError.closed }
@@ -1176,12 +1251,16 @@ public actor CoordinatorSession {
         return nil
       }
       actionConnections[id] = stream
-      if case .submit(let input) = request {
-        for reference in input.attachments ?? [] {
-          try Task.checkCancellation()
-          let file = try await attachments.local(reference)
-          try await upload(file, on: stream)
+      let uploadAttachments: [AttachmentRef] =
+        switch request {
+        case .submit(let input): input.attachments ?? []
+        case .sidechatInput(let input): input.attachments ?? []
+        default: []
         }
+      for reference in uploadAttachments {
+        try Task.checkCancellation()
+        let file = try await attachments.local(reference)
+        try await upload(file, on: stream)
       }
       try Task.checkCancellation()
       guard self.generation == generation else { throw CancellationError() }
@@ -1317,6 +1396,7 @@ public actor CoordinatorSession {
     snapshot.activeWorkSupported = false
     snapshot.dreamsSupported = false
     snapshot.taskGraph = nil
+    snapshot.sidechatsSupported = false
     snapshot.settings = nil
   }
 
@@ -1372,6 +1452,37 @@ public actor CoordinatorSession {
     return applied
   }
 
+  public func listSidechats(includeArchived: Bool = false) async throws -> [SidechatSummary] {
+    let event = try await sidechatControl(.listSidechats(.init(includeArchived: includeArchived)))
+    guard case .sidechats(let list) = event else { throw ConnectionError.incompleteFrame }
+    return list.items
+  }
+
+  public func createSidechat(_ request: NativeRequestCreateSidechat) async throws -> SidechatSummary
+  {
+    let event = try await sidechatControl(.createSidechat(request))
+    guard case .sidechat(let created) = event else { throw ConnectionError.incompleteFrame }
+    return created.sidechat
+  }
+
+  public func updateSidechat(_ request: NativeRequestUpdateSidechat) async throws -> SidechatSummary
+  {
+    let event = try await sidechatControl(.updateSidechat(request))
+    guard case .sidechat(let updated) = event else { throw ConnectionError.incompleteFrame }
+    if sidechatTarget?.conversationId == updated.sidechat.conversationId {
+      snapshot.sidechat = updated.sidechat
+      publish()
+    }
+    return updated.sidechat
+  }
+
+  private func sidechatControl(_ request: NativeRequest) async throws -> NativeEvent {
+    try await shortLivedControl(
+      request,
+      supported: snapshot.sidechatsSupported,
+      unsupportedMessage: "Update the coordinator to use side chats.")
+  }
+
   /// Each control owns a short-lived socket. It never enters the composer outbox
   /// or publishes control responses into the observed conversation.
   private func workControl(_ request: NativeRequest) async throws -> NativeEvent {
@@ -1419,7 +1530,7 @@ public actor CoordinatorSession {
           case .notice(let notice) where notice.jobStatus != nil:
             guard result == nil else { throw ConnectionError.incompleteFrame }
             result = event
-          case .conversations, .dreamsList, .dreamsShow, .dreamsApplied:
+          case .conversations, .dreamsList, .dreamsShow, .dreamsApplied, .sidechat, .sidechats:
             guard result == nil else { throw ConnectionError.incompleteFrame }
             result = event
           case .done:
@@ -1465,7 +1576,11 @@ public actor CoordinatorSession {
     actionConnections[id] = stream
     return try await withTaskCancellationHandler {
       do {
-        try await timedSend(stream, .settings(.init(catalog: catalog, change: change)))
+        try await timedSend(
+          stream,
+          .settings(
+            .init(
+              catalog: catalog, change: change, conversationId: sidechatTarget?.conversationId)))
         var result: NativeSettingsSnapshot?
         while true {
           let event = try await timedNext(stream)
@@ -1553,7 +1668,11 @@ public actor CoordinatorSession {
         .toolDetails(
           .init(
             agentId: inspectedConversation?.agentId,
-            callId: callID, entryId: entryID, taskId: inspectedConversation?.taskId)))
+            callId: callID,
+            conversationId: sidechatTarget?.conversationId
+              ?? (supportsConversationToolDetails && inspectedConversation?.taskId == nil
+                ? inspectedConversation?.conversationId : nil),
+            entryId: entryID, taskId: inspectedConversation?.taskId)))
       var details: ToolDetails?
       while true {
         let event = try await timedNext(stream)
@@ -1663,6 +1782,8 @@ public actor CoordinatorSession {
       snapshot.workInspectionSupported = value.workInspection == true
       snapshot.activeWorkSupported = value.activeWork == true
       snapshot.dreamsSupported = value.dreams == true
+      snapshot.sidechatsSupported = value.sidechats == true
+      if let sidechat = value.sidechat { snapshot.sidechat = sidechat }
       snapshot.model = value.model
       snapshot.busy = value.working ?? true
     case .taskGraph(let value):
@@ -1708,6 +1829,10 @@ public actor CoordinatorSession {
       snapshot.busy = true
       transcript.activity(value.activity)
     case .accepted(let value):
+      if sidechatTarget != nil, var sidechat = snapshot.sidechat, sidechat.archivedAt != nil {
+        sidechat.archivedAt = nil
+        snapshot.sidechat = sidechat
+      }
       if mark(value.inputId, refused: false, accepted: true) == .queued {
         transcript.work(value.inputId, value.work)
       }
@@ -1716,6 +1841,10 @@ public actor CoordinatorSession {
       tellVoice(value.inputId, .delivered)
       if let word = InputWord(value.work) { tellVoice(value.inputId, word) }
     case .placed(let value):
+      if sidechatTarget != nil, var sidechat = snapshot.sidechat, sidechat.archivedAt != nil {
+        sidechat.archivedAt = nil
+        snapshot.sidechat = sidechat
+      }
       answerSiri(value.inputId, .delivered)
       tellVoice(value.inputId, .delivered)
       mark(value.inputId, refused: false, accepted: true)
@@ -1754,7 +1883,7 @@ public actor CoordinatorSession {
       transcript.idle()
     // `VerifiedConnection` fails a socket that repeats `identity`, so it never arrives here.
     case .attachment, .toolDetails, .conversations, .dreamsList, .dreamsShow, .dreamsApplied,
-      .notifications, .serviceStatus, .disconnect, .done, .identity:
+      .sidechat, .sidechats, .notifications, .serviceStatus, .disconnect, .done, .identity:
       break
     }
     switch event {

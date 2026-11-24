@@ -64,6 +64,11 @@ pub enum NotificationRequest {
     Register {
         installation_id: String,
         token: String,
+        /// When `Some(false)`, keeps the token registered for sidechats with
+        /// explicit `on` alerts while muting Main and `inherit` sidechats.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        main_enabled: Option<bool>,
     },
     Unregister {
         installation_id: String,
@@ -101,6 +106,10 @@ impl NotificationRequest {
 pub struct NotificationStatus {
     pub configured: bool,
     pub registered: bool,
+    /// Present when the coordinator tracks Main vs. sidechat alert overrides separately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub main_enabled: Option<bool>,
 }
 
 /// Routing identity; the bounded reply preview travels in APNs' native alert.
@@ -150,6 +159,7 @@ mod tests {
         let request = NotificationRequest::Register {
             installation_id,
             token: "01ab".repeat(24),
+            main_enabled: None,
         };
         request.validate().unwrap();
         let decoded: NotificationRequest =
@@ -159,6 +169,7 @@ mod tests {
             NotificationRequest::Register {
                 installation_id: uuid::Uuid::new_v4().to_string(),
                 token: "invalid token".into(),
+                main_enabled: None,
             }
             .validate()
             .is_err()
@@ -202,6 +213,7 @@ mod tests {
             status: NotificationStatus {
                 configured: true,
                 registered: false,
+                main_enabled: None,
             },
         });
         assert!(
@@ -216,5 +228,20 @@ mod tests {
             })
             .is_err()
         );
+        let register = NotificationRequest::Register {
+            installation_id: uuid::Uuid::new_v4().to_string(),
+            token: "01ab".repeat(24),
+            main_enabled: Some(false),
+        };
+        register.validate().unwrap();
+        let round_trip: NotificationRequest =
+            serde_json::from_slice(&serde_json::to_vec(&register).unwrap()).unwrap();
+        assert!(matches!(
+            round_trip,
+            NotificationRequest::Register {
+                main_enabled: Some(false),
+                ..
+            }
+        ));
     }
 }

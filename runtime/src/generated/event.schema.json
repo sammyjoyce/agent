@@ -126,6 +126,12 @@
         "is_job": {
           "type": "boolean"
         },
+        "sidechat_slug": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "started_at": {
           "type": [
             "integer",
@@ -4672,6 +4678,13 @@
         "configured": {
           "type": "boolean"
         },
+        "main_enabled": {
+          "description": "Present when the coordinator tracks Main vs. sidechat alert overrides separately.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "registered": {
           "type": "boolean"
         }
@@ -5262,6 +5275,41 @@
         {
           "type": "object",
           "properties": {
+            "sidechat": {
+              "$ref": "#/$defs/SidechatSummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "sidechat"
+            }
+          },
+          "required": [
+            "type",
+            "sidechat"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "items": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SidechatSummary"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "sidechats"
+            }
+          },
+          "required": [
+            "type",
+            "items"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "type": {
               "type": "string",
               "const": "configured"
@@ -5671,6 +5719,13 @@
             "model": {
               "$ref": "#/$defs/ModelSelection"
             },
+            "sidechats": {
+              "description": "Missing on legacy runtimes; native clients gate standing side chats per connection.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
             "type": {
               "type": "string",
               "const": "main_ready"
@@ -5681,6 +5736,60 @@
             "conversation_id",
             "model",
             "cwd"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "accepted_input_origins": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/AcceptedInputOrigins"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "conversation_id": {
+              "type": "string"
+            },
+            "conversation_settings": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "cwd": {
+              "type": "string"
+            },
+            "input_origins": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "model": {
+              "$ref": "#/$defs/ModelSelection"
+            },
+            "sidechat": {
+              "$ref": "#/$defs/SidechatSummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "sidechat_ready"
+            },
+            "working": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "type",
+            "conversation_id",
+            "sidechat",
+            "model",
+            "cwd",
+            "working"
           ]
         },
         {
@@ -6122,6 +6231,13 @@
         "cwd": {
           "type": "string"
         },
+        "delivery_sidechat": {
+          "description": "Optional target side chat (by slug or conversation ID) where job\nbriefings and updates land instead of Main.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "id": {
           "$ref": "#/$defs/JobId"
         },
@@ -6218,6 +6334,91 @@
         "job",
         "schedule_id",
         "scheduled_at"
+      ]
+    },
+    "SidechatNotificationPreference": {
+      "description": "Per-sidechat APNs push notification override.",
+      "oneOf": [
+        {
+          "description": "Follow the device's Main chat notification preference.",
+          "type": "string",
+          "const": "inherit"
+        },
+        {
+          "description": "Always push alerts for this side chat while the device has push permission.",
+          "type": "string",
+          "const": "on"
+        },
+        {
+          "description": "Suppress push alerts for this side chat even when Main alerts are enabled.",
+          "type": "string",
+          "const": "off"
+        }
+      ]
+    },
+    "SidechatSummary": {
+      "description": "Durable metadata for a standing topic side chat.",
+      "type": "object",
+      "properties": {
+        "archived_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "charter": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "conversation_id": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "isolated": {
+          "type": "boolean",
+          "default": false
+        },
+        "notifications": {
+          "$ref": "#/$defs/SidechatNotificationPreference",
+          "default": "inherit"
+        },
+        "pinned": {
+          "type": "boolean"
+        },
+        "seed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReplyReference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "slug": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "conversation_id",
+        "slug",
+        "title",
+        "pinned",
+        "created_at",
+        "updated_at"
       ]
     },
     "SourceCheckpoint": {
@@ -6855,7 +7056,7 @@
           ]
         },
         {
-          "description": "No task or agent owns it, as with source triage.",
+          "description": "No task or agent owns it, as with source triage or standing side chats\n(side chats carry additional metadata in `TaskGraphConversation::sidechat`).",
           "type": "object",
           "properties": {
             "type": {
@@ -6898,6 +7099,16 @@
         },
         "conversation_id": {
           "type": "string"
+        },
+        "sidechat": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskGraphSidechat"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -7050,6 +7261,22 @@
         "aborted",
         "orphaned",
         "faulted"
+      ]
+    },
+    "TaskGraphSidechat": {
+      "description": "Metadata identifying a standing topic side chat in a `TaskGraphConversation`.\n\nCarried as an optional field on `TaskGraphConversation` (with `actor: TaskGraphActor::Other`)\nrather than a new closed `TaskGraphActor` enum variant so older native and CLI clients continue\ndecoding task-graph snapshots without error while a side chat turn is running.",
+      "type": "object",
+      "properties": {
+        "slug": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "slug",
+        "title"
       ]
     },
     "TaskGraphSnapshot": {
@@ -7321,6 +7548,13 @@
         },
         "conversation_id": {
           "type": "string"
+        },
+        "delivery_conversation_id": {
+          "description": "Optional side chat conversation ID where routine task updates and job\nbriefings land instead of Main.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "id": {
           "$ref": "#/$defs/TaskId"

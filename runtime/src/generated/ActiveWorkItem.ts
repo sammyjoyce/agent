@@ -3,4 +3,4 @@ import type { ActiveWorkChild } from "./ActiveWorkChild.js";
 import type { ActiveWorkStatus } from "./ActiveWorkStatus.js";
 import type { TaskId } from "./TaskId.js";
 
-export type ActiveWorkItem = { id: string, task_id?: TaskId, conversation_id: string, title: string, status: ActiveWorkStatus, host?: string, is_job: boolean, detail?: string, started_at?: number, tools?: Array<string>, children?: Array<ActiveWorkChild>, };
+export type ActiveWorkItem = { id: string, task_id?: TaskId, conversation_id: string, title: string, status: ActiveWorkStatus, host?: string, is_job: boolean, sidechat_slug?: string, detail?: string, started_at?: number, tools?: Array<string>, children?: Array<ActiveWorkChild>, };

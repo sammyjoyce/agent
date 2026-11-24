@@ -16,7 +16,7 @@ use crate::{
     host::effects::{Admission, Capacity, HostEffects},
     native::{NativeEvent, NativeRequest},
     protocol::{CoordinatorBootstrap, RuntimeCommand, RuntimeEventKind},
-    runtime::lifecycle::RequestLifecycle,
+    runtime::lifecycle::{RequestLifecycle, View},
 };
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
@@ -532,7 +532,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         };
         return write_client_frame(&mut writer, &refusal, &runtime).await;
     }
-    if native && lifecycle.is_view() {
+    if native && matches!(lifecycle, RequestLifecycle::View(View::MainObserver)) {
         write_client_frame(
             &mut writer,
             &crate::native::NativeEvent::Commands {
@@ -2359,7 +2359,7 @@ mod tests {
             let script = state.join("fixture.mjs");
             fs::write(
                 &script,
-                "import readline from 'node:readline';\nconst rl = readline.createInterface({ input: process.stdin });\nrl.on('line', (line) => {\n  const req = JSON.parse(line);\n  if (req.command.type === 'configure_coordinator' || req.command.type === 'set_connected_nodes' || req.command.type === 'run_background') {\n    process.stdout.write(JSON.stringify({ version: 1, id: req.id, event: { type: 'done' } }) + '\\n');\n  } else if (req.command.type === 'observe_main') {\n    process.stdout.write(JSON.stringify({ version: 1, id: req.id, event: { type: 'main_ready', conversation_id: '1', cwd: '/', model: { provider: 'openai', model_id: 'fixture', reasoning: null, fast: false } } }) + '\\n');\n    process.stdout.write(JSON.stringify({ version: 1, id: req.id, event: { type: 'worker_idle' } }) + '\\n');\n  } else if (req.command.type === 'read_task_graph') {\n    process.stdout.write(JSON.stringify({ version: 1, id: req.id, event: { type: 'task_graph', graph: { nodes: [], conversations: [], omitted: 0, work: [] } } }) + '\\n');\n    process.stdout.write(JSON.stringify({ version: 1, id: req.id, event: { type: 'done' } }) + '\\n');\n  } else {\n    process.stderr.write('UNEXPECTED_RUNTIME_COMMAND:' + req.command.type + '\\n');\n  }\n});\n",
+                "import readline from 'node:readline';\nconst rl = readline.createInterface({ input: process.stdin });\nrl.on('line', (line) => {\n  const req = JSON.parse(line);\n  if (req.command.type === 'configure_coordinator' || req.command.type === 'set_connected_nodes' || req.command.type === 'run_background') {\n    process.stdout.write(JSON.stringify({ version: 1, id: req.id, event: { type: 'done' } }) + '\\n');\n  } else if (req.command.type === 'observe_main') {\n    process.stdout.write(JSON.stringify({ version: 1, id: req.id, event: { type: 'main_ready', conversation_id: '1', cwd: '/', model: { provider: 'openai', model_id: 'fixture', reasoning: null, fast: false } } }) + '\\n');\n    process.stdout.write(JSON.stringify({ version: 1, id: req.id, event: { type: 'worker_idle' } }) + '\\n');\n  } else if (req.command.type === 'observe_sidechat') {\n    process.stdout.write(JSON.stringify({ version: 1, id: req.id, event: { type: 'sidechat_ready', conversation_id: req.command.conversation_id, sidechat: { conversation_id: req.command.conversation_id, slug: 'morning-brief', title: 'Morning Brief', pinned: false, isolated: false, notifications: 'inherit', created_at: 100, updated_at: 200 }, cwd: '/', model: { provider: 'openai', model_id: 'fixture', reasoning: null, fast: false }, working: false } }) + '\\n');\n    process.stdout.write(JSON.stringify({ version: 1, id: req.id, event: { type: 'worker_idle' } }) + '\\n');\n  } else if (req.command.type === 'read_task_graph') {\n    process.stdout.write(JSON.stringify({ version: 1, id: req.id, event: { type: 'task_graph', graph: { nodes: [], conversations: [], omitted: 0, work: [] } } }) + '\\n');\n    process.stdout.write(JSON.stringify({ version: 1, id: req.id, event: { type: 'done' } }) + '\\n');\n  } else {\n    process.stderr.write('UNEXPECTED_RUNTIME_COMMAND:' + req.command.type + '\\n');\n  }\n});\n",
             )
             .unwrap();
             let (stop, stopped) = oneshot::channel::<()>();
@@ -2764,6 +2764,48 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], NativeEvent::TaskGraph { .. }));
         assert!(matches!(events[1], NativeEvent::Done));
+
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn native_observe_sidechat_does_not_emit_main_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let service = BoundaryService::start(state, None).await;
+
+        let mut sock = service.connect().await;
+        write_frame(
+            &mut sock,
+            &RuntimeCommand::Native {
+                request: NativeRequest::ObserveSidechat {
+                    conversation_id: "7".into(),
+                    input_ids: vec![],
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let (read, _write) = sock.into_split();
+        let mut reader = FrameReader::new(BufReader::new(read));
+        let first = timeout(TEST_HANG_LIMIT, reader.next_frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let event: NativeEvent = serde_json::from_slice(&first).unwrap();
+        assert!(
+            matches!(
+                event,
+                NativeEvent::Ready {
+                    sidechat: Some(_),
+                    ..
+                }
+            ),
+            "Sidechat observers must receive Ready first without Main slash commands; got {event:?}"
+        );
+        drop(_write);
+        drop(reader);
 
         service.shutdown().await;
     }

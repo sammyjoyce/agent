@@ -12,8 +12,32 @@ use ratatui::{
 use ratatui_textarea::TextArea;
 use tokio::sync::oneshot;
 
+pub(super) struct PickerLabels {
+    pub(super) heading: &'static str,
+    pub(super) placeholder: &'static str,
+    pub(super) empty: &'static str,
+    pub(super) enter_action: &'static str,
+}
+
+impl PickerLabels {
+    pub(super) const CONVERSATIONS: Self = Self {
+        heading: "Resume conversation",
+        placeholder: "Conversation title or ID",
+        empty: "No matching conversations",
+        enter_action: "resume",
+    };
+
+    pub(super) const SIDECHATS: Self = Self {
+        heading: "Side chats",
+        placeholder: "Side chat title or slug",
+        empty: "No matching side chats",
+        enter_action: "open",
+    };
+}
+
 pub(super) struct ConversationPicker {
     choices: Vec<SavedConversation>,
+    labels: PickerLabels,
     query: TextArea<'static>,
     filtered: Vec<usize>,
     list: ListState,
@@ -24,14 +48,16 @@ impl ConversationPicker {
     pub(super) fn new(
         choices: Vec<SavedConversation>,
         query: String,
+        labels: PickerLabels,
         reply: oneshot::Sender<Option<String>>,
     ) -> Self {
         let mut editor = editor();
         editor.insert_str(query);
         editor.set_block(Block::default().padding(Padding::new(2, 1, 1, 1)));
-        editor.set_placeholder_text("Conversation title or ID");
+        editor.set_placeholder_text(labels.placeholder);
         let mut picker = Self {
             choices,
+            labels,
             query: editor,
             filtered: Vec::new(),
             list: ListState::default(),
@@ -141,7 +167,7 @@ impl ConversationPicker {
         .split(area);
         frame.render_widget(
             Line::styled(
-                "Resume conversation",
+                self.labels.heading,
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             areas[0],
@@ -153,22 +179,23 @@ impl ConversationPicker {
             .and_then(|time| i64::try_from(time.as_millis()).ok());
         self.page = (usize::from(areas[2].height) / 2).max(1);
         if self.filtered.is_empty() {
-            frame.render_widget(Paragraph::new("No matching conversations"), areas[2]);
+            frame.render_widget(Paragraph::new(self.labels.empty), areas[2]);
         } else {
             let items = self
                 .filtered
                 .iter()
                 .map(|index| {
                     let choice = &self.choices[*index];
+                    let title = crate::sidechats::sanitize_terminal_text(&choice.title);
                     let detail = choice
                         .host
                         .iter()
-                        .cloned()
+                        .map(|host| crate::sidechats::sanitize_terminal_text(host))
                         .chain(age(choice.updated_at, now))
                         .collect::<Vec<_>>()
                         .join(" · ");
                     ListItem::new(vec![
-                        Line::raw(choice.title.clone()),
+                        Line::raw(title),
                         Line::styled(detail, Style::default().add_modifier(Modifier::DIM)),
                     ])
                 })
@@ -184,7 +211,10 @@ impl ConversationPicker {
         frame.render_widget(
             Line::from(vec![
                 Span::styled("↑↓", Style::default().add_modifier(Modifier::DIM)),
-                Span::raw(" choose · Enter resume · Esc cancel"),
+                Span::raw(format!(
+                    " choose · Enter {} · Esc cancel",
+                    self.labels.enter_action
+                )),
             ]),
             areas[3],
         );
@@ -213,7 +243,7 @@ fn age(timestamp: Option<i64>, now: Option<i64>) -> Option<String> {
 mod tests {
     use crate::{
         protocol::SavedConversation,
-        tui::conversations::{ConversationPicker, age},
+        tui::conversations::{ConversationPicker, PickerLabels, age},
     };
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend};
@@ -240,7 +270,12 @@ mod tests {
     #[test]
     fn picker_filters_native_rows_and_returns_the_selected_existing_identity() {
         let (reply, mut selected) = tokio::sync::oneshot::channel();
-        let mut picker = ConversationPicker::new(choices(), "board".into(), reply);
+        let mut picker = ConversationPicker::new(
+            choices(),
+            "board".into(),
+            PickerLabels::CONVERSATIONS,
+            reply,
+        );
         let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
         terminal
             .draw(|frame| picker.draw(frame, frame.area()))
@@ -269,7 +304,12 @@ mod tests {
     #[test]
     fn empty_picker_does_not_select_another_conversation_and_escape_cancels() {
         let (reply, mut selected) = tokio::sync::oneshot::channel();
-        let mut picker = ConversationPicker::new(choices(), "missing".into(), reply);
+        let mut picker = ConversationPicker::new(
+            choices(),
+            "missing".into(),
+            PickerLabels::CONVERSATIONS,
+            reply,
+        );
         assert!(!picker.input(Event::Key(KeyEvent::new(
             KeyCode::Enter,
             KeyModifiers::NONE
@@ -289,5 +329,38 @@ mod tests {
             age(Some(3_600_001), Some(3_600_000)).as_deref(),
             Some("now")
         );
+    }
+
+    #[test]
+    fn sidechat_picker_uses_sidechat_labels_and_strips_bidi_and_control_characters() {
+        let (reply, _selected) = tokio::sync::oneshot::channel();
+        let items = vec![SavedConversation {
+            conversation_id: "42".into(),
+            title: "Demo\u{202e}\x1b[31m Car\u{200b}".into(),
+            updated_at: None,
+            task_id: None,
+            agent_id: None,
+            host: Some("car\u{202e}".into()),
+            source_thread_id: Some("car".into()),
+        }];
+        let mut picker =
+            ConversationPicker::new(items, String::new(), PickerLabels::SIDECHATS, reply);
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        terminal
+            .draw(|frame| picker.draw(frame, frame.area()))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("Side chats"), "{text}");
+        assert!(text.contains("Enter open"), "{text}");
+        assert!(!text.contains("Resume conversation"), "{text}");
+        assert!(!text.contains('\u{202e}'), "{text}");
+        assert!(!text.contains('\u{200b}'), "{text}");
+        assert!(!text.contains('\x1b'), "{text}");
     }
 }

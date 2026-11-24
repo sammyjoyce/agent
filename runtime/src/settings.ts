@@ -4,11 +4,12 @@ import type { ConversationSettings } from "./generated/ConversationSettings.js";
 import type { RuntimeCommand } from "./generated/RuntimeCommand.js";
 import type { CoordinatorEnvironment } from "./environment.js";
 import { ModelError } from "./models.js";
+import type { SidechatStore } from "./sidechats.js";
 import type { TaskStore } from "./tasks.js";
 
 /** Local controls configure the existing conversation without submitting input. */
 export async function conversationSettings(tasks: TaskStore, environment: CoordinatorEnvironment,
-  command: Extract<RuntimeCommand, { type: "conversation_settings" }>): Promise<ConversationSettings> {
+  command: Extract<RuntimeCommand, { type: "conversation_settings" }>, sidechats?: SidechatStore): Promise<ConversationSettings> {
   if (command.task_id === null && command.agent_id !== null) throw new ModelError("Choose a task for agent settings.");
   let task = command.task_id === null ? undefined : await tasks.get(command.task_id);
   let agentId = command.agent_id;
@@ -18,7 +19,9 @@ export async function conversationSettings(tasks: TaskStore, environment: Coordi
     if (owner !== undefined) {
       task = owner; agentId = owner.conversation_id === command.conversation_id ? null
         : owner.agents.find((agent) => agent.conversation_id === command.conversation_id)?.id ?? null;
-    } else if (await tasks.saved(command.conversation_id) === undefined) throw new ModelError("Choose an existing saved conversation.");
+    } else if (await tasks.saved(command.conversation_id) === undefined && await sidechats?.get(command.conversation_id) === undefined) {
+      throw new ModelError("Choose an existing saved conversation.");
+    }
   }
   const actor = agentId === null ? task : task?.agents.find((agent) => agent.id === agentId);
   if (task !== undefined && actor === undefined) throw new ModelError("The task agent is unavailable.");

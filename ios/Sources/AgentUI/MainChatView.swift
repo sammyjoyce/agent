@@ -7,21 +7,46 @@ import UniformTypeIdentifiers
   import QuickLook
 #endif
 
-private struct OpenedJob: Hashable {
-  let job: ScopedEntityID
+private struct SidechatDestination: Hashable {
+  let target: ScopedEntityID
   let request: UUID
+  let initial: SidechatSummary?
+
+  static func == (lhs: Self, rhs: Self) -> Bool {
+    lhs.target == rhs.target && lhs.request == rhs.request
+  }
+  func hash(into hasher: inout Hasher) {
+    hasher.combine(target)
+    hasher.combine(request)
+  }
+}
+
+private enum OpenedDestination: Hashable {
+  case job(ScopedEntityID, request: UUID)
+  case sidechats(ProfileID?)
+  case sidechat(SidechatDestination)
+}
+
+private struct SidechatSeedTarget: Identifiable, Equatable {
+  let id = UUID()
+  let lane: ProfileID
+  let seed: ReplyReference
 }
 
 private enum PresentedSheet: Identifiable, Equatable {
   case settings
   case sourceDetails
   case activeWork
+  case sidechatSettings
+  case seedSidechat(SidechatSeedTarget)
 
   var id: String {
     switch self {
     case .settings: "settings"
     case .sourceDetails: "sourceDetails"
     case .activeWork: "activeWork"
+    case .sidechatSettings: "sidechatSettings"
+    case .seedSidechat(let target): "seedSidechat-\(target.id.uuidString)"
     }
   }
 }
@@ -33,13 +58,16 @@ public struct MainChatView: View {
   private let detailLoader: ToolDetailsLoader?
   private let initialScrollTarget: String?
   private let notifications: AppNotifications?
+  private let sidechatOwner: ChatModel?
+  private let sidechatLane: ProfileID?
+  private let sidechatNotifications: AppNotifications?
   private let relatedWork: [SavedConversation]
   private let inspectRelated: ((SavedConversation) -> Void)?
   private let dictation: Dictation?
   @Environment(\.dismiss) private var dismiss
   @FocusState private var composerFocused: Bool
   @State private var presentedSheet: PresentedSheet?
-  @State private var opened: [OpenedJob] = []
+  @State private var opened: [OpenedDestination] = []
   @State private var handledOpen: OpenRequest?
   @State private var followsLatest = true
   @State private var transcriptWidth: CGFloat = 0
@@ -69,6 +97,25 @@ public struct MainChatView: View {
     detailLoader = nil
     initialScrollTarget = nil
     self.notifications = notifications
+    sidechatOwner = nil
+    sidechatLane = nil
+    sidechatNotifications = nil
+    relatedWork = []
+    inspectRelated = nil
+    self.dictation = dictation
+  }
+  init(
+    sidechatModel: ChatModel, sidechatOwner: ChatModel, sidechatLane: ProfileID,
+    sidechatNotifications: AppNotifications? = nil, dictation: Dictation? = nil
+  ) {
+    _model = State(initialValue: sidechatModel)
+    coordinators = nil
+    detailLoader = nil
+    initialScrollTarget = nil
+    notifications = nil
+    self.sidechatOwner = sidechatOwner
+    self.sidechatLane = sidechatLane
+    self.sidechatNotifications = sidechatNotifications
     relatedWork = []
     inspectRelated = nil
     self.dictation = dictation
@@ -87,55 +134,48 @@ public struct MainChatView: View {
     detailLoader = details
     self.initialScrollTarget = initialScrollTarget
     notifications = nil
+    sidechatOwner = nil
+    sidechatLane = nil
+    sidechatNotifications = nil
     self.relatedWork = relatedWork
     self.inspectRelated = inspectRelated
     self.dictation = dictation
     _followsLatest = State(initialValue: initialScrollTarget == nil)
   }
   public var body: some View {
-    NavigationStack(path: $opened) {
-      chatBody
-        .navigationTitle("Beep Boop")
-        #if os(iOS)
-          .navigationBarTitleDisplayMode(.inline)
-          .toolbarBackground(Color(uiColor: .systemBackground), for: .navigationBar)
-          .toolbarBackground(.visible, for: .navigationBar)
-        #endif
-        .toolbar {
-          ToolbarItem(placement: .principal) {
-            if model.multiple && !inspecting {
-              ScopeMenu(model: model, badge: badge) { alertNotice = nil }
-            } else {
-              VStack(spacing: 1) {
-                Text(model.inspectedConversation?.title ?? "Beep Boop").font(.headline)
-                  .lineLimit(1)
-                Text(model.model.split(separator: "/").last.map(String.init) ?? model.model)
-                  .font(.caption).foregroundStyle(.primary.opacity(0.65)).lineLimit(1)
-              }.accessibilityElement(children: .combine)
-            }
-          }
-          ToolbarItem(placement: .primaryAction) {
-            if inspecting {
-              Button("Done") { dismiss() }.accessibilityIdentifier("closeWorkInspection")
-            } else {
-              Button("Connection", systemImage: "slider.horizontal.3") {
-                composerFocused = false
-                #if os(iOS)
-                  // The iOS draft is a UIKit text view, which focus state does not reach.
-                  UIApplication.shared.sendAction(
-                    #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-                #endif
-                presentedSheet = .settings
+    Group {
+      if model.activeSidechat != nil {
+        chatBody
+      } else {
+        NavigationStack(path: $opened) {
+          chatBody
+            .navigationDestination(for: OpenedDestination.self) { destination in
+              switch destination {
+              case .job(let job, _):
+                LaneScreen(model: model, lane: job.profile) {
+                  JobDetailView(jobID: job.item, model: model, lane: job.profile)
+                }
+              case .sidechats(let lane):
+                SidechatsListView(
+                  model: model, initialLane: lane, notifications: notifications,
+                  dictation: dictation)
+              case .sidechat(let target):
+                LaneScreen(model: model, lane: target.target.profile) {
+                  if let initial = target.initial {
+                    SidechatChatView(
+                      owner: model, lane: target.target.profile, initial: initial,
+                      notifications: notifications, dictation: dictation)
+                  } else {
+                    SidechatRouteLoaderView(
+                      owner: model, lane: target.target.profile,
+                      conversationID: target.target.item, notifications: notifications,
+                      dictation: dictation)
+                  }
+                }
               }
-              .tint(.primary)
             }
-          }
         }
-        .navigationDestination(for: OpenedJob.self) { opened in
-          LaneScreen(model: model, lane: opened.job.profile) {
-            JobDetailView(jobID: opened.job.item, model: model, lane: opened.job.profile)
-          }
-        }
+      }
     }
     .preferredColorScheme(appearance.colorScheme)
   }
@@ -144,7 +184,7 @@ public struct MainChatView: View {
   private var chatBody: some View {
     let workSummary = model.activeWorkSummary
     VStack(spacing: 0) {
-      if !workSummary.isEmpty {
+      if !workSummary.isEmpty && !inspecting && model.activeSidechat == nil {
         ActiveWorkStrip(summary: workSummary) { presentedSheet = .activeWork }
       }
       Group {
@@ -260,6 +300,77 @@ public struct MainChatView: View {
     .background(.background)
     .onscreenEntity(covered ? nil : .feed(of: model))
     .safeAreaInset(edge: .bottom, spacing: 0) { if !inspecting { composer } }
+    .navigationTitle(model.activeSidechat?.title ?? "Beep Boop")
+    #if os(iOS)
+      .navigationBarTitleDisplayMode(.inline)
+      .toolbarBackground(Color(uiColor: .systemBackground), for: .navigationBar)
+      .toolbarBackground(.visible, for: .navigationBar)
+    #endif
+    .toolbar {
+      if !inspecting, model.activeSidechat == nil, model.sidechatsSupported {
+        #if os(iOS)
+          ToolbarItem(placement: .topBarLeading) {
+            Button("Side chats", systemImage: "bubble.left.and.bubble.right") {
+              dictation?.stop(for: model)
+              composerFocused = false
+              UIApplication.shared.sendAction(
+                #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+              opened.append(.sidechats(model.defaultSidechatLane()))
+            }
+            .tint(.primary)
+            .accessibilityIdentifier("sidechatsButton")
+          }
+        #else
+          ToolbarItem(placement: .navigation) {
+            Button("Side chats", systemImage: "bubble.left.and.bubble.right") {
+              dictation?.stop(for: model)
+              opened.append(.sidechats(model.defaultSidechatLane()))
+            }
+            .accessibilityIdentifier("sidechatsButton")
+          }
+        #endif
+      }
+      ToolbarItem(placement: .principal) {
+        if model.multiple && !inspecting && model.activeSidechat == nil {
+          ScopeMenu(model: model, badge: badge) { alertNotice = nil }
+        } else {
+          VStack(spacing: 1) {
+            Text(
+              model.activeSidechat?.title ?? model.inspectedConversation?.title ?? "Beep Boop"
+            ).font(.headline).lineLimit(1)
+            Text(model.model.split(separator: "/").last.map(String.init) ?? model.model)
+              .font(.caption).foregroundStyle(.primary.opacity(0.65)).lineLimit(1)
+          }.accessibilityElement(children: .combine)
+        }
+      }
+      ToolbarItem(placement: .primaryAction) {
+        if inspecting {
+          Button("Done") { dismiss() }.accessibilityIdentifier("closeWorkInspection")
+        } else if model.activeSidechat != nil, sidechatOwner != nil, sidechatLane != nil {
+          Button("Side chat settings", systemImage: "slider.horizontal.3") {
+            composerFocused = false
+            #if os(iOS)
+              UIApplication.shared.sendAction(
+                #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+            #endif
+            presentedSheet = .sidechatSettings
+          }
+          .tint(.primary)
+          .accessibilityIdentifier("sidechatSettingsButton")
+        } else {
+          Button("Connection", systemImage: "slider.horizontal.3") {
+            composerFocused = false
+            #if os(iOS)
+              // The iOS draft is a UIKit text view, which focus state does not reach.
+              UIApplication.shared.sendAction(
+                #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+            #endif
+            presentedSheet = .settings
+          }
+          .tint(.primary)
+        }
+      }
+    }
     .sheet(item: $presentedSheet) { sheet in
       Group {
         switch sheet {
@@ -275,7 +386,28 @@ public struct MainChatView: View {
               }
           }
         case .activeWork:
-          ActiveWorkSheet(model: model)
+          ActiveWorkSheet(model: model) { lane, conversationID in
+            presentedSheet = nil
+            opened.append(
+              .sidechat(
+                SidechatDestination(
+                  target: ScopedEntityID(profile: lane, item: conversationID),
+                  request: UUID(), initial: nil)))
+          }
+        case .sidechatSettings:
+          if let sidechat = model.activeSidechat, let sidechatOwner, let sidechatLane {
+            SidechatSettingsSheet(
+              owner: sidechatOwner, lane: sidechatLane, sidechatModel: model, sidechat: sidechat,
+              notifications: sidechatNotifications)
+          }
+        case .seedSidechat(let target):
+          CreateSidechatSheet(model: model, lane: target.lane, seed: target.seed) { created in
+            opened.append(
+              .sidechat(
+                SidechatDestination(
+                  target: ScopedEntityID(profile: target.lane, item: created.conversationId),
+                  request: UUID(), initial: created)))
+          }
         }
       }
       .preferredColorScheme(appearance.colorScheme)
@@ -314,9 +446,12 @@ public struct MainChatView: View {
       notifications?.mainVisible = mainVisible
       Task {
         // Attached sessions share the same scene lifecycle as configured ones. Saved
-        // coordinators follow the app's phase through `Coordinators`, not one scene's.
+        // coordinators follow the app's phase through `Coordinators`, and side chat sessions
+        // follow their parent session's connect/disconnect, never a second competing call here.
         // Publish connection intent before file I/O can yield to a newer phase.
-        if coordinators == nil { await model.setActive(phase == .active) }
+        if coordinators == nil && model.activeSidechat == nil {
+          await model.setActive(phase == .active)
+        }
         if phase == .active {
           await model.receiveSharedDrafts()
         } else {
@@ -355,7 +490,12 @@ public struct MainChatView: View {
       presentedSheet = nil
       switch request.destination {
       case .job(let job):
-        opened = [OpenedJob(job: job, request: request.id)]
+        opened = [.job(job, request: request.id)]
+      case .sidechat(let target):
+        dictation?.stop(for: model)
+        opened = [
+          .sidechat(SidechatDestination(target: target, request: request.id, initial: nil))
+        ]
       case .feed(let notice):
         opened = []
         followsLatest = true
@@ -719,6 +859,20 @@ public struct MainChatView: View {
     case .message(let row):
       let entryID = row.row.entryID
       let canReply = model.inspectedConversation == nil && entryID != nil && row.row.role.canReply
+      let onStartSidechat: (() -> Void)? = {
+        guard !inspecting, model.activeSidechat == nil, let entryID,
+          let lane = row.lane ?? model.profiles.first?.id,
+          model.snapshots[lane]?.sidechatsSupported == true,
+          !row.row.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
+        return {
+          presentedSheet = .seedSidechat(
+            SidechatSeedTarget(
+              lane: lane,
+              seed: ReplyReference(
+                entryId: entryID, excerpt: String(row.row.text.prefix(600)), role: row.row.role)))
+        }
+      }()
       MessageRow(
         model: row, retry: { id in Task { await model.retry(id) } },
         restore: { id in Task { await model.restore(id) } },
@@ -728,6 +882,7 @@ public struct MainChatView: View {
         onTapReplyQuote: { targetEntryID in
           historyRequest = .entry(UUID(), entryID: targetEntryID, scope: model.scope)
         },
+        onStartSidechat: onStartSidechat,
         badges: badges, implied: model.scope.coordinator)
     case .activity(let group):
       let isLiveTailGroup =
@@ -747,7 +902,9 @@ public struct MainChatView: View {
     if let detailLoader { return try await detailLoader(row) }
     return try await model.toolDetails(for: row, lane: lane)
   }
-  private var dictating: Bool { dictation?.take != nil }
+  private var isDictatingHere: Bool { dictation?.take?.target.chat === model }
+  private var ownsDictationChrome: Bool { model.activeSidechat != nil || !covered }
+  private var dictating: Bool { isDictatingHere }
   #if os(iOS)
     private var dictationTarget: DictationTarget {
       DictationTarget(
@@ -772,7 +929,9 @@ public struct MainChatView: View {
     VStack(spacing: 6) {
       if !model.pickerMatches.isEmpty, !dictating { picker }
       #if os(iOS)
-        if let dictation { DictationStatus(dictation: dictation, chat: model) }
+        if let dictation, isDictatingHere || ownsDictationChrome {
+          DictationStatus(dictation: dictation, chat: model)
+        }
       #endif
       if let reply = model.replyTarget {
         QuotedMessageBar(
@@ -945,7 +1104,8 @@ public struct MainChatView: View {
       .confirmationDialog(
         dictation?.offering?.question ?? "",
         isPresented: Binding(
-          get: { dictation?.offering != nil }, set: { if !$0 { dictation?.offering = nil } }),
+          get: { ownsDictationChrome && dictation?.offering != nil },
+          set: { if !$0 { dictation?.offering = nil } }),
         titleVisibility: .visible
       ) {
         Button("Download") { dictation?.download() }
@@ -956,6 +1116,9 @@ public struct MainChatView: View {
     #endif
   }
   private var placeholder: String {
+    if let sidechat = model.activeSidechat {
+      return model.mode == .steer ? "Message \(sidechat.title)" : "Queue a follow-up"
+    }
     if let shown = model.scope.coordinator {
       return model.mode == .steer
         ? "Message \(model.name(shown))" : "Queue a follow-up for \(model.name(shown))"
@@ -973,7 +1136,8 @@ public struct MainChatView: View {
             name: badge.name, color: UIColor(badge.color),
             removable: !model.admitting && !dictating)
         }, editor: composerEditor, promotion: model.promotion, restoredFrom: model.restoredFrom,
-        provisional: dictation?.take?.provisional ?? "", reservation: dictation?.take?.reservation,
+        provisional: isDictatingHere ? (dictation?.take?.provisional ?? "") : "",
+        reservation: isDictatingHere ? dictation?.take?.reservation : nil,
         edit: { model.edit($0, committed: $1) }, removeChip: { model.removeChip() })
     }
   #else
@@ -1030,7 +1194,8 @@ public struct MainChatView: View {
           Section(model.name(shown)) {
             LabeledContent("Status", value: statusText(profile))
             LabeledContent("Model", value: model.model)
-            CoordinatorControls(model: model, lane: shown)
+            CoordinatorControls(
+              model: model, lane: shown, notifications: notifications, dictation: dictation)
           }
         }
         Section {
@@ -1040,7 +1205,8 @@ public struct MainChatView: View {
           }
           NavigationLink("Sources") { SourceDetailsView(model: model) }
           if !model.multiple, let lane = model.profiles.first?.id {
-            CoordinatorControls(model: model, lane: lane)
+            CoordinatorControls(
+              model: model, lane: lane, notifications: notifications, dictation: dictation)
           }
           Picker("Appearance", selection: $appearance) {
             ForEach(AppAppearance.allCases) { appearance in
@@ -1072,7 +1238,9 @@ public struct MainChatView: View {
                       LabeledContent("Status", value: statusText(profile))
                       LabeledContent(
                         "Model", value: model.snapshots[profile.id]?.model ?? "Unknown")
-                      CoordinatorControls(model: model, lane: profile.id)
+                      CoordinatorControls(
+                        model: model, lane: profile.id, notifications: notifications,
+                        dictation: dictation)
                     }
                     CoordinatorForm(coordinators: coordinators, profile: profile, pushed: true)
                   }
@@ -1117,19 +1285,34 @@ public struct MainChatView: View {
                 }
               }
               if !registration.enabled,
-                model.profiles.contains(where: { registration.status($0.id).registered })
+                model.profiles.contains(where: {
+                  registration.status($0.id).registered && !registration.hasSidechatOverrides($0.id)
+                })
+              {
+                Button("Retry removing this device") {
+                  Task { await registration.setEnabled(false) }
+                }.disabled(registration.busy)
+              } else if !registration.enabled,
+                model.profiles.contains(where: { registration.hasSidechatOverrides($0.id) })
+              {
+                Text("Side chat alerts remain active for topics set to On.").font(.footnote)
+                  .foregroundStyle(.secondary)
+              }
+            } else if let error = registration.error ?? channel?.error {
+              Text(error).font(.footnote).foregroundStyle(.primary)
+              if !registration.enabled, channel?.registered == true,
+                let lane = coordinators?.profiles.first?.id,
+                !registration.hasSidechatOverrides(lane)
               {
                 Button("Retry removing this device") {
                   Task { await registration.setEnabled(false) }
                 }.disabled(registration.busy)
               }
-            } else if let error = registration.error ?? channel?.error {
-              Text(error).font(.footnote).foregroundStyle(.primary)
-              if !registration.enabled, channel?.registered == true {
-                Button("Retry removing this device") {
-                  Task { await registration.setEnabled(false) }
-                }.disabled(registration.busy)
-              }
+            } else if !registration.enabled, let lane = coordinators?.profiles.first?.id,
+              registration.hasSidechatOverrides(lane)
+            {
+              Text("Side chat alerts remain active for topics set to On.").font(.footnote)
+                .foregroundStyle(.secondary)
             } else if model.connection != .connected {
               Text("Connect to the coordinator to receive updates.").font(.footnote)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1576,6 +1759,7 @@ struct MessageRow: View {
   let preview: (AttachmentRef) -> Void
   let onReply: (() -> Void)?
   let onTapReplyQuote: ((String) -> Void)?
+  let onStartSidechat: (() -> Void)?
   /// Names and colors with two or more coordinators. Empty draws the one-coordinator row.
   let badges: [ProfileID: CoordinatorBadge]
   let implied: ProfileID?
@@ -1587,6 +1771,7 @@ struct MessageRow: View {
     model: RowModel, retry: @escaping (String) -> Void, restore: @escaping (String) -> Void,
     discard: @escaping (String) -> Void, preview: @escaping (AttachmentRef) -> Void = { _ in },
     onReply: (() -> Void)? = nil, onTapReplyQuote: ((String) -> Void)? = nil,
+    onStartSidechat: (() -> Void)? = nil,
     badges: [ProfileID: CoordinatorBadge] = [:], implied: ProfileID? = nil
   ) {
     self.model = model
@@ -1596,6 +1781,7 @@ struct MessageRow: View {
     self.preview = preview
     self.onReply = onReply
     self.onTapReplyQuote = onTapReplyQuote
+    self.onStartSidechat = onStartSidechat
     self.badges = badges
     self.implied = implied
   }
@@ -1625,7 +1811,7 @@ struct MessageRow: View {
     .padding(.leading, isUser && !typeSize.isAccessibilitySize ? 32 : 0)
     .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
     .accessibilityElement(children: .contain).accessibilityLabel(title)
-    .messageTextActions(model.row.text, onReply: onReply)
+    .messageTextActions(model.row.text, onReply: onReply, onStartSidechat: onStartSidechat)
   }
   /// Who a Send went to once every recipient placed it, else each recipient's own state with its
   /// own Check, or Restore and Discard. A recipient that is no longer saved reads as a removed

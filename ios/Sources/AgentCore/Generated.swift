@@ -36,18 +36,20 @@ public struct ActiveWorkItem: Codable, Sendable, Equatable {
     public var `host`: String?
     public var `id`: String
     public var `isJob`: Bool
+    public var `sidechatSlug`: String?
     public var `startedAt`: Int?
     public var `status`: ActiveWorkStatus
     public var `taskId`: TaskId?
     public var `title`: String
     public var `tools`: [String]?
-    public init(`children`: [ActiveWorkChild]? = nil, `conversationId`: String, `detail`: String? = nil, `host`: String? = nil, `id`: String, `isJob`: Bool, `startedAt`: Int? = nil, `status`: ActiveWorkStatus, `taskId`: TaskId? = nil, `title`: String, `tools`: [String]? = nil) {
+    public init(`children`: [ActiveWorkChild]? = nil, `conversationId`: String, `detail`: String? = nil, `host`: String? = nil, `id`: String, `isJob`: Bool, `sidechatSlug`: String? = nil, `startedAt`: Int? = nil, `status`: ActiveWorkStatus, `taskId`: TaskId? = nil, `title`: String, `tools`: [String]? = nil) {
         self.`children` = `children`
         self.`conversationId` = `conversationId`
         self.`detail` = `detail`
         self.`host` = `host`
         self.`id` = `id`
         self.`isJob` = `isJob`
+        self.`sidechatSlug` = `sidechatSlug`
         self.`startedAt` = `startedAt`
         self.`status` = `status`
         self.`taskId` = `taskId`
@@ -61,6 +63,7 @@ public struct ActiveWorkItem: Codable, Sendable, Equatable {
         case `host` = "host"
         case `id` = "id"
         case `isJob` = "is_job"
+        case `sidechatSlug` = "sidechat_slug"
         case `startedAt` = "started_at"
         case `status` = "status"
         case `taskId` = "task_id"
@@ -1363,9 +1366,11 @@ public struct NativeEventReady: Codable, Sendable, Equatable {
     public var `dreams`: Bool?
     public var `inputOrigins`: Bool?
     public var `model`: String
+    public var `sidechat`: SidechatSummary?
+    public var `sidechats`: Bool?
     public var `workInspection`: Bool?
     public var `working`: Bool?
-    public init(`acceptedInputOrigins`: [String]? = nil, `activeWork`: Bool? = nil, `conversationId`: String, `conversationSettings`: Bool? = nil, `dreams`: Bool? = nil, `inputOrigins`: Bool? = nil, `model`: String, `workInspection`: Bool? = nil, `working`: Bool? = nil) {
+    public init(`acceptedInputOrigins`: [String]? = nil, `activeWork`: Bool? = nil, `conversationId`: String, `conversationSettings`: Bool? = nil, `dreams`: Bool? = nil, `inputOrigins`: Bool? = nil, `model`: String, `sidechat`: SidechatSummary? = nil, `sidechats`: Bool? = nil, `workInspection`: Bool? = nil, `working`: Bool? = nil) {
         self.`acceptedInputOrigins` = `acceptedInputOrigins`
         self.`activeWork` = `activeWork`
         self.`conversationId` = `conversationId`
@@ -1373,6 +1378,8 @@ public struct NativeEventReady: Codable, Sendable, Equatable {
         self.`dreams` = `dreams`
         self.`inputOrigins` = `inputOrigins`
         self.`model` = `model`
+        self.`sidechat` = `sidechat`
+        self.`sidechats` = `sidechats`
         self.`workInspection` = `workInspection`
         self.`working` = `working`
     }
@@ -1384,6 +1391,8 @@ public struct NativeEventReady: Codable, Sendable, Equatable {
         case `dreams` = "dreams"
         case `inputOrigins` = "input_origins"
         case `model` = "model"
+        case `sidechat` = "sidechat"
+        case `sidechats` = "sidechats"
         case `workInspection` = "work_inspection"
         case `working` = "working"
     }
@@ -1435,6 +1444,26 @@ public struct NativeEventConversations: Codable, Sendable, Equatable {
     enum CodingKeys: String, CodingKey {
         case `items` = "items"
         case `nextCursor` = "next_cursor"
+    }
+}
+
+public struct NativeEventSidechat: Codable, Sendable, Equatable {
+    public var `sidechat`: SidechatSummary
+    public init(`sidechat`: SidechatSummary) {
+        self.`sidechat` = `sidechat`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `sidechat` = "sidechat"
+    }
+}
+
+public struct NativeEventSidechats: Codable, Sendable, Equatable {
+    public var `items`: [SidechatSummary]
+    public init(`items`: [SidechatSummary]) {
+        self.`items` = `items`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `items` = "items"
     }
 }
 
@@ -1659,6 +1688,8 @@ public enum NativeEvent: Codable, Sendable, Equatable {
     case `history`(NativeEventHistory)
     case `sources`(NativeEventSources)
     case `conversations`(NativeEventConversations)
+    case `sidechat`(NativeEventSidechat)
+    case `sidechats`(NativeEventSidechats)
     case `working`(NativeEventWorking)
     case `toolDetails`(NativeEventToolDetails)
     case `message`(NativeEventMessage)
@@ -1691,6 +1722,8 @@ public enum NativeEvent: Codable, Sendable, Equatable {
         case "history": self = .`history`(try NativeEventHistory(from: decoder))
         case "sources": self = .`sources`(try NativeEventSources(from: decoder))
         case "conversations": self = .`conversations`(try NativeEventConversations(from: decoder))
+        case "sidechat": self = .`sidechat`(try NativeEventSidechat(from: decoder))
+        case "sidechats": self = .`sidechats`(try NativeEventSidechats(from: decoder))
         case "working": self = .`working`(try NativeEventWorking(from: decoder))
         case "tool_details": self = .`toolDetails`(try NativeEventToolDetails(from: decoder))
         case "message": self = .`message`(try NativeEventMessage(from: decoder))
@@ -1740,6 +1773,12 @@ public enum NativeEvent: Codable, Sendable, Equatable {
             try value.encode(to: encoder)
         case .`conversations`(let value):
             try tag.encode("conversations", forKey: .type)
+            try value.encode(to: encoder)
+        case .`sidechat`(let value):
+            try tag.encode("sidechat", forKey: .type)
+            try value.encode(to: encoder)
+        case .`sidechats`(let value):
+            try tag.encode("sidechats", forKey: .type)
             try value.encode(to: encoder)
         case .`working`(let value):
             try tag.encode("working", forKey: .type)
@@ -1957,30 +1996,159 @@ public struct NativeRequestInspect: Codable, Sendable, Equatable {
 public struct NativeRequestSettings: Codable, Sendable, Equatable {
     public var `catalog`: Bool
     public var `change`: ConversationChange?
-    public init(`catalog`: Bool, `change`: ConversationChange? = nil) {
+    public var `conversationId`: String?
+    public init(`catalog`: Bool, `change`: ConversationChange? = nil, `conversationId`: String? = nil) {
         self.`catalog` = `catalog`
         self.`change` = `change`
+        self.`conversationId` = `conversationId`
     }
     enum CodingKeys: String, CodingKey {
         case `catalog` = "catalog"
         case `change` = "change"
+        case `conversationId` = "conversation_id"
+    }
+}
+
+public struct NativeRequestListSidechats: Codable, Sendable, Equatable {
+    public var `includeArchived`: Bool
+    public init(`includeArchived`: Bool) {
+        self.`includeArchived` = `includeArchived`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `includeArchived` = "include_archived"
+    }
+}
+
+public struct NativeRequestCreateSidechat: Codable, Sendable, Equatable {
+    public var `charter`: String?
+    public var `handoff`: String?
+    public var `isolated`: Bool?
+    public var `notifications`: SidechatNotificationPreference?
+    public var `seed`: ReplyReference?
+    public var `slug`: String?
+    public var `title`: String
+    public init(`charter`: String? = nil, `handoff`: String? = nil, `isolated`: Bool? = nil, `notifications`: SidechatNotificationPreference? = nil, `seed`: ReplyReference? = nil, `slug`: String? = nil, `title`: String) {
+        self.`charter` = `charter`
+        self.`handoff` = `handoff`
+        self.`isolated` = `isolated`
+        self.`notifications` = `notifications`
+        self.`seed` = `seed`
+        self.`slug` = `slug`
+        self.`title` = `title`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `charter` = "charter"
+        case `handoff` = "handoff"
+        case `isolated` = "isolated"
+        case `notifications` = "notifications"
+        case `seed` = "seed"
+        case `slug` = "slug"
+        case `title` = "title"
+    }
+}
+
+public struct NativeRequestUpdateSidechat: Codable, Sendable, Equatable {
+    public var `archived`: Bool?
+    public var `charter`: String?
+    public var `clearCharter`: Bool?
+    public var `conversationId`: String
+    public var `isolated`: Bool?
+    public var `notifications`: SidechatNotificationPreference?
+    public var `pinned`: Bool?
+    public var `slug`: String?
+    public var `title`: String?
+    public init(`archived`: Bool? = nil, `charter`: String? = nil, `clearCharter`: Bool? = nil, `conversationId`: String, `isolated`: Bool? = nil, `notifications`: SidechatNotificationPreference? = nil, `pinned`: Bool? = nil, `slug`: String? = nil, `title`: String? = nil) {
+        self.`archived` = `archived`
+        self.`charter` = `charter`
+        self.`clearCharter` = `clearCharter`
+        self.`conversationId` = `conversationId`
+        self.`isolated` = `isolated`
+        self.`notifications` = `notifications`
+        self.`pinned` = `pinned`
+        self.`slug` = `slug`
+        self.`title` = `title`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `archived` = "archived"
+        case `charter` = "charter"
+        case `clearCharter` = "clear_charter"
+        case `conversationId` = "conversation_id"
+        case `isolated` = "isolated"
+        case `notifications` = "notifications"
+        case `pinned` = "pinned"
+        case `slug` = "slug"
+        case `title` = "title"
+    }
+}
+
+public struct NativeRequestObserveSidechat: Codable, Sendable, Equatable {
+    public var `conversationId`: String
+    public var `inputIds`: [String]
+    public init(`conversationId`: String, `inputIds`: [String]) {
+        self.`conversationId` = `conversationId`
+        self.`inputIds` = `inputIds`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `conversationId` = "conversation_id"
+        case `inputIds` = "input_ids"
+    }
+}
+
+public struct NativeRequestSidechatInput: Codable, Sendable, Equatable {
+    public var `attachments`: [AttachmentRef]?
+    public var `conversationId`: String
+    public var `inputId`: String
+    public var `mode`: InputMode
+    public var `origin`: InputOrigin?
+    public var `replyTo`: ReplyReference?
+    public var `text`: String
+    public init(`attachments`: [AttachmentRef]? = nil, `conversationId`: String, `inputId`: String, `mode`: InputMode, `origin`: InputOrigin? = nil, `replyTo`: ReplyReference? = nil, `text`: String) {
+        self.`attachments` = `attachments`
+        self.`conversationId` = `conversationId`
+        self.`inputId` = `inputId`
+        self.`mode` = `mode`
+        self.`origin` = `origin`
+        self.`replyTo` = `replyTo`
+        self.`text` = `text`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `attachments` = "attachments"
+        case `conversationId` = "conversation_id"
+        case `inputId` = "input_id"
+        case `mode` = "mode"
+        case `origin` = "origin"
+        case `replyTo` = "reply_to"
+        case `text` = "text"
+    }
+}
+
+public struct NativeRequestSidechatInterrupt: Codable, Sendable, Equatable {
+    public var `conversationId`: String
+    public init(`conversationId`: String) {
+        self.`conversationId` = `conversationId`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `conversationId` = "conversation_id"
     }
 }
 
 public struct NativeRequestToolDetails: Codable, Sendable, Equatable {
     public var `agentId`: String?
     public var `callId`: String
+    public var `conversationId`: String?
     public var `entryId`: String
     public var `taskId`: TaskId?
-    public init(`agentId`: String? = nil, `callId`: String, `entryId`: String, `taskId`: TaskId? = nil) {
+    public init(`agentId`: String? = nil, `callId`: String, `conversationId`: String? = nil, `entryId`: String, `taskId`: TaskId? = nil) {
         self.`agentId` = `agentId`
         self.`callId` = `callId`
+        self.`conversationId` = `conversationId`
         self.`entryId` = `entryId`
         self.`taskId` = `taskId`
     }
     enum CodingKeys: String, CodingKey {
         case `agentId` = "agent_id"
         case `callId` = "call_id"
+        case `conversationId` = "conversation_id"
         case `entryId` = "entry_id"
         case `taskId` = "task_id"
     }
@@ -2030,6 +2198,12 @@ public enum NativeRequest: Codable, Sendable, Equatable {
     case `conversations`(NativeRequestConversations)
     case `inspect`(NativeRequestInspect)
     case `settings`(NativeRequestSettings)
+    case `listSidechats`(NativeRequestListSidechats)
+    case `createSidechat`(NativeRequestCreateSidechat)
+    case `updateSidechat`(NativeRequestUpdateSidechat)
+    case `observeSidechat`(NativeRequestObserveSidechat)
+    case `sidechatInput`(NativeRequestSidechatInput)
+    case `sidechatInterrupt`(NativeRequestSidechatInterrupt)
     case `toolDetails`(NativeRequestToolDetails)
     case `interrupt`
     case `notifications`(NativeRequestNotifications)
@@ -2052,6 +2226,12 @@ public enum NativeRequest: Codable, Sendable, Equatable {
         case "conversations": self = .`conversations`(try NativeRequestConversations(from: decoder))
         case "inspect": self = .`inspect`(try NativeRequestInspect(from: decoder))
         case "settings": self = .`settings`(try NativeRequestSettings(from: decoder))
+        case "list_sidechats": self = .`listSidechats`(try NativeRequestListSidechats(from: decoder))
+        case "create_sidechat": self = .`createSidechat`(try NativeRequestCreateSidechat(from: decoder))
+        case "update_sidechat": self = .`updateSidechat`(try NativeRequestUpdateSidechat(from: decoder))
+        case "observe_sidechat": self = .`observeSidechat`(try NativeRequestObserveSidechat(from: decoder))
+        case "sidechat_input": self = .`sidechatInput`(try NativeRequestSidechatInput(from: decoder))
+        case "sidechat_interrupt": self = .`sidechatInterrupt`(try NativeRequestSidechatInterrupt(from: decoder))
         case "tool_details": self = .`toolDetails`(try NativeRequestToolDetails(from: decoder))
         case "interrupt": self = .`interrupt`
         case "notifications": self = .`notifications`(try NativeRequestNotifications(from: decoder))
@@ -2094,6 +2274,24 @@ public enum NativeRequest: Codable, Sendable, Equatable {
             try value.encode(to: encoder)
         case .`settings`(let value):
             try tag.encode("settings", forKey: .type)
+            try value.encode(to: encoder)
+        case .`listSidechats`(let value):
+            try tag.encode("list_sidechats", forKey: .type)
+            try value.encode(to: encoder)
+        case .`createSidechat`(let value):
+            try tag.encode("create_sidechat", forKey: .type)
+            try value.encode(to: encoder)
+        case .`updateSidechat`(let value):
+            try tag.encode("update_sidechat", forKey: .type)
+            try value.encode(to: encoder)
+        case .`observeSidechat`(let value):
+            try tag.encode("observe_sidechat", forKey: .type)
+            try value.encode(to: encoder)
+        case .`sidechatInput`(let value):
+            try tag.encode("sidechat_input", forKey: .type)
+            try value.encode(to: encoder)
+        case .`sidechatInterrupt`(let value):
+            try tag.encode("sidechat_interrupt", forKey: .type)
             try value.encode(to: encoder)
         case .`toolDetails`(let value):
             try tag.encode("tool_details", forKey: .type)
@@ -2204,13 +2402,16 @@ public struct NotificationRequestStatus: Codable, Sendable, Equatable {
 
 public struct NotificationRequestRegister: Codable, Sendable, Equatable {
     public var `installationId`: String
+    public var `mainEnabled`: Bool?
     public var `token`: String
-    public init(`installationId`: String, `token`: String) {
+    public init(`installationId`: String, `mainEnabled`: Bool? = nil, `token`: String) {
         self.`installationId` = `installationId`
+        self.`mainEnabled` = `mainEnabled`
         self.`token` = `token`
     }
     enum CodingKeys: String, CodingKey {
         case `installationId` = "installation_id"
+        case `mainEnabled` = "main_enabled"
         case `token` = "token"
     }
 }
@@ -2257,13 +2458,16 @@ public enum NotificationRequest: Codable, Sendable, Equatable {
 
 public struct NotificationStatus: Codable, Sendable, Equatable {
     public var `configured`: Bool
+    public var `mainEnabled`: Bool?
     public var `registered`: Bool
-    public init(`configured`: Bool, `registered`: Bool) {
+    public init(`configured`: Bool, `mainEnabled`: Bool? = nil, `registered`: Bool) {
         self.`configured` = `configured`
+        self.`mainEnabled` = `mainEnabled`
         self.`registered` = `registered`
     }
     enum CodingKeys: String, CodingKey {
         case `configured` = "configured"
+        case `mainEnabled` = "main_enabled"
         case `registered` = "registered"
     }
 }
@@ -2349,6 +2553,7 @@ public typealias ScheduleId = String
 
 public struct ScheduledJob: Codable, Sendable, Equatable {
     public var `cwd`: String
+    public var `deliverySidechat`: String?
     public var `id`: JobId
     public var `model`: ModelSelection
     public var `prompt`: String
@@ -2356,8 +2561,9 @@ public struct ScheduledJob: Codable, Sendable, Equatable {
     public var `schedules`: [JobSchedule]
     public var `timezone`: TimezoneId
     public var `title`: String
-    public init(`cwd`: String, `id`: JobId, `model`: ModelSelection, `prompt`: String, `revision`: String, `schedules`: [JobSchedule], `timezone`: TimezoneId, `title`: String) {
+    public init(`cwd`: String, `deliverySidechat`: String? = nil, `id`: JobId, `model`: ModelSelection, `prompt`: String, `revision`: String, `schedules`: [JobSchedule], `timezone`: TimezoneId, `title`: String) {
         self.`cwd` = `cwd`
+        self.`deliverySidechat` = `deliverySidechat`
         self.`id` = `id`
         self.`model` = `model`
         self.`prompt` = `prompt`
@@ -2368,6 +2574,7 @@ public struct ScheduledJob: Codable, Sendable, Equatable {
     }
     enum CodingKeys: String, CodingKey {
         case `cwd` = "cwd"
+        case `deliverySidechat` = "delivery_sidechat"
         case `id` = "id"
         case `model` = "model"
         case `prompt` = "prompt"
@@ -2413,6 +2620,52 @@ public struct ScheduledOccurrence: Codable, Sendable, Equatable {
         case `job` = "job"
         case `scheduleId` = "schedule_id"
         case `scheduledAt` = "scheduled_at"
+    }
+}
+
+public enum SidechatNotificationPreference: String, Codable, Sendable, Equatable {
+    case `inherit` = "inherit"
+    case `on` = "on"
+    case `off` = "off"
+}
+
+public struct SidechatSummary: Codable, Sendable, Equatable {
+    public var `archivedAt`: Int?
+    public var `charter`: String?
+    public var `conversationId`: String
+    public var `createdAt`: Int
+    public var `isolated`: Bool
+    public var `notifications`: SidechatNotificationPreference
+    public var `pinned`: Bool
+    public var `seed`: ReplyReference?
+    public var `slug`: String
+    public var `title`: String
+    public var `updatedAt`: Int
+    public init(`archivedAt`: Int? = nil, `charter`: String? = nil, `conversationId`: String, `createdAt`: Int, `isolated`: Bool, `notifications`: SidechatNotificationPreference, `pinned`: Bool, `seed`: ReplyReference? = nil, `slug`: String, `title`: String, `updatedAt`: Int) {
+        self.`archivedAt` = `archivedAt`
+        self.`charter` = `charter`
+        self.`conversationId` = `conversationId`
+        self.`createdAt` = `createdAt`
+        self.`isolated` = `isolated`
+        self.`notifications` = `notifications`
+        self.`pinned` = `pinned`
+        self.`seed` = `seed`
+        self.`slug` = `slug`
+        self.`title` = `title`
+        self.`updatedAt` = `updatedAt`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `archivedAt` = "archived_at"
+        case `charter` = "charter"
+        case `conversationId` = "conversation_id"
+        case `createdAt` = "created_at"
+        case `isolated` = "isolated"
+        case `notifications` = "notifications"
+        case `pinned` = "pinned"
+        case `seed` = "seed"
+        case `slug` = "slug"
+        case `title` = "title"
+        case `updatedAt` = "updated_at"
     }
 }
 
@@ -2735,13 +2988,16 @@ public enum TaskGraphBlocked: String, Codable, Sendable, Equatable {
 public struct TaskGraphConversation: Codable, Sendable, Equatable {
     public var `actor`: TaskGraphActor
     public var `conversationId`: String
-    public init(`actor`: TaskGraphActor, `conversationId`: String) {
+    public var `sidechat`: TaskGraphSidechat?
+    public init(`actor`: TaskGraphActor, `conversationId`: String, `sidechat`: TaskGraphSidechat? = nil) {
         self.`actor` = `actor`
         self.`conversationId` = `conversationId`
+        self.`sidechat` = `sidechat`
     }
     enum CodingKeys: String, CodingKey {
         case `actor` = "actor"
         case `conversationId` = "conversation_id"
+        case `sidechat` = "sidechat"
     }
 }
 
@@ -2845,6 +3101,19 @@ public enum TaskGraphOutcome: String, Codable, Sendable, Equatable {
     case `aborted` = "aborted"
     case `orphaned` = "orphaned"
     case `faulted` = "faulted"
+}
+
+public struct TaskGraphSidechat: Codable, Sendable, Equatable {
+    public var `slug`: String
+    public var `title`: String
+    public init(`slug`: String, `title`: String) {
+        self.`slug` = `slug`
+        self.`title` = `title`
+    }
+    enum CodingKeys: String, CodingKey {
+        case `slug` = "slug"
+        case `title` = "title"
+    }
 }
 
 public struct TaskGraphSnapshot: Codable, Sendable, Equatable {
@@ -3049,6 +3318,7 @@ public enum TaskMessageSender: Codable, Sendable, Equatable {
 public struct TaskRecord: Codable, Sendable, Equatable {
     public var `agents`: [TaskAgentRecord]
     public var `conversationId`: String
+    public var `deliveryConversationId`: String?
     public var `id`: TaskId
     public var `model`: ModelSelection?
     public var `outcome`: String
@@ -3061,9 +3331,10 @@ public struct TaskRecord: Codable, Sendable, Equatable {
     public var `title`: String
     public var `updatedAt`: Int
     public var `worker`: WorkerState
-    public init(`agents`: [TaskAgentRecord], `conversationId`: String, `id`: TaskId, `model`: ModelSelection? = nil, `outcome`: String, `pending`: [TaskInput], `scheduledRun`: JobRunReceipt? = nil, `sources`: [SourceRef], `startedAt`: Int? = nil, `state`: TaskState, `summary`: String, `title`: String, `updatedAt`: Int, `worker`: WorkerState) {
+    public init(`agents`: [TaskAgentRecord], `conversationId`: String, `deliveryConversationId`: String? = nil, `id`: TaskId, `model`: ModelSelection? = nil, `outcome`: String, `pending`: [TaskInput], `scheduledRun`: JobRunReceipt? = nil, `sources`: [SourceRef], `startedAt`: Int? = nil, `state`: TaskState, `summary`: String, `title`: String, `updatedAt`: Int, `worker`: WorkerState) {
         self.`agents` = `agents`
         self.`conversationId` = `conversationId`
+        self.`deliveryConversationId` = `deliveryConversationId`
         self.`id` = `id`
         self.`model` = `model`
         self.`outcome` = `outcome`
@@ -3080,6 +3351,7 @@ public struct TaskRecord: Codable, Sendable, Equatable {
     enum CodingKeys: String, CodingKey {
         case `agents` = "agents"
         case `conversationId` = "conversation_id"
+        case `deliveryConversationId` = "delivery_conversation_id"
         case `id` = "id"
         case `model` = "model"
         case `outcome` = "outcome"
