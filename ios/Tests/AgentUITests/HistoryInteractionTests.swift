@@ -1773,6 +1773,47 @@ final class HistoryInteractionTests: XCTestCase {
     XCTAssertFalse(sendInEitherMode.isEnabled)
   }
 
+  func testFirstQuotedBlockCopiesOnlyItsOwnRenderedText() async throws {
+    try await assertQuotedCopy(index: 0, expected: "Take the blue path.\nMeet at the café — 😀.")
+  }
+
+  func testSecondQuotedBlockDoesNotCopyItsHeadingOrNeighbor() async throws {
+    try await assertQuotedCopy(index: 1, expected: "Try the green path.")
+  }
+
+  private func assertQuotedCopy(index: Int, expected: String) async throws {
+    let text = """
+      **First route**
+      > Take the **blue** path.
+      > Meet at the café — 😀.
+
+      **Second route**
+      > Try the [green path](https://example.invalid/route).
+
+      End of the invented note.
+      """
+    let app = try await launchMessages([
+      .init(
+        continuation: false, entryId: "quote-copy-1", finalChunk: true, role: .final, text: text)
+    ])
+    let buttons = app.buttons.matching(identifier: "copyQuotedText")
+    XCTAssertTrue(buttons.element(boundBy: index).waitForExistence(timeout: 5))
+    XCTAssertEqual(buttons.count, 2)
+    buttons.element(boundBy: index).tap()
+    XCTAssertFalse(app.navigationBars["Select text"].exists)
+    let composer = editor(app)
+    composer.tap()
+    composer.press(forDuration: 1)
+    let paste = action("Paste", app: app)
+    XCTAssertTrue(paste.waitForExistence(timeout: 3), app.debugDescription)
+    paste.tap()
+    let pasted = XCTNSPredicateExpectation(
+      predicate: NSPredicate(format: "value == %@", expected), object: composer)
+    XCTAssertEqual(
+      XCTWaiter.wait(for: [pasted], timeout: 3), .completed,
+      "The real native Paste action must contain only the chosen quote")
+  }
+
   func testWholeMessageCopyAndPartialNativeSelectionPasteThroughComposer() async throws {
     let text = "Alpha bracket Charlie.\n\nSecond paragraph from the same answer."
     let app = try await launchMessages([

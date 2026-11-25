@@ -2036,11 +2036,7 @@ struct RichMessage: View {
             .accessibilityAddTraits(.isHeader)
             .messageTextSelection()
         case .quote(let text):
-          Text(text).font(textStyle).lineSpacing(leading).messageTextSelection()
-            .fixedSize(horizontal: false, vertical: true).padding(.leading, 12)
-            .overlay(alignment: .leading) {
-              RoundedRectangle(cornerRadius: 2).fill(.secondary).frame(width: 3)
-            }
+          QuotedTextBlock(text: text, textStyle: textStyle, lineSpacing: leading)
         case .listItem(let text, let marker, let depth):
           HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(marker).frame(minWidth: listMarkerWidth, alignment: .trailing)
