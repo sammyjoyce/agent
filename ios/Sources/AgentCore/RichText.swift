@@ -6,10 +6,54 @@ public enum RichBlock: Sendable, Equatable {
   case prose(AttributedString)
   case heading(AttributedString, level: Int)
   case code(String, language: String)
-  case quote(AttributedString)
+  /// One whole Markdown block quote. `listItemDepth` is the `depth` of the list item that holds
+  /// the quote, and nil when no list item holds it.
+  case quote(RichQuote, listItemDepth: Int? = nil)
   case listItem(AttributedString, marker: String, depth: Int)
   case divider
   case table([[AttributedString]])
+}
+
+/// One whole Markdown block quote: every block it holds, in order.
+public struct RichQuote: Sendable, Equatable {
+  public let blocks: [RichBlock]
+
+  init(_ blocks: [RichBlock]) { self.blocks = blocks }
+
+  /// The quote as plain text for another app. Blocks are one blank line apart, and two list items
+  /// in a row are one line apart. A link is its text, a list item keeps the marker the screen
+  /// shows, and a table has a tab between cells.
+  public var plainText: String { Self.plainText(of: blocks) }
+
+  private static func plainText(of blocks: [RichBlock]) -> String {
+    var text = ""
+    var afterListItem = false
+    for block in blocks {
+      let part: String
+      var isListItem = false
+      switch block {
+      case .prose(let prose): part = String(prose.characters)
+      case .heading(let heading, _): part = String(heading.characters)
+      case .code(let code, _): part = code
+      case .quote(let quote, let listItemDepth):
+        let indent = String(repeating: "    ", count: listItemDepth.map { $0 + 1 } ?? 0)
+        part = quote.plainText.split(separator: "\n", omittingEmptySubsequences: false)
+          .map { indent + ($0.isEmpty ? ">" : "> \($0)") }.joined(separator: "\n")
+      case .listItem(let item, let marker, let depth):
+        let words = [marker, String(item.characters)].filter { !$0.isEmpty }
+        part = String(repeating: "    ", count: depth) + words.joined(separator: " ")
+        isListItem = true
+      case .divider: part = "---"
+      case .table(let rows):
+        part = rows.map { $0.map { String($0.characters) }.joined(separator: "\t") }
+          .joined(separator: "\n")
+      }
+      if !text.isEmpty { text += afterListItem && isListItem ? "\n" : "\n\n" }
+      text += part
+      afterListItem = isListItem
+    }
+    return text
+  }
 }
 
 /// Foundation owns Markdown syntax; the session actor owns ordered snapshots.
@@ -121,19 +165,30 @@ public enum RichText {
     guard let parsed = try? AttributedString(markdown: text) else {
       return [.prose(AttributedString(text))]
     }
+    return blocks(
+      in: Array(parsed.runs[\.presentationIntent])[...], of: parsed, enclosingComponentCount: 0)
+  }
+
+  private typealias Run = (PresentationIntent?, Range<AttributedString.Index>)
+
+  /// Foundation lists a run's components innermost first.
+  private static func blocks(
+    in runs: ArraySlice<Run>, of parsed: AttributedString, enclosingComponentCount: Int
+  ) -> [RichBlock] {
     var blocks: [RichBlock] = []
     var leafID: Int?
-    var leafIntent: PresentationIntent?
+    var leafComponents: ArraySlice<PresentationIntent.IntentType> = []
     var leafText = AttributedString()
     var markedListItems: Set<Int> = []
     var tableID: Int?
     var tableRows: [[AttributedString]] = []
     func flushLeaf() {
       if !leafText.characters.isEmpty {
-        blocks.append(block(leafText, intent: leafIntent, markedListItems: &markedListItems))
+        blocks.append(
+          block(leafText, components: leafComponents, markedListItems: &markedListItems))
       }
       leafID = nil
-      leafIntent = nil
+      leafComponents = []
       leafText = AttributedString()
     }
     func flushTable() {
@@ -141,7 +196,30 @@ public enum RichText {
       tableID = nil
       tableRows = []
     }
-    for (intent, range) in parsed.runs[\.presentationIntent] {
+    var index = runs.startIndex
+    while index < runs.endIndex {
+      let (intent, range) = runs[index]
+      let components = (intent?.components ?? []).dropLast(enclosingComponentCount)
+      if let quoteAt = components.lastIndex(where: { $0.kind == .blockQuote }) {
+        flushLeaf()
+        flushTable()
+        let quote = components[quoteAt]
+        // Every run of one block quote carries that quote's component, and its runs are adjacent.
+        let end =
+          runs[index...].firstIndex { !($0.0?.components.contains(quote) ?? false) }
+          ?? runs.endIndex
+        let item = innermostListItem(components[(quoteAt + 1)...])
+        if let item, markedListItems.insert(item.itemID).inserted {
+          blocks.append(.listItem(AttributedString(), marker: item.marker, depth: item.depth))
+        }
+        let held = Self.blocks(
+          in: runs[index..<end], of: parsed,
+          enclosingComponentCount: enclosingComponentCount + components[quoteAt...].count)
+        blocks.append(.quote(RichQuote(held), listItemDepth: item?.depth))
+        index = end
+        continue
+      }
+      index += 1
       var value = AttributedString(parsed[range])
       value.presentationIntent = nil
       if #available(iOS 26, macOS 26, *) { value.listItemDelimiter = nil }
@@ -161,7 +239,7 @@ public enum RichText {
           value[range].inlinePresentationIntent = nil
         }
       }
-      if let component = intent?.components.first(where: {
+      if let component = components.first(where: {
         if case .table = $0.kind { return true }
         return false
       }), case .table(let columns) = component.kind {
@@ -172,7 +250,7 @@ public enum RichText {
         }
         var row = 0
         var column = 0
-        for part in intent?.components ?? [] {
+        for part in components {
           if case .tableRow(let index) = part.kind { row = index }
           if case .tableCell(let index) = part.kind { column = index }
         }
@@ -190,11 +268,11 @@ public enum RichText {
         continue
       }
       flushTable()
-      let identity = intent?.components.first?.identity
+      let identity = components.first?.identity
       if leafID != identity {
         flushLeaf()
         leafID = identity
-        leafIntent = intent
+        leafComponents = components
       }
       leafText.append(value)
     }
@@ -204,9 +282,9 @@ public enum RichText {
   }
 
   private static func block(
-    _ text: AttributedString, intent: PresentationIntent?, markedListItems: inout Set<Int>
+    _ text: AttributedString, components: ArraySlice<PresentationIntent.IntentType>,
+    markedListItems: inout Set<Int>
   ) -> RichBlock {
-    let components = intent?.components ?? []
     switch components.first?.kind {
     case .header(let level): return .heading(text, level: level)
     case .codeBlock(let language):
@@ -216,6 +294,16 @@ public enum RichText {
     case .thematicBreak: return .divider
     default: break
     }
+    if let item = innermostListItem(components) {
+      let marker = markedListItems.insert(item.itemID).inserted ? item.marker : ""
+      return .listItem(text, marker: marker, depth: item.depth)
+    }
+    return .prose(text)
+  }
+
+  private static func innermostListItem(_ components: ArraySlice<PresentationIntent.IntentType>)
+    -> (itemID: Int, marker: String, depth: Int)?
+  {
     var ordinal: Int?
     var itemID: Int?
     var ordered: Bool?
@@ -236,11 +324,7 @@ public enum RichText {
       default: break
       }
     }
-    if let ordinal, let ordered, let itemID {
-      let marker = markedListItems.insert(itemID).inserted ? (ordered ? "\(ordinal)." : "•") : ""
-      return .listItem(text, marker: marker, depth: max(depth, 0))
-    }
-    if components.contains(where: { $0.kind == .blockQuote }) { return .quote(text) }
-    return .prose(text)
+    guard let ordinal, let ordered, let itemID else { return nil }
+    return (itemID, ordered ? "\(ordinal)." : "•", max(depth, 0))
   }
 }

@@ -398,16 +398,23 @@ struct ActivityItemView: View {
       }
       return tool.name.replacingOccurrences(of: "_", with: " ")
     }
-    for block in model.row.blocks {
+    if let line = Self.firstTextLine(in: model.row.blocks) { return String(line.prefix(160)) }
+    return "Thinking"
+  }
+
+  private static func firstTextLine(in blocks: [RichBlock]) -> Substring? {
+    for block in blocks {
       switch block {
-      case .prose(let value), .heading(let value, _), .quote(let value), .listItem(let value, _, _):
-        if let line = String(value.characters).split(whereSeparator: \.isNewline).first {
-          return String(line.prefix(160))
+      case .prose(let text), .heading(let text, _), .listItem(let text, _, _):
+        if let line = String(text.characters).split(whereSeparator: \.isNewline).first {
+          return line
         }
-      default: break
+      case .quote(let quote, _):
+        if let line = firstTextLine(in: quote.blocks) { return line }
+      case .code, .divider, .table: break
       }
     }
-    return "Thinking"
+    return nil
   }
 
   private var isShell: Bool {
