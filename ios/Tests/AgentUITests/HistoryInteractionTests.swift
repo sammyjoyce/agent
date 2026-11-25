@@ -1869,6 +1869,88 @@ final class HistoryInteractionTests: XCTestCase {
       "A long press on quote text must still open the message menu")
   }
 
+  func testOneCopyButtonOnAQuoteCopiesEverythingUnderItsBar() async throws {
+    let app = try await launchMessages([
+      .init(
+        continuation: false, entryId: "1", finalChunk: true, role: .final,
+        text: """
+          > Hello Odo, please bring:
+          >
+          > - the rope
+          > - the tape
+          >
+          > Thanks, see you at six.
+
+          > Run this first:
+          >
+          > ```sh
+          > echo inside
+          > ```
+
+          1. **Pim Rowan**
+
+             > Draft for Pim.
+
+          2. **Lark Hale**
+
+             > Draft for Lark.
+             >
+             > Second paragraph for Lark.
+
+          3. **Wren Tolle**
+
+             > ```
+             > echo listed
+             > ```
+
+          The plan:
+
+          > | Day | Task |
+          > | --- | --- |
+          > | Friday | Rope |
+          """)
+    ])
+    let copyQuotes = app.buttons.matching(NSPredicate(format: "label == %@", "Copy quote"))
+    let copyCodes = app.buttons.matching(NSPredicate(format: "label == %@", "Copy code"))
+    XCTAssertTrue(copyQuotes.element(boundBy: 5).waitForExistence(timeout: 5))
+    XCTAssertEqual(copyQuotes.count, 6, "Each quote bar must hold exactly one Copy button")
+    XCTAssertEqual(copyCodes.count, 0, "A code block under a quote bar must have no Copy button")
+    let screenshot = XCTAttachment(screenshot: app.screenshot())
+    screenshot.name = "quote-shapes"
+    screenshot.lifetime = .keepAlways
+    add(screenshot)
+    let codeInAListItem = app.staticTexts["echo listed"].frame
+    XCTAssertEqual(
+      app.staticTexts["The plan:"].frame.minY - codeInAListItem.maxY,
+      app.staticTexts["Pim Rowan"].frame.minY - app.staticTexts["echo inside"].frame.maxY,
+      accuracy: 0.5,
+      "A list row must be as tall as the quote in it when that quote opens with a code block")
+    let paddingAroundCode: CGFloat = 12
+    XCTAssertEqual(
+      copyQuotes.element(boundBy: 4).frame.minY, codeInAListItem.minY - paddingAroundCode,
+      accuracy: 0.5,
+      "The Copy button of a quote in a list item that opens with a code block must be at its top")
+    let tableButton = copyQuotes.element(boundBy: 5).frame
+    let paddingAroundATable: CGFloat = 12
+    XCTAssertGreaterThanOrEqual(
+      tableButton.minY, app.staticTexts["Day"].frame.minY - paddingAroundATable - 0.5,
+      "The Copy button of a quote that opens with a table must not rise above the quote")
+    XCTAssertLessThanOrEqual(
+      tableButton.maxY, app.staticTexts["Rope"].frame.maxY + paddingAroundATable + 0.5,
+      "The Copy button of a quote that opens with a table must not fall below the quote")
+    copyQuotes.element(boundBy: 0).tap()
+    let composer = editor(app)
+    let quoteWithAList =
+      "Hello Odo, please bring:\n\n• the rope\n• the tape\n\nThanks, see you at six."
+    pasteCopiedText(quoteWithAList, into: composer, app: app)
+    XCTAssertEqual(composer.value as? String, quoteWithAList)
+    try await clearComposer(composer, excluding: "please bring", app: app)
+    copyQuotes.element(boundBy: 3).tap()
+    let quoteInAListItem = "Draft for Lark.\n\nSecond paragraph for Lark."
+    pasteCopiedText(quoteInAListItem, into: composer, app: app)
+    XCTAssertEqual(composer.value as? String, quoteInAListItem)
+  }
+
   private func pasteCopiedText(_ expected: String, into composer: XCUIElement, app: XCUIApplication)
   {
     composer.tap()

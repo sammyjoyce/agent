@@ -117,24 +117,14 @@ enum SpokenReply {
   static let limit = 600
   static let rest = "The rest is in the chat."
 
-  /// Prose, headings, quotes and list items as sentences. A code block or a table is named, not
-  /// read. Links read as their text, and a bare web address in any case as "a link" that keeps
-  /// the punctuation after it. A longer reply is cut at the last sentence end that fits, or else
-  /// the last word, and closes with `rest`.
+  /// Prose, headings and list items as sentences. A quote is the sentences of what it holds. A
+  /// code block or a table is named, not read, inside a quote too. Links read as their text, and
+  /// a bare web address in any case as "a link" that keeps the punctuation after it. A longer
+  /// reply is cut at the last sentence end that fits, or else the last word, and closes with
+  /// `rest`.
   static func speech(from markdown: String, limit: Int = limit) -> String {
-    let sentences = RichText.parse(markdown).compactMap { block -> String? in
-      switch block {
-      case .prose(let text), .heading(let text, _), .listItem(let text, _, _):
-        return sentence(String(text.characters))
-      case .quote(let text):
-        return String(text.characters).split(separator: "\n\n").map { sentence(String($0)) }
-          .joined(separator: " ")
-      case .code: return "There's a code block in the chat."
-      case .table: return "There's a table in the chat."
-      case .divider: return nil
-      }
-    }
-    let speech = sentences.filter { !$0.isEmpty }.joined(separator: " ")
+    let speech = sentences(in: RichText.parse(markdown)).filter { !$0.isEmpty }
+      .joined(separator: " ")
     guard speech.count > limit else { return speech }
     let room = speech.prefix(limit - rest.count - 1)
     let end = room.indices.last { index in
@@ -144,6 +134,19 @@ enum SpokenReply {
     if let end { return String(speech[...end]) + " " + rest }
     let word = room.lastIndex(of: " ") ?? room.startIndex
     return String(room[..<word]) + "… " + rest
+  }
+
+  private static func sentences(in blocks: [RichBlock]) -> [String] {
+    blocks.flatMap { block -> [String] in
+      switch block {
+      case .prose(let text), .heading(let text, _), .listItem(let text, _, _):
+        [sentence(String(text.characters))]
+      case .quote(let quote, _): sentences(in: quote.blocks)
+      case .code: ["There's a code block in the chat."]
+      case .table: ["There's a table in the chat."]
+      case .divider: []
+      }
+    }
   }
 
   private static func sentence(_ text: String) -> String {

@@ -18,6 +18,7 @@ func copyToPasteboard(_ text: String) {
 struct CopyBlockButton: View {
   private static let touchTargetWidth: CGFloat = 44
   private static let glyphWidth: CGFloat = 24
+  private static let touchTargetHeightBeyondEachGlyphEdge: CGFloat = 15
   static let trailingWidthABlockKeepsClear = glyphWidth + 8
   private static let typeSizeCapSoTheGlyphFitsItsWidth = DynamicTypeSize.xxxLarge
 
@@ -34,8 +35,8 @@ struct CopyBlockButton: View {
         .font(.footnote).foregroundStyle(.secondary)
         .dynamicTypeSize(...Self.typeSizeCapSoTheGlyphFitsItsWidth)
         .frame(width: Self.glyphWidth)
-        .hitAreaLargerThanLayoutFrame(
-          horizontal: (Self.touchTargetWidth - Self.glyphWidth) / 2, vertical: 15)
+        .layoutFrameAsTallAsTouchTarget(addingToEachEdge: Self.touchTargetHeightBeyondEachGlyphEdge)
+        .hitAreaWiderThanLayoutFrame(by: (Self.touchTargetWidth - Self.glyphWidth) / 2)
     }
     .buttonStyle(.plain)
     .accessibilityLabel(label).accessibilityValue(copiedAt == nil ? "" : "Copied")
@@ -52,10 +53,11 @@ struct CopyBlockButton: View {
 }
 
 extension View {
-  fileprivate func hitAreaLargerThanLayoutFrame(horizontal: CGFloat, vertical: CGFloat)
-    -> some View
-  {
-    padding(.horizontal, horizontal).padding(.vertical, vertical).contentShape(Rectangle())
-      .padding(.horizontal, -horizontal).padding(.vertical, -vertical)
+  fileprivate func layoutFrameAsTallAsTouchTarget(addingToEachEdge height: CGFloat) -> some View {
+    padding(.vertical, height)
+  }
+
+  fileprivate func hitAreaWiderThanLayoutFrame(by width: CGFloat) -> some View {
+    padding(.horizontal, width).contentShape(Rectangle()).padding(.horizontal, -width)
   }
 }

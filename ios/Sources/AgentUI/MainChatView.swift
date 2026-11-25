@@ -2022,9 +2022,8 @@ struct RichMessage: View {
   var compact = false
   @ScaledMetric(relativeTo: .body) private var leading = 3
   @ScaledMetric(relativeTo: .body) private var columnSpacing = 16
-  @ScaledMetric(relativeTo: .body) private var listIndent = 16
-  @ScaledMetric(relativeTo: .body) private var listMarkerWidth = 24
-  private var showsCopyButtons: Bool { !compact }
+  @Environment(\.isUnderAQuoteBar) private var isUnderAQuoteBar
+  private var showsCopyButtons: Bool { !compact && !isUnderAQuoteBar }
   private var copyButtonWidth: CGFloat {
     showsCopyButtons ? CopyBlockButton.trailingWidthABlockKeepsClear : 0
   }
@@ -2039,26 +2038,20 @@ struct RichMessage: View {
           Text(text).font(compact ? textStyle : level <= 2 ? .title3 : .headline)
             .accessibilityAddTraits(.isHeader)
             .messageTextSelection()
-        case .quote(let text):
-          Text(text).font(textStyle).lineSpacing(leading).messageTextSelection()
-            .fixedSize(horizontal: false, vertical: true).padding(.leading, 12)
-            .overlay(alignment: .leading) {
-              RoundedRectangle(cornerRadius: 2).fill(.secondary).frame(width: 3)
-            }
-            .padding(.trailing, copyButtonWidth)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .overlay(alignment: .trailingFirstTextBaseline) {
-              if showsCopyButtons {
-                CopyBlockButton(text: String(text.characters), label: "Copy quote")
-              }
-            }
+        case .quote(let quote, let listItemDepth):
+          let block = QuoteBlock(
+            quote: quote, textStyle: textStyle, compact: compact,
+            showsCopyButton: showsCopyButtons)
+          if let listItemDepth {
+            ListItemRow(marker: "", depth: listItemDepth, markerFont: textStyle) { block }
+          } else {
+            block
+          }
         case .listItem(let text, let marker, let depth):
-          HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(marker).frame(minWidth: listMarkerWidth, alignment: .trailing)
-            Text(text).lineSpacing(leading).messageTextSelection()
+          ListItemRow(marker: marker, depth: depth, markerFont: textStyle) {
+            Text(text).font(textStyle).lineSpacing(leading).messageTextSelection()
               .fixedSize(horizontal: false, vertical: true)
           }
-          .font(textStyle).padding(.leading, CGFloat(depth) * listIndent)
           .accessibilityElement(children: .combine)
         case .divider: Divider()
         case .code(let code, let language):

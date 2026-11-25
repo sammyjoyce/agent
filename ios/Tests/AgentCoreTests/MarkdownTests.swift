@@ -158,26 +158,178 @@ import Testing
         .heading(AttributedString("Fifth"), level: 5),
         .heading(AttributedString("Sixth"), level: 6),
         .heading(AttributedString("Setext"), level: 2),
-        .quote(AttributedString("First quoted line.\nSecond quoted line.")),
+        .quote(RichQuote([.prose(AttributedString("First quoted line.\nSecond quoted line."))])),
         .divider,
       ])
   }
 
-  @Test func oneBlockQuoteIsOneQuoteHoweverManyParagraphsItHolds() {
+  @Test func oneBlockQuoteIsOneQuoteWhateverItHolds() {
     #expect(
       RichText.parse("> Para one.\n>\n> Para two.") == [
-        .quote(AttributedString("Para one.\n\nPara two."))
+        .quote(
+          RichQuote([.prose(AttributedString("Para one.")), .prose(AttributedString("Para two."))]))
       ])
     #expect(
       RichText.parse("> First.\n\n> Second.") == [
-        .quote(AttributedString("First.")), .quote(AttributedString("Second.")),
+        .quote(RichQuote([.prose(AttributedString("First."))])),
+        .quote(RichQuote([.prose(AttributedString("Second."))])),
       ])
     #expect(
-      RichText.parse("> Before.\n>\n> - item\n>\n> After.") == [
-        .quote(AttributedString("Before.")),
-        .listItem(AttributedString("item"), marker: "•", depth: 0),
-        .quote(AttributedString("After.")),
+      RichText.parse("> Please bring:\n>\n> - the rope\n> - the tape\n>\n> Thanks.") == [
+        .quote(
+          RichQuote([
+            .prose(AttributedString("Please bring:")),
+            .listItem(AttributedString("the rope"), marker: "•", depth: 0),
+            .listItem(AttributedString("the tape"), marker: "•", depth: 0),
+            .prose(AttributedString("Thanks.")),
+          ]))
       ])
+    #expect(
+      RichText.parse("> Outer level.\n>\n> > Inner nested level.\n>\n> Outer again.") == [
+        .quote(
+          RichQuote([
+            .prose(AttributedString("Outer level.")),
+            .quote(RichQuote([.prose(AttributedString("Inner nested level."))])),
+            .prose(AttributedString("Outer again.")),
+          ]))
+      ])
+    #expect(
+      RichText.parse("> Run this:\n>\n> ```sh\n> echo inside\n> ```\n>\n> Then stop.") == [
+        .quote(
+          RichQuote([
+            .prose(AttributedString("Run this:")),
+            .code("echo inside", language: "sh"),
+            .prose(AttributedString("Then stop.")),
+          ]))
+      ])
+    #expect(
+      RichText.parse("> | a | b |\n> |---|---|\n> | 1 | 2 |") == [
+        .quote(
+          RichQuote([
+            .table([
+              [AttributedString("a"), AttributedString("b")],
+              [AttributedString("1"), AttributedString("2")],
+            ])
+          ]))
+      ])
+  }
+
+  @Test func aQuoteInAListItemIsOneQuoteAtThatItemsDepth() {
+    #expect(
+      RichText.parse(
+        """
+        1. Name One
+
+           > Draft for one.
+
+        2. Name Two
+
+           > Draft for two.
+           >
+           > Second paragraph.
+        """) == [
+          .listItem(AttributedString("Name One"), marker: "1.", depth: 0),
+          .quote(RichQuote([.prose(AttributedString("Draft for one."))]), listItemDepth: 0),
+          .listItem(AttributedString("Name Two"), marker: "2.", depth: 0),
+          .quote(
+            RichQuote([
+              .prose(AttributedString("Draft for two.")),
+              .prose(AttributedString("Second paragraph.")),
+            ]), listItemDepth: 0),
+        ])
+    #expect(
+      RichText.parse("- Outer\n    - Inner\n\n      > Draft for the inner item.") == [
+        .listItem(AttributedString("Outer"), marker: "•", depth: 0),
+        .listItem(AttributedString("Inner"), marker: "•", depth: 1),
+        .quote(
+          RichQuote([.prose(AttributedString("Draft for the inner item."))]), listItemDepth: 1),
+      ])
+    #expect(
+      RichText.parse("1. > Draft that opens its item.") == [
+        .listItem(AttributedString(), marker: "1.", depth: 0),
+        .quote(
+          RichQuote([.prose(AttributedString("Draft that opens its item."))]), listItemDepth: 0),
+      ])
+  }
+
+  @Test func aListInAQuoteHoldsAQuoteAndTheTextAfterItInOneItem() {
+    #expect(
+      RichText.parse("> 1. Name\n>\n>    > Draft.\n>\n>    After.\n> 2. Two") == [
+        .quote(
+          RichQuote([
+            .listItem(AttributedString("Name"), marker: "1.", depth: 0),
+            .quote(RichQuote([.prose(AttributedString("Draft."))]), listItemDepth: 0),
+            .listItem(AttributedString("After."), marker: "", depth: 0),
+            .listItem(AttributedString("Two"), marker: "2.", depth: 0),
+          ]))
+      ])
+  }
+
+  @Test func textAfterAQuoteThatOpensItsListItemStaysInThatItem() {
+    #expect(
+      RichText.parse("1. > Opens.\n\n   After.") == [
+        .listItem(AttributedString(), marker: "1.", depth: 0),
+        .quote(RichQuote([.prose(AttributedString("Opens."))]), listItemDepth: 0),
+        .listItem(AttributedString("After."), marker: "", depth: 0),
+      ])
+  }
+
+  @Test(arguments: [
+    ("> Lunch at noon works.", ["Lunch at noon works."]),
+    ("> Para one.\n>\n> Para two.", ["Para one.\n\nPara two."]),
+    (
+      "> Please bring:\n>\n> - the rope\n> - the tape\n>\n> Thanks.",
+      ["Please bring:\n\n• the rope\n• the tape\n\nThanks."]
+    ),
+    (
+      "> Steps:\n>\n> 1. first\n>    - inner\n> 2. second",
+      ["Steps:\n\n1. first\n    • inner\n2. second"]
+    ),
+    (
+      "> Run this:\n>\n> ```sh\n> echo inside\n> ```\n>\n> Then stop.",
+      ["Run this:\n\necho inside\n\nThen stop."]
+    ),
+    ("> ## Title\n>\n> Body.", ["Title\n\nBody."]),
+    (
+      "> Outer level.\n>\n> > Inner nested level.\n>\n> Outer again.",
+      ["Outer level.\n\n> Inner nested level.\n\nOuter again."]
+    ),
+    (
+      "1. **Name One**\n\n   > Draft for one.\n\n2. **Name Two**\n\n   > Draft for two.\n   >\n   > Second paragraph.",
+      ["Draft for one.", "Draft for two.\n\nSecond paragraph."]
+    ),
+    ("> | a | b |\n> |---|---|\n> | 1 | 2 |", ["a\tb\n1\t2"]),
+    (
+      "> 1. Name\n>\n>    > Draft.\n>\n>    After.\n> 2. Two",
+      ["1. Name\n\n    > Draft.\n\nAfter.\n2. Two"]
+    ),
+    ("> First.\n\n> Second.", ["First.", "Second."]),
+    ("> See [route map](https://example.com/routes/7) now.", ["See route map now."]),
+  ])
+  func eachQuoteCopiesThePlainTextOfEverythingItHolds(markdown: String, copied: [String]) {
+    let quotes = RichText.parse(markdown).compactMap { block -> String? in
+      if case .quote(let quote, _) = block { quote.plainText } else { nil }
+    }
+    #expect(quotes == copied)
+  }
+
+  @Test func aQuoteCopiesDividersNestedBlankLinesAndListIndents() {
+    let draft = RichQuote([
+      .prose(AttributedString("Draft.")), .prose(AttributedString("More.")),
+    ])
+    #expect(
+      RichQuote([.prose(AttributedString("Top.")), .divider, .quote(draft)]).plainText
+        == "Top.\n\n---\n\n> Draft.\n>\n> More.")
+    #expect(
+      RichQuote([
+        .listItem(AttributedString("Name"), marker: "1.", depth: 0),
+        .quote(draft, listItemDepth: 0),
+      ]).plainText == "1. Name\n\n    > Draft.\n    >\n    > More.")
+    #expect(
+      RichQuote([
+        .listItem(AttributedString(), marker: "2.", depth: 1),
+        .listItem(AttributedString("continued"), marker: "", depth: 1),
+      ]).plainText == "    2.\n    continued")
   }
 
   @Test func consecutiveBoldReasoningSummariesSeparateCleanlyWithoutDroppingInlineBold() {

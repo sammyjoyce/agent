@@ -135,6 +135,12 @@ import Testing
       == "First paragraph without a stop. Second paragraph.")
 }
 
+@Test func aCodeBlockInsideAQuoteIsNamedNotRead() {
+  #expect(
+    SpokenReply.speech(from: "> Run this:\n>\n> ```sh\n> echo inside\n> ```\n>\n> Then stop.")
+      == "Run this: There's a code block in the chat. Then stop.")
+}
+
 @Test func aBareWebAddressInAnyCaseReadsAsALinkAndKeepsItsSentenceEnd() {
   let table = [
     (
