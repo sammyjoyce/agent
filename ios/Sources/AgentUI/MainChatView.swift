@@ -2024,6 +2024,10 @@ struct RichMessage: View {
   @ScaledMetric(relativeTo: .body) private var columnSpacing = 16
   @ScaledMetric(relativeTo: .body) private var listIndent = 16
   @ScaledMetric(relativeTo: .body) private var listMarkerWidth = 24
+  private var showsCopyButtons: Bool { !compact }
+  private var copyButtonWidth: CGFloat {
+    showsCopyButtons ? CopyBlockButton.trailingWidthABlockKeepsClear : 0
+  }
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
       ForEach(blocks.indices, id: \.self) { index in
@@ -2041,6 +2045,13 @@ struct RichMessage: View {
             .overlay(alignment: .leading) {
               RoundedRectangle(cornerRadius: 2).fill(.secondary).frame(width: 3)
             }
+            .padding(.trailing, copyButtonWidth)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .overlay(alignment: .trailingFirstTextBaseline) {
+              if showsCopyButtons {
+                CopyBlockButton(text: String(text.characters), label: "Copy quote")
+              }
+            }
         case .listItem(let text, let marker, let depth):
           HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(marker).frame(minWidth: listMarkerWidth, alignment: .trailing)
@@ -2052,12 +2063,19 @@ struct RichMessage: View {
         case .divider: Divider()
         case .code(let code, let language):
           VStack(alignment: .leading, spacing: 8) {
-            if !language.isEmpty { Text(language).font(.caption).foregroundStyle(.secondary) }
+            if showsCopyButtons || !language.isEmpty {
+              Text(language).font(.caption).foregroundStyle(.secondary)
+                .padding(.trailing, copyButtonWidth)
+            }
             ScrollView(.horizontal) {
               Text(code).font(.system(.callout, design: .monospaced)).messageTextSelection()
                 .fixedSize(horizontal: true, vertical: false)
             }
-          }.padding(12).background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+          }
+          .overlay(alignment: .trailingFirstTextBaseline) {
+            if showsCopyButtons { CopyBlockButton(text: code, label: "Copy code") }
+          }
+          .padding(12).background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
         case .table(let rows):
           ScrollView(.horizontal) {
             Grid(alignment: .topLeading, horizontalSpacing: columnSpacing, verticalSpacing: 10) {

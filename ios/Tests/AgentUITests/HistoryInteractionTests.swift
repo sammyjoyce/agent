@@ -1785,30 +1785,9 @@ final class HistoryInteractionTests: XCTestCase {
     XCTAssertTrue(copy.waitForExistence(timeout: 3))
     copy.tap()
     let composer = editor(app)
-    func pasteCopiedText(_ expected: String) {
-      composer.tap()
-      composer.press(forDuration: 1)
-      let paste = action("Paste", app: app)
-      XCTAssertTrue(paste.waitForExistence(timeout: 3), app.debugDescription)
-      paste.tap()
-      let pasted = XCTNSPredicateExpectation(
-        predicate: NSPredicate(format: "value == %@", expected), object: composer)
-      XCTAssertEqual(
-        XCTWaiter.wait(for: [pasted], timeout: 3), .completed,
-        "The actual native Paste action must update the composer: \(composer.debugDescription)")
-    }
-    pasteCopiedText(text)
+    pasteCopiedText(text, into: composer, app: app)
     XCTAssertEqual(composer.value as? String, text)
-    // Select the actual native range rather than assuming the insertion point
-    // starts at the end, then wait for the real editor to finish the deletion.
-    composer.press(forDuration: 1)
-    let selectAll = action("Select All", app: app)
-    XCTAssertTrue(selectAll.waitForExistence(timeout: 3))
-    selectAll.tap()
-    let delete = app.keys["delete"]
-    XCTAssertTrue(delete.exists)
-    delete.tap()
-    try await assertVisibleEditorText("Message Beep Boop", excluding: "Alpha bracket", in: app)
+    try await clearComposer(composer, excluding: "Alpha bracket", app: app)
     first.press(forDuration: 1)
     let select = action("Select text", app: app)
     XCTAssertTrue(select.waitForExistence(timeout: 3))
@@ -1827,8 +1806,96 @@ final class HistoryInteractionTests: XCTestCase {
     add(screenshot)
     selectedCopy.tap()
     app.buttons["Done"].tap()
-    pasteCopiedText("Alpha")
+    pasteCopiedText("Alpha", into: composer, app: app)
     XCTAssertEqual(composer.value as? String, "Alpha")
+  }
+
+  func testCopyButtonsOnQuotesAndCodePasteTheirPlainTextThroughComposer() async throws {
+    let app = try await launchMessages([
+      .init(
+        continuation: false, entryId: "1", finalChunk: true, role: .final,
+        text: """
+          **Mira Vale**
+
+          > Lunch at noon works for me.
+
+          **Tobin Ash**
+
+          > The blue folder is ready.
+          >
+          > Please bring the **spare** key on Friday.
+
+          Send either one when you are ready.
+
+          ```swift
+          let total = 2 + 3
+          print(total)
+          ```
+
+          ```
+          echo ready
+          ```
+          """)
+    ])
+    let copyQuotes = app.buttons.matching(NSPredicate(format: "label == %@", "Copy quote"))
+    let copyCodes = app.buttons.matching(NSPredicate(format: "label == %@", "Copy code"))
+    XCTAssertTrue(copyCodes.element(boundBy: 1).waitForExistence(timeout: 5))
+    XCTAssertEqual(copyQuotes.count, 2)
+    XCTAssertEqual(copyCodes.count, 2)
+    let screenshot = XCTAttachment(screenshot: app.screenshot())
+    screenshot.name = "quote-copy-buttons"
+    screenshot.lifetime = .keepAlways
+    add(screenshot)
+    XCTAssertLessThan(
+      copyCodes.element(boundBy: 1).frame.midY, app.staticTexts["echo ready"].frame.minY,
+      "The Copy button of a fence with no language must sit above its code")
+    copyQuotes.element(boundBy: 1).tap()
+    let composer = editor(app)
+    let quote = "The blue folder is ready.\n\nPlease bring the spare key on Friday."
+    pasteCopiedText(quote, into: composer, app: app)
+    XCTAssertEqual(composer.value as? String, quote)
+    try await clearComposer(composer, excluding: "blue folder", app: app)
+    copyCodes.element(boundBy: 0).tap()
+    let code = "let total = 2 + 3\nprint(total)"
+    pasteCopiedText(code, into: composer, app: app)
+    XCTAssertEqual(composer.value as? String, code)
+    try await clearComposer(composer, excluding: "total", app: app)
+    copyCodes.element(boundBy: 1).tap()
+    pasteCopiedText("echo ready", into: composer, app: app)
+    XCTAssertEqual(composer.value as? String, "echo ready")
+    app.staticTexts["Lunch at noon works for me."].press(forDuration: 1)
+    XCTAssertTrue(
+      action("Copy message", app: app).waitForExistence(timeout: 3),
+      "A long press on quote text must still open the message menu")
+  }
+
+  private func pasteCopiedText(_ expected: String, into composer: XCUIElement, app: XCUIApplication)
+  {
+    composer.tap()
+    composer.press(forDuration: 1)
+    let paste = action("Paste", app: app)
+    XCTAssertTrue(paste.waitForExistence(timeout: 3), app.debugDescription)
+    paste.tap()
+    let pasted = XCTNSPredicateExpectation(
+      predicate: NSPredicate(format: "value == %@", expected), object: composer)
+    XCTAssertEqual(
+      XCTWaiter.wait(for: [pasted], timeout: 3), .completed,
+      "The actual native Paste action must update the composer: \(composer.debugDescription)")
+  }
+
+  private func clearComposer(
+    _ composer: XCUIElement, excluding pasted: String, app: XCUIApplication
+  ) async throws {
+    // Select the actual native range rather than assuming the insertion point
+    // starts at the end, then wait for the real editor to finish the deletion.
+    composer.press(forDuration: 1)
+    let selectAll = action("Select All", app: app)
+    XCTAssertTrue(selectAll.waitForExistence(timeout: 3))
+    selectAll.tap()
+    let delete = app.keys["delete"]
+    XCTAssertTrue(delete.exists)
+    delete.tap()
+    try await assertVisibleEditorText("Message Beep Boop", excluding: pasted, in: app)
   }
 
   func testPasteImagesKeepsTheNoteAndCreatesOnlyRemovableUnsentAttachments() async throws {

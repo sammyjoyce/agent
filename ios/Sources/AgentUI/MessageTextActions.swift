@@ -2,8 +2,6 @@ import SwiftUI
 
 #if os(iOS)
   import UIKit
-#elseif os(macOS)
-  import AppKit
 #endif
 
 extension View {
@@ -52,12 +50,7 @@ private struct MessageTextActions: ViewModifier {
           }
         }
         Button("Copy message", systemImage: "doc.on.doc") {
-          #if os(iOS)
-            UIPasteboard.general.string = text
-          #elseif os(macOS)
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(text, forType: .string)
-          #endif
+          copyToPasteboard(text)
         }.disabled(text.isEmpty)
         Button("Select text", systemImage: "text.cursor") {
           // A streaming update must not change the range beneath native handles.
