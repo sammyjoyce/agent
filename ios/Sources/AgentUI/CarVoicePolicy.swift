@@ -124,8 +124,11 @@ enum SpokenReply {
   static func speech(from markdown: String, limit: Int = limit) -> String {
     let sentences = RichText.parse(markdown).compactMap { block -> String? in
       switch block {
-      case .prose(let text), .heading(let text, _), .quote(let text), .listItem(let text, _, _):
+      case .prose(let text), .heading(let text, _), .listItem(let text, _, _):
         return sentence(String(text.characters))
+      case .quote(let text):
+        return String(text.characters).split(separator: "\n\n").map { sentence(String($0)) }
+          .joined(separator: " ")
       case .code: return "There's a code block in the chat."
       case .table: return "There's a table in the chat."
       case .divider: return nil

@@ -163,6 +163,23 @@ import Testing
       ])
   }
 
+  @Test func oneBlockQuoteIsOneQuoteHoweverManyParagraphsItHolds() {
+    #expect(
+      RichText.parse("> Para one.\n>\n> Para two.") == [
+        .quote(AttributedString("Para one.\n\nPara two."))
+      ])
+    #expect(
+      RichText.parse("> First.\n\n> Second.") == [
+        .quote(AttributedString("First.")), .quote(AttributedString("Second.")),
+      ])
+    #expect(
+      RichText.parse("> Before.\n>\n> - item\n>\n> After.") == [
+        .quote(AttributedString("Before.")),
+        .listItem(AttributedString("item"), marker: "•", depth: 0),
+        .quote(AttributedString("After.")),
+      ])
+  }
+
   @Test func consecutiveBoldReasoningSummariesSeparateCleanlyWithoutDroppingInlineBold() {
     let separated = RichText.separateReasoningSummaries(
       "**Inspecting report status****Reviewing message text**")

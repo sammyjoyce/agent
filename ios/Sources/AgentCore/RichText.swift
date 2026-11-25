@@ -126,11 +126,24 @@ public enum RichText {
     var leafIntent: PresentationIntent?
     var leafText = AttributedString()
     var markedListItems: Set<Int> = []
+    var lastQuoteID: Int?
     var tableID: Int?
     var tableRows: [[AttributedString]] = []
     func flushLeaf() {
       if !leafText.characters.isEmpty {
-        blocks.append(block(leafText, intent: leafIntent, markedListItems: &markedListItems))
+        let next = block(leafText, intent: leafIntent, markedListItems: &markedListItems)
+        let quoteID = leafIntent?.components.first { $0.kind == .blockQuote }?.identity
+        // Foundation makes each paragraph of a block quote its own leaf.
+        if case .quote(let paragraph) = next, quoteID == lastQuoteID,
+          case .quote(var quote) = blocks.last
+        {
+          quote.append(AttributedString("\n\n"))
+          quote.append(paragraph)
+          blocks[blocks.count - 1] = .quote(quote)
+        } else {
+          blocks.append(next)
+          lastQuoteID = quoteID
+        }
       }
       leafID = nil
       leafIntent = nil

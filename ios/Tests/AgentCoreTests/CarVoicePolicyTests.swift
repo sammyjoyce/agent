@@ -129,6 +129,12 @@ import Testing
   )
 }
 
+@Test func eachParagraphOfAQuoteIsReadAsItsOwnSentence() {
+  #expect(
+    SpokenReply.speech(from: "> First paragraph without a stop\n>\n> Second paragraph")
+      == "First paragraph without a stop. Second paragraph.")
+}
+
 @Test func aBareWebAddressInAnyCaseReadsAsALinkAndKeepsItsSentenceEnd() {
   let table = [
     (
