@@ -20,6 +20,10 @@ esac
 
 native_dir=$(cd "$(dirname "$0")/.." && pwd)
 repo_root=$(cd "$native_dir/.." && pwd)
+# Scope SDKROOT per command, before the first package graph is resolved. Host
+# and simulator builds must not reuse an inherited SDK from the other platform.
+with_sdk() { bash "$native_dir/scripts/with-sdk.sh" "$@"; }
+python3 "$native_dir/scripts/test-sdk-selection.py"
 mkdir -p "$repo_root/target/ios-validation"
 run_dir=$(mktemp -d "$repo_root/target/ios-validation/run.XXXXXX")
 printf 'Native validation output: %s\n' "$run_dir"
@@ -68,7 +72,7 @@ func sessionWithoutPin(_ directory: ProfileDirectory, _ address: CoordinatorAddr
   _ = CoordinatorSession(directory: directory, address: address, transport: .tailnet)
 }
 SWIFT
-  if swift build --package-path "$boundary" --scratch-path "$run_dir/boundary-build" 2>&1 \
+  if with_sdk macosx swift build --package-path "$boundary" --scratch-path "$run_dir/boundary-build" 2>&1 \
     | sed $'s/\e\\[[0-9;]*m//g' > "$run_dir/boundary.log"; then
     printf 'Identity boundary violations compiled\n' >&2
     exit 1
@@ -81,7 +85,7 @@ SWIFT
     fi
   done
   rm "$violation"
-  if ! swift build --package-path "$boundary" --scratch-path "$run_dir/boundary-build" \
+  if ! with_sdk macosx swift build --package-path "$boundary" --scratch-path "$run_dir/boundary-build" \
     > "$run_dir/boundary-clean.log" 2>&1; then
     cat "$run_dir/boundary-clean.log" >&2
     exit 1
@@ -90,24 +94,24 @@ SWIFT
   mkdir "$run_dir/macos-rendered"
   # Native captures block MainActor. Run them apart from async lifecycle tests
   # so rendering time cannot consume a network assertion's deadline.
-  swift test --package-path "$native_dir" --scratch-path "$run_dir/macos" \
+  with_sdk macosx swift test --package-path "$native_dir" --scratch-path "$run_dir/macos" \
     --skip NativeRenderingTests --attachments-path "$run_dir/macos-rendered"
-  swift test --package-path "$native_dir" --scratch-path "$run_dir/macos" \
+  with_sdk macosx swift test --package-path "$native_dir" --scratch-path "$run_dir/macos" \
     --filter NativeRenderingTests \
     --attachments-path "$run_dir/macos-rendered"
-  swift test --configuration release --package-path "$native_dir" \
+  with_sdk macosx swift test --configuration release --package-path "$native_dir" \
     --scratch-path "$run_dir/macos" --filter "$performance_test" \
     --attachments-path "$run_dir/macos-rendered"
-  (cd "$native_dir/Speech" && xcodebuild -quiet -scheme Speech -destination 'generic/platform=iOS' \
+  (cd "$native_dir/Speech" && with_sdk iphoneos xcodebuild -quiet -scheme Speech -destination 'generic/platform=iOS' \
     -derivedDataPath "$run_dir/speech" -onlyUsePackageVersionsFromResolvedFile \
     CODE_SIGNING_ALLOWED=NO build)
   python3 "$native_dir/PhoneAcceptance/test_phone_acceptance.py"
-  xcodebuild -quiet -project "$native_dir/PhoneAcceptance/PhoneAcceptance.xcodeproj" \
+  with_sdk iphoneos xcodebuild -quiet -project "$native_dir/PhoneAcceptance/PhoneAcceptance.xcodeproj" \
     -scheme PhoneAcceptance -destination 'generic/platform=iOS' \
     -derivedDataPath "$run_dir/phone-acceptance" CODE_SIGNING_ALLOWED=NO build-for-testing
   # Users get the Release build, and each build extracts its own App Intents metadata.
   for configuration in Debug Release; do
-    xcodebuild -quiet -project "$native_dir/Agent.xcodeproj" -scheme Agent \
+    with_sdk iphonesimulator xcodebuild -quiet -project "$native_dir/Agent.xcodeproj" -scheme Agent \
       -configuration "$configuration" -destination 'generic/platform=iOS Simulator' \
       -onlyUsePackageVersionsFromResolvedFile \
       -derivedDataPath "$run_dir/app" ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO build
@@ -119,7 +123,7 @@ SWIFT
   show_signing() {
     local sdk=$1
     shift
-    xcodebuild -project "$native_dir/Agent.xcodeproj" -target Agent -target AgentShare \
+    with_sdk "$sdk" xcodebuild -project "$native_dir/Agent.xcodeproj" -target Agent -target AgentShare \
       -sdk "$sdk" -showBuildSettings -json "$@"
   }
   for sdk in iphoneos iphonesimulator; do
@@ -314,13 +318,13 @@ xcrun simctl bootstatus "$simulator_id" -b
 for suite in "${suites[@]}"; do
   case "$suite" in
     core)
-      xcodebuild -quiet -workspace "$run_dir/NativeTests.xcworkspace" -scheme AgentCoreTests \
+      with_sdk iphonesimulator xcodebuild -quiet -workspace "$run_dir/NativeTests.xcworkspace" -scheme AgentCoreTests \
         -destination "platform=iOS Simulator,id=$simulator_id" -destination-timeout 60 \
         -parallel-testing-enabled NO -derivedDataPath "$run_dir/tests" \
         -resultBundlePath "$run_dir/ios-core-tests.xcresult" CODE_SIGNING_ALLOWED=NO test
       ;;
     performance)
-      xcodebuild -quiet -workspace "$run_dir/NativeTests.xcworkspace" -scheme AgentCoreTests \
+      with_sdk iphonesimulator xcodebuild -quiet -workspace "$run_dir/NativeTests.xcworkspace" -scheme AgentCoreTests \
         -configuration Release -only-testing:"AgentCoreTests/$performance_test()" \
         -destination "platform=iOS Simulator,id=$simulator_id" -destination-timeout 60 \
         -parallel-testing-enabled NO -derivedDataPath "$run_dir/tests" \
@@ -333,7 +337,7 @@ for suite in "${suites[@]}"; do
       notification_watcher=$!
       # App Group access is enforced in the simulator too. Ad-hoc signing
       # supplies real entitlements without an Apple account or profile.
-      xcodebuild -quiet -project "$native_dir/Agent.xcodeproj" -scheme Agent \
+      with_sdk iphonesimulator xcodebuild -quiet -project "$native_dir/Agent.xcodeproj" -scheme Agent \
         -destination "platform=iOS Simulator,id=$simulator_id" -destination-timeout 60 \
         -onlyUsePackageVersionsFromResolvedFile \
         -parallel-testing-enabled NO -test-timeouts-enabled YES -derivedDataPath "$run_dir/app" \

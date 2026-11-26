@@ -24,12 +24,17 @@ func supports273AppIntentsSDK() -> Bool {
       }
     }
   }
-  let candidates = [
-    sdkRoot.map { "\($0)/SDKSettings.json" },
-    developerDir.map {
-      "\($0)/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk/SDKSettings.json"
-    },
-  ].compactMap { $0 }
+  // An explicit SDK is authoritative, even when unreadable: never fall back to
+  // a newer SDK and enable APIs that the selected compiler cannot import.
+  // iOS build callers must select their target SDK before package resolution.
+  let candidates: [String]
+  if let sdkRoot {
+    candidates = ["\(sdkRoot)/SDKSettings.json"]
+  } else {
+    candidates = developerDir.map {
+      ["\($0)/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk/SDKSettings.json"]
+    } ?? []
+  }
   for path in candidates {
     guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
