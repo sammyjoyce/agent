@@ -396,6 +396,83 @@ private func replies(_ prefix: String, _ count: Int, next: String? = nil) -> Nat
     }
   }
 
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func workPickerHoldsSendFromAnotherWindow() async throws {
+    try await withLab(tcp: true) { lab, coordinators in
+      let (work, _) = try await addWorkAndPersonal(coordinators)
+      let chat = coordinators.chat
+      let workTarget = try orchardWorkTarget(chat, lane: work)
+      try #require(await chat.respond(inChatTo: workTarget))
+      let workText = "Friday suits the orchard delivery"
+      chat.draft = workText
+      let picker = try #require(chat.beginPicker())
+      defer { chat.endPicker(picker) }
+      try #require(
+        chat.sendBlocker == .preparingAttachments && !chat.canSend,
+        "Send waits for the picker that holds the Work response")
+      #expect(chat.startSend() == nil)
+      #expect(chat.draft == workText && chat.workResponseTarget == workTarget)
+      let bytes = Data("Invented orchard delivery plan".utf8)
+      let url = lab.root.appending(path: "Delivery plan.txt")
+      try bytes.write(to: url)
+      let importing = try #require(chat.attach(urls: [url]))
+      chat.endPicker(picker)
+      await importing.value
+      let file = try #require(chat.attachments.first)
+      #expect(chat.canSend)
+      await chat.send()
+      try await eventually("Work received the response") {
+        await submitted(lab.workFixture).count == 1
+      }
+      let received = await lab.workFixture.received().compactMap {
+        if case .submit(let request) = $0 { request } else { nil }
+      }
+      let sent = try #require(received.first)
+      #expect(sent.text.hasSuffix("My response:\n\(workText)"))
+      #expect(sent.attachments?.map(\.id) == [file.id])
+      #expect(await lab.workFixture.uploaded(file.id) == bytes)
+      #expect(await submitted(lab.personalFixture).isEmpty)
+    }
+  }
+
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func workPickerHoldsItsItemFromAnotherWindow() async throws {
+    try await withLab(tcp: true) { lab, coordinators in
+      let (work, personal) = try await addWorkAndPersonal(coordinators)
+      let chat = coordinators.chat
+      let workTarget = try orchardWorkTarget(chat, lane: work)
+      let personalTarget = try orchardWorkTarget(chat, lane: personal)
+      try #require(await chat.respond(inChatTo: workTarget))
+      let picker = try #require(chat.beginPicker())
+      defer { chat.endPicker(picker) }
+      let tookPersonal = await chat.respond(inChatTo: personalTarget)
+      try #require(
+        !chat.canSelectWorkResponse && !tookPersonal,
+        "Another item waits for the picker that holds the Work response")
+      #expect(chat.workResponseTarget == workTarget)
+      let bytes = Data("Invented orchard delivery plan".utf8)
+      let url = lab.root.appending(path: "Delivery plan.txt")
+      try bytes.write(to: url)
+      let importing = try #require(chat.attach(urls: [url]))
+      chat.endPicker(picker)
+      await importing.value
+      let file = try #require(chat.attachments.first)
+      #expect(chat.workResponseTarget == workTarget && chat.canSelectWorkResponse)
+      chat.draft = "Plan attached"
+      await chat.send()
+      try await eventually("Work received the file") {
+        await submitted(lab.workFixture).count == 1
+      }
+      let received = await lab.workFixture.received().compactMap {
+        if case .submit(let request) = $0 { request } else { nil }
+      }
+      #expect(received.first?.attachments?.map(\.id) == [file.id])
+      #expect(await lab.workFixture.uploaded(file.id) == bytes)
+      #expect(await lab.personalFixture.uploadCount() == 0)
+      #expect(await chat.respond(inChatTo: personalTarget))
+    }
+  }
+
   @MainActor @Test(.timeLimit(.minutes(1)), arguments: [false, true])
   func onlyAWaitingShareStopsAHeldWorkDictationSend(batchWaiting: Bool) async throws {
     try await withLab(tcp: true) { lab, coordinators in

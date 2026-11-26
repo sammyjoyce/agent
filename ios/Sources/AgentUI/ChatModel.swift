@@ -394,7 +394,7 @@ final class ChatModel {
   }
   var canSelectWorkResponse: Bool {
     draftReady && !admitting && !selectingWorkResponse && !preparingAttachments
-      && !dictationInProgress
+      && draftProducers.isEmpty
       && !pendingSharedImport && recoveredWorkResponse == nil
       && inspectedConversation == nil && activeSidechat == nil
   }
@@ -1339,6 +1339,7 @@ final class ChatModel {
     if admitting || selectingWorkResponse { return .admitting }
     if preparingAttachments { return .preparingAttachments }
     if workResponseTarget != nil, dictationInProgress { return .dictating }
+    if producingWorkResponse { return .preparingAttachments }
     if feedbackDraft != nil { return nil }
     guard case .to = addressing else { return .addressing(addressing) }
     return nil
