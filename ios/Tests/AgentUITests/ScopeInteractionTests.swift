@@ -250,6 +250,8 @@ final class ScopeInteractionTests: XCTestCase {
     app.buttons["Paste images"].tap()
     let attachment = app.buttons["Remove Image.jpg"]
     XCTAssertTrue(attachment.waitForExistence(timeout: 5))
+    let recipients = app.staticTexts["recipientLine"]
+    XCTAssertEqual(recipients.label, "To Work and Personal")
 
     let strip = app.buttons["activeWorkStrip"]
     let sheet = app.navigationBars["Active work"]
@@ -282,6 +284,9 @@ final class ScopeInteractionTests: XCTestCase {
     XCTAssertTrue(banner.waitForNonExistence(timeout: 5))
     XCTAssertEqual(composer.value as? String, note)
     XCTAssertTrue(attachment.exists)
+    XCTAssertTrue(
+      recipients.wait(for: \.label, toEqual: "To Work and Personal", timeout: 5),
+      "recipientLine reads \(recipients.label)")
 
     strip.tap()
     let inspect = app.buttons.matching(

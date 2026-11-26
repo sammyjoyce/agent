@@ -383,6 +383,7 @@ final class ChatModel {
   private var pendingContext: ComposerContext?
   private(set) var recoveredWorkResponse: RecoveredWorkResponse?
   private var selectingWorkResponse = false
+  @ObservationIgnored private var draftRevisionAtWorkSelection: Int?
   private var pendingReply: PendingReply? {
     if case .reply(let reply) = pendingContext { return reply }
     return nil
@@ -410,9 +411,12 @@ final class ChatModel {
         return false
       }
       reference = existing.reference
-    } else if addressesByName, destination.chip == nil, restoredFrom == nil {
-      reference.conflictsWithLeadingTags = Addressing.leadingTags(committed).tags.contains {
-        $0.lowercased() != name(lane).lowercased()
+    } else {
+      draftRevisionAtWorkSelection = draftRevision
+      if addressesByName, destination.chip == nil, restoredFrom == nil {
+        reference.conflictsWithLeadingTags = Addressing.leadingTags(committed).tags.contains {
+          $0.lowercased() != name(lane).lowercased()
+        }
       }
     }
     selectingWorkResponse = true
@@ -447,7 +451,9 @@ final class ChatModel {
     let work = workResponseTarget?.reference
     pendingContext = nil
     guard let work else { return }
-    if !composerIsEmpty, compatibleWithWorkDraft(work) {
+    if draftRevisionAtWorkSelection != draftRevision, !composerIsEmpty,
+      compatibleWithWorkDraft(work)
+    {
       destination = .chip(work.lane)
     } else {
       draftChanged()

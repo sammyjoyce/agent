@@ -703,6 +703,56 @@ private func replies(_ prefix: String, _ count: Int, next: String? = nil) -> Nat
     }
   }
 
+  enum WorkCancel: CaseIterable { case untouched, edited, relaunched }
+
+  @MainActor @Test(.timeLimit(.minutes(1)), arguments: WorkCancel.allCases)
+  func cancellingAWorkResponseRestoresOnlyAnUntouchedDraftsRecipients(_ kind: WorkCancel)
+    async throws
+  {
+    try await withLab { lab, coordinators in
+      let (work, personal) = try await addWorkAndPersonal(coordinators)
+      var chat = coordinators.chat
+      let note = "Invented note about the harvest supper"
+      chat.draft = note
+      let before = chat.draftAddressing
+      try #require(chat.addressing == .to([work, personal], body: note))
+      try #require(await chat.respond(inChatTo: orchardWorkTarget(chat, lane: work)))
+      var cold: Coordinators?
+      switch kind {
+      case .edited: chat.draft = note + " and the orchard"
+      case .relaunched:
+        await coordinators.setActive(false)
+        let reopened = await lab.launch()
+        await reopened.setActive(true)
+        chat = reopened.chat
+        cold = reopened
+        try await eventually("both reopened profiles connected") {
+          [work, personal].allSatisfy { chat.snapshots[$0]?.connection == .connected }
+        }
+        try #require(chat.workResponseTarget != nil)
+      case .untouched: break
+      }
+      let text = chat.draft
+      chat.clearComposerContext()
+      #expect(chat.workResponseTarget == nil && chat.draft == text)
+      let recipients = kind == .untouched ? [work, personal] : [work]
+      if kind == .untouched {
+        #expect(chat.draftAddressing == before)
+      } else {
+        #expect(chat.destination == .chip(work))
+      }
+      #expect(chat.addressing == .to(recipients, body: text))
+      await chat.send()
+      try await eventually("Work received the note") {
+        await submitted(lab.workFixture) == [text]
+      }
+      try await eventually("Personal received the note only when it was for both") {
+        await submitted(lab.personalFixture) == (recipients.contains(personal) ? [text] : [])
+      }
+      await cold?.setActive(false)
+    }
+  }
+
   @MainActor @Test(.timeLimit(.minutes(1)))
   func sharedDraftDoesNotInheritTheSelectedWorkResponse() async throws {
     try await withLab { lab, coordinators in
