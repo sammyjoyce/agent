@@ -1,4 +1,5 @@
 import AgentCore
+import UIKit
 import XCTest
 
 @MainActor
@@ -214,6 +215,193 @@ final class ScopeInteractionTests: XCTestCase {
     XCTAssertTrue(field.wait(for: \.isEnabled, toEqual: true, timeout: 10))
     field.tap()
     field.typeText(text)
+  }
+
+  func testRespondInChatKeepsTheDraftAndSendsOnlyToTheSelectedCoordinator() async throws {
+    let parcel = ActiveWorkItem(
+      conversationId: "parcel-conversation", detail: "Choose a delivery date",
+      id: "task:parcel-17", isJob: false, startedAt: 10, status: .waitingOwner,
+      taskId: "parcel-17", title: "Parcel review")
+    let (app, work, personal) = try await launch { work, personal in
+      var other = parcel
+      other.title = "Personal parcel review"
+      other.conversationId = "personal-parcel-conversation"
+      other.startedAt = 20
+      await work.serveActiveWork(.init(conversations: [], nodes: [], omitted: 0, work: [parcel]))
+      await personal.serveActiveWork(
+        .init(conversations: [], nodes: [], omitted: 0, work: [other]))
+      await work.serveInspection(
+        parcel.conversationId,
+        messages: [
+          .init(
+            continuation: false, entryId: "parcel-log-1", finalChunk: true, role: .assistant,
+            text: "Invented parcel inspection log.")
+        ])
+    }
+
+    let note = "Friday works"
+    let composer = app.textViews["Message the coordinator"]
+    type(note, app)
+    let renderer = UIGraphicsImageRenderer(size: CGSize(width: 32, height: 24))
+    UIPasteboard.general.image = renderer.image { context in
+      UIColor.systemTeal.setFill()
+      context.fill(CGRect(x: 0, y: 0, width: 32, height: 24))
+    }
+    app.buttons["Paste images"].tap()
+    let attachment = app.buttons["Remove Image.jpg"]
+    XCTAssertTrue(attachment.waitForExistence(timeout: 5))
+
+    let strip = app.buttons["activeWorkStrip"]
+    let sheet = app.navigationBars["Active work"]
+    let banner = app.otherElements["workResponseBanner"]
+    let respond = app.buttons.matching(
+      NSPredicate(format: "label == 'Respond in chat' AND identifier ENDSWITH '-task:parcel-17'")
+    )
+    .firstMatch
+    func selectParcel() {
+      XCTAssertTrue(strip.waitForExistence(timeout: 5))
+      strip.tap()
+      XCTAssertTrue(sheet.waitForExistence(timeout: 5))
+      XCTAssertTrue(app.staticTexts["Parcel review"].waitForExistence(timeout: 5))
+      XCTAssertTrue(app.staticTexts["Personal parcel review"].waitForExistence(timeout: 5))
+      XCTAssertTrue(
+        respond.waitForExistence(timeout: 5),
+        "The waiting-owner row must offer Respond in chat")
+      respond.tap()
+      XCTAssertTrue(sheet.waitForNonExistence(timeout: 5))
+      XCTAssertTrue(banner.waitForExistence(timeout: 5))
+      XCTAssertTrue(banner.staticTexts["Responding in Work chat"].exists)
+      XCTAssertTrue(
+        banner.staticTexts["Parcel review · Choose a delivery date"].exists)
+      XCTAssertEqual(composer.value as? String, note)
+      XCTAssertTrue(attachment.exists)
+    }
+
+    selectParcel()
+    app.buttons["Cancel work response"].tap()
+    XCTAssertTrue(banner.waitForNonExistence(timeout: 5))
+    XCTAssertEqual(composer.value as? String, note)
+    XCTAssertTrue(attachment.exists)
+
+    strip.tap()
+    let inspect = app.buttons.matching(
+      NSPredicate(
+        format: "identifier BEGINSWITH 'activeWorkRow:' AND label CONTAINS 'Parcel review'")
+    )
+    .firstMatch
+    inspect.tap()
+    XCTAssertTrue(app.staticTexts["Invented parcel inspection log."].waitForExistence(timeout: 10))
+    XCTAssertFalse(app.buttons["Send message"].isHittable)
+    let closeInspection = app.buttons["closeWorkInspection"]
+    closeInspection.tap()
+    XCTAssertTrue(closeInspection.waitForNonExistence(timeout: 5))
+    XCTAssertTrue(sheet.waitForExistence(timeout: 5))
+    sheet.buttons["Done"].tap()
+    XCTAssertTrue(sheet.waitForNonExistence(timeout: 5))
+
+    selectParcel()
+    var updated = parcel
+    updated.title = "Changed parcel notice"
+    updated.conversationId = "later-parcel-conversation"
+    try await work.publish(
+      .taskGraph(.init(graph: .init(conversations: [], nodes: [], omitted: 0, work: [updated]))))
+    choose("Personal", app)
+    let send = app.buttons["Send message"]
+    XCTAssertTrue(send.wait(for: \.isEnabled, toEqual: false, timeout: 5))
+    XCTAssertEqual(app.staticTexts["recipientLine"].label, "This draft goes to Work")
+    choose("Work", app)
+    let workBeforeSend = await work.submitRequests()
+    let personalBeforeSend = await personal.submitRequests()
+    XCTAssertTrue(workBeforeSend.isEmpty)
+    XCTAssertTrue(personalBeforeSend.isEmpty)
+    XCTAssertTrue(send.wait(for: \.isEnabled, toEqual: true, timeout: 5))
+    send.tap()
+
+    try await wait { await work.submitAttempts() == 1 }
+    let received = await work.submitRequests()
+    let request = try XCTUnwrap(received.first)
+    XCTAssertTrue(request.text.contains("Task ID: \"parcel-17\""), request.text)
+    XCTAssertTrue(request.text.contains("Conversation ID: \"parcel-conversation\""), request.text)
+    XCTAssertTrue(request.text.contains("Coordinator: \"Work\""), request.text)
+    XCTAssertTrue(request.text.contains("Title: \"Parcel review\""), request.text)
+    XCTAssertFalse(request.text.contains("later-parcel-conversation"), request.text)
+    XCTAssertTrue(request.text.hasSuffix("My response:\n\(note)"), request.text)
+    XCTAssertNil(request.replyTo)
+    XCTAssertEqual(request.attachments?.map(\.name), ["Image.jpg"])
+    let other = await personal.submitRequests()
+    XCTAssertTrue(other.isEmpty)
+    XCTAssertTrue(banner.waitForNonExistence(timeout: 5))
+  }
+
+  func testRespondInChatPreservesJobSidechatAndChildIdentity() async throws {
+    let items = [
+      ActiveWorkItem(
+        conversationId: "nightly-conversation", id: "task:nightly-1", isJob: true,
+        status: .waitingOwner, taskId: "nightly-1", title: "Nightly orchard report"),
+      ActiveWorkItem(
+        conversationId: "orchard-chat", id: "sidechat:orchard-chat", isJob: false,
+        sidechatSlug: "orchard-planning", status: .waitingOwner, title: "Orchard planning"),
+      ActiveWorkItem(
+        children: [
+          .init(
+            agentId: "runner-1", conversationId: "child-conversation", status: .waitingOwner,
+            title: "Orchard runner", tools: [])
+        ],
+        conversationId: "plan-conversation", id: "task:plan-1", isJob: false,
+        status: .running, taskId: "plan-1", title: "Orchard plan"),
+    ]
+    let (app, work, _) = try await launch(count: 1) { work, _ in
+      await work.serveActiveWork(.init(conversations: [], nodes: [], omitted: 0, work: items))
+    }
+    let cases = [
+      (
+        "task:nightly-1", "Nightly orchard report", "nightly-conversation",
+        "Task ID: \"nightly-1\"", "Job: \"yes\""
+      ),
+      (
+        "sidechat:orchard-chat", "Orchard planning", "orchard-chat",
+        "Work item ID: \"sidechat:orchard-chat\"", "Side chat: \"orchard-planning\""
+      ),
+      (
+        "task:plan-1:runner-1", "Orchard runner", "child-conversation", "Task ID: \"plan-1\"",
+        "Child agent ID: \"runner-1\""
+      ),
+    ]
+    let strip = app.buttons["activeWorkStrip"]
+    let sheet = app.navigationBars["Active work"]
+    let banner = app.otherElements["workResponseBanner"]
+    XCTAssertTrue(strip.waitForExistence(timeout: 10))
+    for (index, (id, title, conversation, identity, kind)) in cases.enumerated() {
+      strip.tap()
+      XCTAssertTrue(sheet.waitForExistence(timeout: 5))
+      let respond = app.buttons.matching(
+        NSPredicate(
+          format: "identifier BEGINSWITH 'activeWorkRespond:' AND identifier ENDSWITH %@", "-\(id)")
+      )
+      .firstMatch
+      XCTAssertTrue(respond.waitForExistence(timeout: 5))
+      respond.tap()
+      XCTAssertTrue(sheet.waitForNonExistence(timeout: 5))
+      XCTAssertTrue(banner.staticTexts[title].waitForExistence(timeout: 5))
+      let beforeSend = await work.submitAttempts()
+      XCTAssertEqual(beforeSend, index)
+      let response = "Invented response \(index)"
+      type(response, app)
+      app.buttons["Send message"].tap()
+      try await wait { await work.submitAttempts() == index + 1 }
+      let received = await work.submitRequests()
+      let request = try XCTUnwrap(received.last)
+      XCTAssertTrue(request.text.contains("Conversation ID: \"\(conversation)\""), request.text)
+      XCTAssertTrue(request.text.contains(identity), request.text)
+      XCTAssertTrue(request.text.contains(kind), request.text)
+      XCTAssertTrue(request.text.hasSuffix("My response:\n\(response)"), request.text)
+      XCTAssertNil(request.replyTo)
+      XCTAssertTrue(banner.waitForNonExistence(timeout: 5))
+    }
+    let directSidechatInputs = await work.sidechatInputs()
+    let jobRetries = await work.retriedJobs()
+    XCTAssertTrue(directSidechatInputs.isEmpty)
+    XCTAssertTrue(jobRetries.isEmpty)
   }
 
   func testNotificationTapsRouteWithoutChangingTheDraft() async throws {

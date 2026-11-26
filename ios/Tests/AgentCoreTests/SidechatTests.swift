@@ -442,8 +442,12 @@ func sidechatComposerPreservesReplyTargetForSlashPrefixedText() async throws {
 
     let replyRef = ReplyReference(entryId: "12", excerpt: "Earlier note", role: .assistant)
     await MainActor.run {
-      sidechatModel.pendingReply = ChatModel.PendingReply(
-        reference: replyRef, lane: mainSession.profile)
+      let row = RowModel(
+        ChatRow(
+          id: "invented-reply", entryID: replyRef.entryId, role: replyRef.role,
+          text: replyRef.excerpt))
+      row.lane = mainSession.profile
+      sidechatModel.reply(to: row)
       sidechatModel.draft = "/etc/hosts check"
     }
     await sidechatModel.send()

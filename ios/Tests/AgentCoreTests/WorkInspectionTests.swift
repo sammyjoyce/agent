@@ -292,7 +292,6 @@ private func inspectionJob(
       ChatRow(id: "a-1", entryID: "entry-a-1", role: .final, text: "Alpha original message"))
     rowFromA.lane = profileA.id
     model.reply(to: rowFromA)
-    #expect(model.pendingReply?.lane == profileA.id)
 
     // Target Beta while replying to Alpha's message: must refuse explicitly and preserve draft + reply.
     model.show(.one(profileB.id))
@@ -300,7 +299,7 @@ private func inspectionJob(
     let refused = model.startSend()
     #expect(refused == nil)
     #expect(model.draft == "Cross-lane follow-up")
-    #expect(model.pendingReply?.reference.entryId == "entry-a-1")
+    #expect(model.replyTarget?.entryId == "entry-a-1")
     #expect(model.reports.last?.contains("Alpha") == true)
     #expect(
       await fixtureB.received().filter { if case .submit = $0 { true } else { false } }.isEmpty)
@@ -647,7 +646,8 @@ private func inspectionJob(
           ActiveWorkStrip(summary: model.activeWorkSummary) {}
           Spacer()
         }, name: "active-work-strip")
-      try await Self.captureWork(ActiveWorkSheet(model: model), name: "active-work-sheet")
+      try await Self.captureWork(
+        ActiveWorkSheet(model: model, respond: { _ in }), name: "active-work-sheet")
     }
 
     @MainActor @Test func dreamsListAndDetailViewsRenderCoverageChecksEvidenceAndEscapedPatch()

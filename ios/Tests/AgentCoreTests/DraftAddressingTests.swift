@@ -49,6 +49,94 @@ extension DraftDisk {
   }
 }
 
+/// The required root fields of the draft decoder at 81ec9c2. Unknown keys are ignored.
+private struct BaseDraftRecord: Decodable {
+  let revision: UInt64
+  let text: String
+  let mode: InputMode
+  let attachments: [AttachmentRef]
+  let consumedTransfers: Set<UUID>
+}
+
+enum StoredWorkResponse: CaseIterable, Sendable {
+  case active, pending, recovered
+}
+
+@MainActor @Test(arguments: StoredWorkResponse.allCases)
+func workRecordsCannotBeOpenedByTheBaseDraftDecoder(_ position: StoredWorkResponse) async throws {
+  let disk = DraftDisk()
+  defer { disk.erase() }
+  let work = try profile("Work", "100.64.1.2")
+  try disk.saveRecord("Invented ordinary draft", addressing: nil)
+  let ordinaryBytes = try Data(contentsOf: disk.url)
+  #expect(
+    try JSONDecoder().decode(BaseDraftRecord.self, from: ordinaryBytes).text
+      == "Invented ordinary draft")
+  let store = ComposerDraftStore(url: disk.url)
+  #expect(try await store.load(from: disk.files).draft.text == "Invented ordinary draft")
+  let reference = WorkResponseReference(
+    lane: work.id, coordinator: "Work", itemID: "task:orchard", conversationID: "orchard-thread",
+    taskID: "orchard", agentID: nil, sidechatSlug: nil, isJob: false, title: "Orchard reply",
+    detail: nil)
+  let file = try await disk.file()
+  let note = "Invented orchard reply"
+  let metadata = RecoveredWorkResponse.Metadata(
+    reference: reference, mode: .followUp, addressing: .init())
+  var draft = ComposerDraft()
+  switch position {
+  case .active:
+    draft = ComposerDraft(text: note, attachments: [file], workResponse: reference)
+  case .pending:
+    let identity = ComposerInputIdentity(composerID: UUID())
+    draft.composerID = identity.composerID
+    draft.submission = ComposerSubmission(
+      identity: identity, outboxURLs: [disk.root.appending(path: "outbox.json")],
+      text: note, attachments: [file], workResponse: metadata)
+  case .recovered:
+    draft.text = "Different invented draft"
+    draft.recoveredWorkResponse = RecoveredWorkResponse(
+      metadata: metadata, text: note, attachments: [file])
+  }
+  try #require(try await store.save(draft, revision: 2))
+  let bytes = try Data(contentsOf: disk.url)
+  #expect(throws: DecodingError.self) {
+    try JSONDecoder().decode(BaseDraftRecord.self, from: bytes)
+  }
+  #expect(try Data(contentsOf: disk.url) == bytes)
+  let reopened = try await disk.saved()
+  if position == .recovered {
+    #expect(reopened.recoveredWorkResponse == draft.recoveredWorkResponse)
+    #expect(reopened.text == "Different invented draft")
+  } else {
+    #expect(
+      reopened.workResponse == reference && reopened.text == note && reopened.attachments == [file])
+  }
+  let envelope = try #require(try JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+  let flat = try #require(envelope["draft"] as? [String: Any])
+  try JSONSerialization.data(withJSONObject: flat).write(to: disk.url, options: .atomic)
+  let migrated = await disk.launch([work])
+  #expect(migrated.draftReady)
+  #expect(migrated.workResponseTarget?.reference == reopened.workResponse)
+  #expect(migrated.recoveredWorkResponse == reopened.recoveredWorkResponse)
+  let migratedBytes = try Data(contentsOf: disk.url)
+  #expect(throws: DecodingError.self) {
+    try JSONDecoder().decode(BaseDraftRecord.self, from: migratedBytes)
+  }
+}
+
+@MainActor @Test func anUnknownDraftVersionIsPreservedAndCannotSend() async throws {
+  let disk = DraftDisk()
+  defer { disk.erase() }
+  try disk.saveRecord("Invented ordinary draft", addressing: nil)
+  let bytes = Data(#"{"version":99,"draft":{"revision":2,"text":"Invented later draft"}}"#.utf8)
+  try bytes.write(to: disk.url, options: .atomic)
+  let model = await disk.launch([])
+  #expect(!model.draftReady && !model.canSend)
+  #expect(model.draftError == "This app cannot open draft format 99. The draft was preserved.")
+  #expect(await !model.saveDraft())
+  #expect(try Data(contentsOf: disk.url) == bytes)
+}
+
 @Test func addressingRoundTripsThroughTheStore() async throws {
   let disk = DraftDisk()
   defer { disk.erase() }

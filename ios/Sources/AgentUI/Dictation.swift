@@ -341,6 +341,7 @@ enum DictationNotice: Equatable {
     case .notSent(.blocked(.sharedImport)): "Not sent. A shared draft is still being added."
     case .notSent(.blocked(.admitting)): "Not sent. The last message is still sending."
     case .notSent(.blocked(.preparingAttachments)): "Not sent. Files are still being added."
+    case .notSent(.blocked(.dictating)): "Not sent. The current dictation is still finishing."
     case .notSent(.refused): "Not sent."
     case .downloadFailed(let reason): "The voice model did not download. \(reason)"
     case .failed(let reason): "Dictation failed. \(reason)"
@@ -588,6 +589,7 @@ public final class Dictation {
     notice = nil
     let reservation = target.reserve()
     target.chat.promoteTypedTag()
+    target.chat.beginDictation()
     let take = Take(
       target: target, reservation: reservation, mark: target.chat.draftMark,
       stage: .opening(gesture))
@@ -685,11 +687,13 @@ public final class Dictation {
       words = try result.get().trimmingCharacters(in: .whitespacesAndNewlines)
     } catch {
       target.unlock()
+      target.chat.endDictation()
       notice = .failed(error.localizedDescription)
       return
     }
     guard !words.isEmpty else {
       target.unlock()
+      target.chat.endDictation()
       notice = .nothingHeard
       return
     }
@@ -700,6 +704,7 @@ public final class Dictation {
       chat.edit(text, committed: text)
     }
     chat.promoteTypedTag()
+    chat.endDictation()
     guard landing == .send else { return }
     if !fresh {
       notice = .notSent(.draftChanged)
@@ -717,6 +722,7 @@ public final class Dictation {
     level = 0
     cancelTimers()
     take.target.unlock()
+    take.target.chat.endDictation()
     self.notice = notice
   }
 

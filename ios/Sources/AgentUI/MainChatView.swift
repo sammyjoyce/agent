@@ -67,6 +67,7 @@ public struct MainChatView: View {
   @Environment(\.dismiss) private var dismiss
   @FocusState private var composerFocused: Bool
   @State private var presentedSheet: PresentedSheet?
+  @State private var focusWorkResponse = false
   @State private var opened: [OpenedDestination] = []
   @State private var handledOpen: OpenRequest?
   @State private var followsLatest = true
@@ -80,7 +81,9 @@ public struct MainChatView: View {
   @State private var alertNotice: String?
   @State private var pendingAlertLatest: FeedScope?
   @State private var importingFiles = false
+  @State private var pickerHold: UUID?
   #if os(iOS)
+    @State private var choosingPhoto = false
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var composerEditor = ComposerEditor()
     @Environment(\.dynamicTypeSize) private var composerTextSize
@@ -371,7 +374,7 @@ public struct MainChatView: View {
         }
       }
     }
-    .sheet(item: $presentedSheet) { sheet in
+    .sheet(item: $presentedSheet, onDismiss: focusAfterWorkResponse) { sheet in
       Group {
         switch sheet {
         case .settings:
@@ -386,14 +389,24 @@ public struct MainChatView: View {
               }
           }
         case .activeWork:
-          ActiveWorkSheet(model: model) { lane, conversationID in
-            presentedSheet = nil
-            opened.append(
-              .sidechat(
-                SidechatDestination(
-                  target: ScopedEntityID(profile: lane, item: conversationID),
-                  request: UUID(), initial: nil)))
-          }
+          ActiveWorkSheet(
+            model: model,
+            openSidechat: { lane, conversationID in
+              presentedSheet = nil
+              opened.append(
+                .sidechat(
+                  SidechatDestination(
+                    target: ScopedEntityID(profile: lane, item: conversationID),
+                    request: UUID(), initial: nil)))
+            },
+            respond: { target in
+              Task {
+                guard await model.respond(inChatTo: target), case .activeWork? = presentedSheet
+                else { return }
+                focusWorkResponse = true
+                presentedSheet = nil
+              }
+            })
         case .sidechatSettings:
           if let sidechat = model.activeSidechat, let sidechatOwner, let sidechatLane {
             SidechatSettingsSheet(
@@ -419,6 +432,9 @@ public struct MainChatView: View {
       case .success(let urls): model.attach(urls: urls)
       case .failure(let error): model.failure = error.localizedDescription
       }
+      endPicker()
+    } onCancellation: {
+      endPicker()
     }
     .dropDestination(for: URL.self) { urls, _ in
       guard !inspecting, !dictating, model.draftReady, !urls.isEmpty else { return false }
@@ -427,9 +443,14 @@ public struct MainChatView: View {
     }
     #if os(iOS)
       .quickLookPreview($model.previewURL)
+      .photosPicker(isPresented: $choosingPhoto, selection: $selectedPhoto, matching: .images)
+      .onChange(of: choosingPhoto) { _, open in
+        if !open { endPicker() }
+      }
       .onChange(of: selectedPhoto) { _, photo in
         guard let photo else { return }
         let attaching = model.attach(photo: photo)
+        endPicker()
         Task {
           await attaching?.value
           selectedPhoto = nil
@@ -858,7 +879,9 @@ public struct MainChatView: View {
     switch item {
     case .message(let row):
       let entryID = row.row.entryID
-      let canReply = model.inspectedConversation == nil && entryID != nil && row.row.role.canReply
+      let canReply =
+        model.inspectedConversation == nil && entryID != nil && row.row.role.canReply
+        && !model.producingWorkResponse
       let onStartSidechat: (() -> Void)? = {
         guard !inspecting, model.activeSidechat == nil, let entryID,
           let lane = row.lane ?? model.profiles.first?.id,
@@ -913,9 +936,54 @@ public struct MainChatView: View {
     }
   #endif
   private var showsStop: Bool {
-    !model.admitting && model.busy
+    model.workResponseTarget == nil && !model.admitting && model.busy
       && model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
       && model.attachments.isEmpty
+  }
+
+  private func beginPicker() -> Bool {
+    pickerHold = model.beginPicker()
+    return pickerHold != nil
+  }
+
+  private func endPicker() {
+    guard let pickerHold else { return }
+    self.pickerHold = nil
+    model.endPicker(pickerHold)
+  }
+
+  private func focusAfterWorkResponse() {
+    guard focusWorkResponse else { return }
+    focusWorkResponse = false
+    guard model.workResponseTarget != nil, model.draftReady, !dictating else { return }
+    #if os(iOS)
+      composerEditor.view?.becomeFirstResponder()
+    #else
+      composerFocused = true
+    #endif
+  }
+
+  private func composerContextBanner(
+    heading: String, excerpt: String, lines: Int, id: String, cancel: String, cancelID: String
+  ) -> some View {
+    QuotedMessageBar(
+      heading: heading, excerpt: excerpt, accentColor: Color.accentColor, lineLimit: lines
+    ) {
+      Spacer(minLength: 4)
+      Button(cancel, systemImage: "xmark.circle.fill") {
+        model.clearComposerContext()
+      }
+      .labelStyle(.iconOnly)
+      .foregroundStyle(.secondary)
+      .frame(minWidth: 36, minHeight: 36)
+      .disabled(model.producingWorkResponse)
+      .accessibilityIdentifier(cancelID)
+    }
+    .padding(.horizontal, 10)
+    .padding(.vertical, 6)
+    .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+    .accessibilityElement(children: .contain)
+    .accessibilityIdentifier(id)
   }
   private var composerLayout: AnyLayout {
     #if os(iOS)
@@ -933,27 +1001,28 @@ public struct MainChatView: View {
           DictationStatus(dictation: dictation, chat: model)
         }
       #endif
-      if let reply = model.replyTarget {
-        QuotedMessageBar(
-          heading: "Replying to \(reply.role.speakerLabel)",
-          excerpt: reply.excerpt,
-          accentColor: Color.accentColor,
-          lineLimit: 1
-        ) {
-          Spacer(minLength: 4)
-          Button("Cancel reply", systemImage: "xmark.circle.fill") {
-            model.clearReply()
+      if let recovered = model.recoveredWorkResponse {
+        VStack(alignment: .leading, spacing: 3) {
+          Text("Unsent response · \(recovered.metadata.reference.title)")
+            .font(.caption.weight(.semibold))
+          Button("Restore work response") { Task { await model.restoreRecoveredWorkResponse() } }
+            .disabled(!model.canRestoreWorkResponse || dictating)
+          if !model.canRestoreWorkResponse {
+            Text("Send or clear the current draft to restore this response.").font(.caption)
           }
-          .labelStyle(.iconOnly)
-          .foregroundStyle(.secondary)
-          .frame(minWidth: 36, minHeight: 36)
-          .accessibilityIdentifier("cancelReplyButton")
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 10).padding(.vertical, 6)
         .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("replyTargetBanner")
+      }
+      if let reply = model.replyTarget {
+        composerContextBanner(
+          heading: "Replying to \(reply.role.speakerLabel)", excerpt: reply.excerpt, lines: 1,
+          id: "replyTargetBanner", cancel: "Cancel reply", cancelID: "cancelReplyButton")
+      } else if let work = model.workResponseTarget?.reference {
+        composerContextBanner(
+          heading: "Responding in \(work.coordinator) chat", excerpt: work.excerpt, lines: 2,
+          id: "workResponseBanner", cancel: "Cancel work response", cancelID: "cancelWorkResponse")
       }
       if !model.attachments.isEmpty {
         HStack {
@@ -978,11 +1047,9 @@ public struct MainChatView: View {
       composerLayout {
         Menu {
           Section("Attachments") {
-            Button("Choose files", systemImage: "folder") { importingFiles = true }
+            Button("Choose files", systemImage: "folder") { importingFiles = beginPicker() }
             #if os(iOS)
-              PhotosPicker(selection: $selectedPhoto, matching: .images) {
-                Label("Choose photo", systemImage: "photo")
-              }
+              Button("Choose photo", systemImage: "photo") { choosingPhoto = beginPicker() }
             #endif
           }.disabled(
             model.admitting || model.preparingAttachments || dictating
@@ -996,7 +1063,9 @@ public struct MainChatView: View {
                 Text(command.description)
               }
             }
-          }.disabled(model.admitting || dictating || model.commands.isEmpty)
+          }.disabled(
+            model.admitting || dictating || model.commands.isEmpty
+              || model.workResponseTarget != nil)
           Picker("Delivery", selection: $model.mode) {
             Text("Steer").tag(InputMode.steer)
             Text("Follow-up").tag(InputMode.followUp)
@@ -1093,7 +1162,7 @@ public struct MainChatView: View {
       .overlay {
         RoundedRectangle(cornerRadius: 26).strokeBorder(.primary.opacity(0.12), lineWidth: 0.5)
       }
-      if model.addressesByName {
+      if model.addressesByName || model.workResponseTarget != nil {
         RecipientLine(model: model)
       }
     }
