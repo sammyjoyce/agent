@@ -868,6 +868,15 @@
             }
           ]
         },
+        "observer_release_after_seconds": {
+          "description": "How long an interactive task terminal stays attached to finished work.\nWithout it, the runtime's default of 15 minutes applies.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
         "settings": {
           "$ref": "#/$defs/CoordinatorSettings"
         }

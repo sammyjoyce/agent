@@ -814,6 +814,8 @@ async function handle(request: RuntimeRequest): Promise<void> {
       case "configure_coordinator": {
         const application = await app();
         await application.startup.run("environment_configure", () => application.environment.configure(command.bootstrap));
+        const releaseAfter = command.bootstrap.observer_release_after_seconds;
+        if (releaseAfter !== undefined) application.tasks.useObserverReleaseAfter(releaseAfter * 1000);
         emit(id, { type: "configured" }); break;
       }
       case "register_node": {

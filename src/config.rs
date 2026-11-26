@@ -42,6 +42,8 @@ pub struct ClientConfig {
     pub sources: Vec<SourceConfig>,
     #[serde(default = "default_poll_interval")]
     pub poll_interval_seconds: u64,
+    /// How long a task terminal stays attached to finished work before the coordinator releases it.
+    pub observer_release_after_seconds: Option<u32>,
     /// Local only: forwards this Mac's finished Scrawl captures as feedback.
     #[serde(default)]
     pub scrawl_feedback: bool,
@@ -86,11 +88,14 @@ impl Default for ClientConfig {
             failover: None,
             sources: Vec::new(),
             poll_interval_seconds: default_poll_interval(),
+            observer_release_after_seconds: None,
             scrawl_feedback: false,
             dreams: None,
         }
     }
 }
+
+pub const OBSERVER_RELEASE_SECONDS: std::ops::RangeInclusive<u32> = 1..=86_400;
 
 fn default_poll_interval() -> u64 {
     60
@@ -357,6 +362,12 @@ fn validate(config: &mut ClientConfig) -> Result<()> {
         (10..=3600).contains(&config.poll_interval_seconds),
         "Source polling interval must be between 10 and 3600 seconds"
     );
+    if let Some(seconds) = config.observer_release_after_seconds {
+        ensure!(
+            OBSERVER_RELEASE_SECONDS.contains(&seconds),
+            "Observer release delay must be between 1 and 86400 seconds"
+        );
+    }
     if let Some(name) = &config.node_name {
         ensure!(
             !name.trim().is_empty() && name.len() <= 128 && !name.chars().any(char::is_control),
@@ -867,6 +878,30 @@ mod tests {
         std::fs::write(&settings, "scrawl_feedback = false\n").unwrap();
         assert!(crate::config::apply(&path, &settings).is_err());
         assert!(load(Some(&path)).unwrap().scrawl_feedback);
+    }
+
+    #[test]
+    fn observer_release_is_an_optional_grace_of_at_most_a_day() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(
+            load(Some(&path)).unwrap().observer_release_after_seconds,
+            None
+        );
+        std::fs::write(&path, "observer_release_after_seconds = 30\n").unwrap();
+        assert_eq!(
+            load(Some(&path)).unwrap().observer_release_after_seconds,
+            Some(30)
+        );
+        for invalid in ["0", "86401", "-1", "1.5", "'900'"] {
+            std::fs::write(
+                &path,
+                format!("observer_release_after_seconds = {invalid}\n"),
+            )
+            .unwrap();
+            assert!(load(Some(&path)).is_err(), "{invalid}");
+        }
     }
 
     #[test]

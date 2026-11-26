@@ -203,6 +203,7 @@ impl Coordinator {
                 sources: vec![],
             },
             background: None,
+            observer_release_after_seconds: None,
         };
         let runtime = Arc::new(
             Runtime::start(&script, OwnerClaim::acquire(files, &script, None).unwrap()).unwrap(),

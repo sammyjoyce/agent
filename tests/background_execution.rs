@@ -225,6 +225,7 @@ async fn stopping_one_background_actor_drains_its_real_process_and_preserves_the
             sources: vec![],
         },
         background: None,
+        observer_release_after_seconds: None,
     };
     let runtime = Arc::new(
         Runtime::start(

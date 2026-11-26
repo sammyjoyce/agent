@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
     process::{ExitCode, Stdio},
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use agent_cli::{
@@ -1087,6 +1087,7 @@ async fn run(mut arguments: Arguments) -> Result<()> {
                 sources: !no_sources,
                 jobs: startup_jobs(&config),
             }),
+            observer_release_after_seconds: config.observer_release_after_seconds,
         };
         let dreams = config.dreams_policy()?;
         return service::serve_configured(
@@ -1869,21 +1870,45 @@ async fn run(mut arguments: Arguments) -> Result<()> {
         })?;
         let mut ui = UiSession::new(handle, inputs);
         ui.initial_replay = Some(ui.handle.begin_history_replay()?);
-        let (result, end) = tokio::select! {
-            result = request_with_ui(&arguments, client, command, &mut ui) => {
-                (result.map(|_| ()), TerminalEnd::Own)
+        // A release ends the request without a failure. Only a terminal that
+        // holds nothing ends with it. Any other terminal attaches again, and
+        // the coordinator starts a new grace for it.
+        let attached = async {
+            loop {
+                let attached = Instant::now();
+                let result = request_with_ui(&arguments, client, command.clone(), &mut ui)
+                    .await
+                    .map(|_| ());
+                let released =
+                    result.is_ok() && !ui.exit_requested && attached.elapsed() >= SOONEST_RELEASE;
+                if !released
+                    || ui
+                        .idle_at_release(task_id, agent_id.as_ref())
+                        .await
+                        .unwrap_or(true)
+                {
+                    break result;
+                }
+                ui.orphan_submitted();
             }
+        };
+        let (result, end) = tokio::select! {
+            result = attached => (result, TerminalEnd::Own),
             signal = signals.next() => (
                 Err(anyhow::anyhow!("{signal} ended this terminal")),
                 TerminalEnd::Signal,
             ),
         };
-        let (kept, end) = if result.is_err() {
+        let unasked = result.is_err() || !ui.exit_requested;
+        let (kept, end) = if unasked {
             let (draft, end) =
-                interface_answer(ui.handle.composer_draft(), end, signals.next()).await;
-            (preserve_ui_recovery(&directory, owner, &ui, draft), end)
+                interface_answer(ui.handle.stop_with_draft(), end, signals.next()).await;
+            (
+                preserve_ui_recovery(&directory, owner.clone(), &mut ui, draft),
+                end,
+            )
         } else {
-            (KeptInput::Nothing, end)
+            (preserve_orphaned(&directory, owner.clone(), &ui), end)
         };
         ui.close_view().await;
         finish_controls(&mut ui.controls).await;
@@ -1892,6 +1917,31 @@ async fn run(mut arguments: Arguments) -> Result<()> {
         // stops. Nothing is left to show on its terminal.
         let Some(stopped) = stopped else {
             std::process::exit(1);
+        };
+        let kept = match kept {
+            KeptInput::Nothing if unasked && end == TerminalEnd::Own => {
+                let Some(text) = typed_after_last_read() else {
+                    // The runtime's teardown takes milliseconds, and a key
+                    // that arrives in them is lost with the pane. The view,
+                    // its connections and their children have stopped, the
+                    // interface restored the terminal, and exit flushes stdout.
+                    if let Err(error) = result.and(stopped) {
+                        eprintln!("Error: {error:?}");
+                        std::process::exit(1);
+                    }
+                    std::process::exit(0);
+                };
+                let late = UiRecovery {
+                    owner,
+                    draft: ComposerInput {
+                        text,
+                        ..Default::default()
+                    },
+                    queued_inputs: Vec::new(),
+                };
+                save_recoveries(&directory, vec![late], None)
+            }
+            kept => kept,
         };
         tokio::select! {
             biased;
@@ -2039,7 +2089,7 @@ struct ChatStart {
     sidechat: Option<SidechatSummary>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum UiRecoveryOwner {
     Main,
@@ -2118,6 +2168,11 @@ enum KeptInput {
     Unsaved(UnsavedInput),
 }
 
+/// The shortest grace the coordinator's config allows. A request that ends
+/// sooner was not released, and attaching again could repeat without end.
+const SOONEST_RELEASE: Duration =
+    Duration::from_secs(*config::OBSERVER_RELEASE_SECONDS.start() as u64);
+
 /// How long a task terminal that a signal ended waits for its interface.
 const INTERFACE_ANSWER_WAIT: Duration = Duration::from_secs(1);
 
@@ -2145,45 +2200,149 @@ async fn interface_answer<T>(
     (answer, TerminalEnd::Signal)
 }
 
-/// Saves what a failed task terminal still holds. `draft` is the interface's
-/// answer for the composer. A missing or failed answer does not stop the save
-/// of the inputs. The terminal shows that failure only when it saved nothing.
+/// Saves what a task terminal still holds when it ends without being asked
+/// to. `draft` is the stopped interface's answer for the composer. The
+/// composer and the inputs its request never read belong to the conversation
+/// in view, which is the task unless the terminal switched.
 fn preserve_ui_recovery(
     directory: &Path,
     owner: UiRecoveryOwner,
-    ui: &UiSession,
+    ui: &mut UiSession,
     draft: Option<Result<ComposerInput>>,
 ) -> KeptInput {
-    let (draft, failure) = match draft.context("The terminal interface did not answer") {
+    let (shown, mut failure) = match draft.context("The terminal interface did not answer") {
         Ok(Ok(draft)) => (draft, None),
         Ok(Err(error)) | Err(error) => (ComposerInput::default(), Some(error)),
     };
-    let recovery = UiRecovery {
-        owner,
-        draft,
-        queued_inputs: ui
-            .queued
-            .iter()
-            .chain(ui.submitted.iter())
-            .cloned()
-            .collect(),
+    let in_view = (shown, unread_submissions(&mut ui.inputs));
+    let (of_task, of_selected) = if ui.selected.is_none() {
+        (in_view, Default::default())
+    } else {
+        (Default::default(), in_view)
     };
-    if recovery.is_empty() {
-        return match failure {
-            None => KeptInput::Nothing,
-            Some(error) => KeptInput::Unsaved(UnsavedInput {
-                input: ComposerInput::default(),
-                error,
-            }),
-        };
+    let mut recoveries = vec![UiRecovery {
+        owner,
+        draft: of_task.0,
+        queued_inputs: ui.unplaced_inputs(of_task.1),
+    }];
+    match observed_recoveries(ui, of_selected.0, of_selected.1) {
+        Ok(elsewhere) => recoveries.extend(elsewhere),
+        Err(error) => failure = failure.or(Some(error)),
     }
-    match write_ui_recovery(directory, &recovery) {
-        Ok(path) => KeptInput::Saved(vec![path]),
-        Err(error) => KeptInput::Unsaved(UnsavedInput {
-            input: recovery.into_unsent(),
+    save_recoveries(directory, recoveries, failure)
+}
+
+/// Saves the orphaned inputs of a task terminal that you quit. A quit discards
+/// what the terminal holds, but you sent an orphaned input, so it is kept.
+fn preserve_orphaned(directory: &Path, owner: UiRecoveryOwner, ui: &UiSession) -> KeptInput {
+    let orphaned = UiRecovery {
+        owner,
+        draft: ComposerInput::default(),
+        queued_inputs: ui.orphaned_inputs(),
+    };
+    save_recoveries(directory, vec![orphaned], None)
+}
+
+/// Writes one file for each recovery that holds input. A `failure` to collect
+/// part of the input does not stop the save of the rest. The terminal shows
+/// that failure only when it saved nothing.
+fn save_recoveries(
+    directory: &Path,
+    mut recoveries: Vec<UiRecovery>,
+    failure: Option<anyhow::Error>,
+) -> KeptInput {
+    recoveries.retain(|recovery| !recovery.is_empty());
+    let saved: Result<Vec<PathBuf>> = recoveries
+        .iter()
+        .map(|recovery| write_ui_recovery(directory, recovery))
+        .collect();
+    match (saved, failure) {
+        (Ok(paths), None) if paths.is_empty() => KeptInput::Nothing,
+        (Ok(paths), Some(error)) if paths.is_empty() => KeptInput::Unsaved(UnsavedInput {
+            input: ComposerInput::default(),
+            error,
+        }),
+        (Ok(paths), _) => KeptInput::Saved(paths),
+        (Err(error), _) => KeptInput::Unsaved(UnsavedInput {
+            input: all_unsent(recoveries),
             error,
         }),
     }
+}
+
+/// Every input the recoveries hold, as one text to show when no file took them.
+fn all_unsent(recoveries: Vec<UiRecovery>) -> ComposerInput {
+    let mut input = ComposerInput::default();
+    for recovery in recoveries {
+        input.append(recovery.into_unsent());
+    }
+    input
+}
+
+async fn submit_queued(
+    queued: &mut VecDeque<QueuedInput>,
+    submitted: &mut VecDeque<QueuedInput>,
+    writer: &mut (dyn AsyncWrite + Unpin + Send),
+) -> Result<()> {
+    while let Some(input) = queued.pop_front() {
+        submitted.push_back(input.clone());
+        write_command(
+            writer,
+            &RuntimeCommand::SubmitInput {
+                origin: Some(agent_cli::protocol::InputOrigin::Cli),
+                input_id: input.id,
+                input: input.input.text,
+                attachments: (!input.input.attachments.is_empty())
+                    .then_some(input.input.attachments),
+                mode: input.mode,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Inputs the task never placed, oldest first. An input leaves `queued` for
+/// `submitted` before its write, so a submitted input is older than a queued
+/// one, and both are older than an input the request never read. An orphaned
+/// input was submitted to an earlier request, so it is the oldest.
+fn unplaced_inputs(
+    orphaned: &[QueuedInput],
+    submitted: &VecDeque<QueuedInput>,
+    queued: &VecDeque<QueuedInput>,
+    unread: Vec<QueuedInput>,
+) -> Vec<QueuedInput> {
+    orphaned
+        .iter()
+        .chain(submitted)
+        .chain(queued)
+        .cloned()
+        .chain(unread)
+        .collect()
+}
+
+fn unread_submissions(
+    inputs: &mut tokio::sync::mpsc::UnboundedReceiver<TuiInput>,
+) -> Vec<QueuedInput> {
+    let mut unread = Vec::new();
+    while let Ok(input) = inputs.try_recv() {
+        let (input, mode) = match input {
+            TuiInput::Submit(input) => (input, InputMode::Steer),
+            TuiInput::Queue(input) => (input, InputMode::FollowUp),
+            // The recovery keeps the command as it was typed, so its text still reads as feedback.
+            TuiInput::Feedback(mut input) => {
+                input.text = format!("/feedback {}", input.text);
+                (input, InputMode::Steer)
+            }
+            _ => continue,
+        };
+        unread.push(QueuedInput {
+            id: uuid::Uuid::new_v4().to_string(),
+            input,
+            mode,
+        });
+    }
+    unread
 }
 
 /// Shows what a task terminal kept, then waits for one line or the end of
@@ -2242,11 +2401,102 @@ async fn present_kept_input(
     let _ = keys.read_line(&mut String::new()).await;
 }
 
-async fn preserve_observed_recovery(directory: &Path, ui: &UiSession) -> Result<Vec<PathBuf>> {
-    let mut drafts = ui.drafts.clone();
-    if let Some(id) = &ui.conversation_id {
-        drafts.insert(id.clone(), ui.handle.composer_draft().await?);
+/// What a person typed into a task terminal after its interface stopped
+/// reading keys. A canonical terminal reports only whole lines, so the check
+/// reads in non-canonical mode and then restores the terminal's modes.
+fn typed_after_last_read() -> Option<String> {
+    let stdin = libc::STDIN_FILENO;
+    let mut modes = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { libc::tcgetattr(stdin, modes.as_mut_ptr()) } != 0 {
+        return None;
     }
+    let modes = unsafe { modes.assume_init() };
+    let mut reading = modes;
+    reading.c_lflag &= !libc::ICANON;
+    reading.c_cc[libc::VMIN] = 0;
+    reading.c_cc[libc::VTIME] = 0;
+    if unsafe { libc::tcsetattr(stdin, libc::TCSANOW, &reading) } != 0 {
+        return None;
+    }
+    let mut arrived = Vec::new();
+    let mut ready = libc::pollfd {
+        fd: stdin,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let mut buffer = [0u8; 4096];
+    while unsafe { libc::poll(&mut ready, 1, 0) } > 0 {
+        let read = unsafe { libc::read(stdin, buffer.as_mut_ptr().cast(), buffer.len()) };
+        let Ok(read @ 1..) = usize::try_from(read) else {
+            break;
+        };
+        arrived.extend_from_slice(&buffer[..read]);
+    }
+    unsafe { libc::tcsetattr(stdin, libc::TCSANOW, &modes) };
+    typed_text(&arrived)
+}
+
+/// The text a person typed among the bytes a terminal delivered. Escape
+/// sequences are keys a draft cannot hold or the terminal's own replies,
+/// such as focus, mouse and cursor reports.
+fn typed_text(bytes: &[u8]) -> Option<String> {
+    let mut kept = Vec::new();
+    let mut rest = bytes;
+    while let Some((&byte, after)) = rest.split_first() {
+        rest = match (byte, after) {
+            (0x1b, [b'[', sequence @ ..]) => sequence
+                .iter()
+                .position(|byte| (0x40..=0x7e).contains(byte))
+                .map_or(&[], |end| &sequence[end + 1..]),
+            (0x1b, [b'O', _, sequence @ ..]) => sequence,
+            (0x1b, [b']' | b'P' | b'_' | b'^' | b'X', sequence @ ..]) => {
+                match sequence.iter().position(|byte| matches!(byte, 0x07 | 0x1b)) {
+                    Some(end) if sequence[end] == 0x07 => &sequence[end + 1..],
+                    Some(end) => sequence.get(end + 2..).unwrap_or(&[]),
+                    None => &[],
+                }
+            }
+            _ => {
+                kept.push(byte);
+                after
+            }
+        };
+    }
+    let mut text = String::new();
+    for typed in String::from_utf8_lossy(&kept).chars() {
+        match typed {
+            '\x7f' | '\x08' => {
+                text.pop();
+            }
+            '\r' | '\n' => text.push('\n'),
+            '\t' => text.push('\t'),
+            typed if !typed.is_control() => text.push(typed),
+            _ => {}
+        }
+    }
+    (!text.trim().is_empty()).then_some(text)
+}
+
+async fn preserve_observed_recovery(directory: &Path, ui: &UiSession) -> Result<Vec<PathBuf>> {
+    let shown = match ui.conversation_id {
+        Some(_) => ui.handle.composer_draft().await?,
+        None => ComposerInput::default(),
+    };
+    observed_recoveries(ui, shown, Vec::new())?
+        .iter()
+        .map(|recovery| write_ui_recovery(directory, recovery))
+        .collect()
+}
+
+/// The unsent input of each conversation a terminal viewed. `shown` is the
+/// composer and `unread` the inputs nothing read yet. Both belong to the
+/// conversation in view.
+fn observed_recoveries(
+    ui: &UiSession,
+    shown: ComposerInput,
+    unread: Vec<QueuedInput>,
+) -> Result<Vec<UiRecovery>> {
+    let mut drafts = ui.drafts.clone();
     let mut queued = HashMap::<String, Vec<QueuedInput>>::new();
     for input in &ui.pending_admissions {
         if input.retained()? {
@@ -2260,25 +2510,22 @@ async fn preserve_observed_recovery(directory: &Path, ui: &UiSession) -> Result<
                 });
         }
     }
+    if let Some(id) = &ui.conversation_id {
+        drafts.insert(id.clone(), shown);
+        queued.entry(id.clone()).or_default().extend(unread);
+    }
     for id in queued.keys() {
         drafts.entry(id.clone()).or_default();
     }
-    let mut paths = Vec::new();
-    for (conversation_id, draft) in drafts {
-        let queued_inputs = queued.remove(&conversation_id).unwrap_or_default();
-        if draft.is_empty() && queued_inputs.is_empty() {
-            continue;
-        }
-        paths.push(write_ui_recovery(
-            directory,
-            &UiRecovery {
-                owner: UiRecoveryOwner::Conversation { conversation_id },
-                draft,
-                queued_inputs,
-            },
-        )?);
-    }
-    Ok(paths)
+    Ok(drafts
+        .into_iter()
+        .map(|(conversation_id, draft)| UiRecovery {
+            queued_inputs: queued.remove(&conversation_id).unwrap_or_default(),
+            owner: UiRecoveryOwner::Conversation { conversation_id },
+            draft,
+        })
+        .filter(|recovery| !recovery.is_empty())
+        .collect())
 }
 
 fn write_ui_recovery(directory: &Path, recovery: &UiRecovery) -> Result<PathBuf> {
@@ -2318,10 +2565,16 @@ struct UiSession {
     inputs: tokio::sync::mpsc::UnboundedReceiver<TuiInput>,
     queued: VecDeque<QueuedInput>,
     history_cursor: Option<String>,
-    exiting: bool,
+    exit_requested: bool,
     failure_shown: bool,
     conversation_id: Option<String>,
+    /// The conversation of this terminal's own request, whatever view is shown.
+    own_conversation: Option<String>,
     submitted: VecDeque<QueuedInput>,
+    /// Inputs still in `submitted` when their request ended at a release. No
+    /// later request writes them again, because the coordinator does not
+    /// ignore a repeated input ID.
+    orphaned: Vec<QueuedInput>,
     errors: VecDeque<String>,
     controls: tokio::task::JoinSet<()>,
     tool_lookup: Option<tokio::task::AbortHandle>,
@@ -2346,10 +2599,12 @@ impl UiSession {
             inputs,
             queued: VecDeque::new(),
             history_cursor: None,
-            exiting: false,
+            exit_requested: false,
             failure_shown: false,
             conversation_id: None,
+            own_conversation: None,
             submitted: VecDeque::new(),
+            orphaned: Vec::new(),
             errors: VecDeque::new(),
             controls: tokio::task::JoinSet::new(),
             tool_lookup: None,
@@ -2553,9 +2808,99 @@ impl UiSession {
         self.queued.push_back(QueuedInput { id, input, mode });
         Ok(())
     }
-    fn placed_input(&mut self, input_id: &str) {
+    /// Whether a released task terminal holds nothing, and so ends. A release
+    /// never ends a terminal that you still use. The terminal ends only when
+    /// it shows its own task, its composer is empty, no other conversation
+    /// has a draft, and no input is queued, submitted, unread or waiting for
+    /// admission. A terminal that ends has stopped reading keys.
+    async fn idle_at_release(&self, task_id: &TaskId, agent_id: Option<&String>) -> Result<bool> {
+        let shows_own_task = self.selected.as_ref().is_none_or(|selected| {
+            selected.task_id.as_ref() == Some(task_id) && selected.agent_id.as_ref() == agent_id
+        });
+        if !shows_own_task || !self.queued.is_empty() || !self.submitted.is_empty() {
+            return Ok(false);
+        }
+        for input in &self.pending_admissions {
+            if input.retained()? {
+                return Ok(false);
+            }
+        }
+        // The composer holds the draft of the conversation in view.
+        let elsewhere = |id: &String| self.conversation_id.as_ref() != Some(id);
+        if self
+            .drafts
+            .iter()
+            .any(|(id, draft)| elsewhere(id) && !draft.is_empty())
+        {
+            return Ok(false);
+        }
+        // Keys stop before the answer, so no key is read between this decision
+        // and the exit. Text that left the composer through Enter is in
+        // `inputs` by now.
+        let composer = self.handle.pause_keys().await?;
+        let idle = composer.is_empty() && self.inputs.is_empty();
+        if !idle {
+            self.handle.read_keys()?;
+        }
+        Ok(idle)
+    }
+    /// Sets apart the inputs still submitted to a request that a release ended.
+    fn orphan_submitted(&mut self) {
+        self.orphaned.extend(self.submitted.drain(..));
+    }
+    fn orphaned_inputs(&self) -> Vec<QueuedInput> {
+        self.orphaned.clone()
+    }
+    /// The inputs that the task never placed, oldest first, with `unread` last.
+    fn unplaced_inputs(&self, unread: Vec<QueuedInput>) -> Vec<QueuedInput> {
+        unplaced_inputs(&self.orphaned, &self.submitted, &self.queued, unread)
+    }
+    /// Follows the request of this terminal's own conversation. Its inputs are
+    /// placed or rejected whatever view is shown.
+    fn own_request_event(&mut self, event: &RuntimeEventKind) -> Result<()> {
+        match event {
+            RuntimeEventKind::TaskReady {
+                conversation_id, ..
+            }
+            | RuntimeEventKind::MainReady {
+                conversation_id, ..
+            } => self.own_conversation = Some(conversation_id.clone()),
+            RuntimeEventKind::InputPlaced { input_id, .. } => self.placed_input(input_id),
+            RuntimeEventKind::InputRejected { input_id, .. } => self.rejected_input(input_id)?,
+            _ => {}
+        }
+        Ok(())
+    }
+    /// Takes an input that this terminal wrote to a request of its own.
+    fn take_written(&mut self, input_id: &str) -> Option<QueuedInput> {
         if let Some(index) = self.submitted.iter().position(|input| input.id == input_id) {
-            self.submitted.remove(index);
+            return self.submitted.remove(index);
+        }
+        let index = self
+            .orphaned
+            .iter()
+            .position(|input| input.id == input_id)?;
+        Some(self.orphaned.remove(index))
+    }
+    fn placed_input(&mut self, input_id: &str) {
+        self.take_written(input_id);
+    }
+    /// Returns an input that the request's conversation rejected to the draft
+    /// of that conversation. The composer holds that draft while the
+    /// conversation is in view.
+    fn rejected_input(&mut self, input_id: &str) -> Result<()> {
+        let Some(input) = self.take_written(input_id) else {
+            return Ok(());
+        };
+        match &self.own_conversation {
+            Some(own) if self.conversation_id.as_ref() != Some(own) => {
+                self.drafts
+                    .entry(own.clone())
+                    .or_default()
+                    .append(input.input);
+                Ok(())
+            }
+            _ => self.handle.restore_composer(input.input),
         }
     }
 }
@@ -3621,7 +3966,7 @@ async fn chat_tui(
             tokio::select! {
                 result = &mut request => break result.context("Could not load the main conversation settings")?,
                 input = ui.next() => match input.unwrap_or(TuiInput::Exit) {
-                    TuiInput::Exit => { ui.exiting = true; return Ok(()); }
+                    TuiInput::Exit => { ui.exit_requested = true; return Ok(()); }
                     input => startup_inputs.push_back(input),
                 }
             }
@@ -3699,7 +4044,7 @@ async fn chat_tui(
             }
             initial_prompt = None;
         }
-        while !ui.exiting {
+        while !ui.exit_requested {
             let input = match startup_inputs.pop_front() {
                 Some(input) => input,
                 None => ui.next().await.unwrap_or(TuiInput::Exit),
@@ -3729,7 +4074,7 @@ async fn chat_tui(
                 TuiInput::History => {} // All native pages are already being replayed in the background.
                 TuiInput::Exit => {
                     ui.finish_admissions().await?;
-                    ui.exiting = true;
+                    ui.exit_requested = true;
                 }
             }
         }
@@ -4676,6 +5021,10 @@ async fn request_presented(
     let mut failure = None::<CoordinatorFailure>;
     let mut outcome = false;
     let mut progress_key = None;
+    let mut attached = Instant::now();
+    // A plain terminal that attached again has shown its task, its settings, its history and
+    // its prompt. Each new attachment sends them again, up to the first idle or new event.
+    let mut shown_before = false;
     loop {
         let frame = tokio::select! {
             frame = reader.next_frame() => match frame.map_err(ViewError::read)? {
@@ -4770,7 +5119,7 @@ async fn request_presented(
                     TuiInput::Exit => {
                         if let Some(ui) = presentation.as_mut().and_then(|view| view.session.as_deref_mut()) {
                             ui.finish_admissions().await?;
-                            ui.exiting = true;
+                            ui.exit_requested = true;
                         }
                         if lifecycle == RequestLifecycle::Chat || lifecycle.is_view() { return Ok(history_cursor); }
                         if lifecycle.is_worker() { write_command(&mut *wire.writer, &RuntimeCommand::DetachWorker).await?; }
@@ -4873,21 +5222,25 @@ async fn request_presented(
         };
         let event = decode_coordinator_event(&frame)?;
         acknowledge_feedback_event(directory, &command, &event)?;
+        if shown_before {
+            match &event {
+                RuntimeEventKind::TaskReady { .. } => { ready = true; continue; }
+                RuntimeEventKind::ConversationSettings { .. } | RuntimeEventKind::History { .. } => continue,
+                RuntimeEventKind::WorkerIdle => { shown_before = false; continue; }
+                _ => shown_before = false,
+            }
+        }
+        if let Some(ui) = presentation
+            .as_mut()
+            .and_then(|view| view.session.as_deref_mut())
+        {
+            ui.own_request_event(&event)?;
+        }
         if let Some(ui) = presentation
             .as_mut()
             .and_then(|view| view.session.as_deref_mut()).filter(|ui|ui.selected.is_none())
         {
             match &event {
-                RuntimeEventKind::InputRejected { input_id, .. } => {
-                    if let Some(index) = ui.submitted.iter().position(|input| &input.id == input_id)
-                        && let Some(input) = ui.submitted.remove(index)
-                    {
-                        ui.handle.restore_composer(input.input)?;
-                    }
-                }
-                RuntimeEventKind::InputPlaced { input_id, .. } => {
-                    ui.placed_input(input_id);
-                }
                 RuntimeEventKind::Failure { message, .. } => {
                     if ui.errors.len() == 8 {
                         ui.errors.pop_front();
@@ -4993,17 +5346,26 @@ async fn request_presented(
             }
             RuntimeEventKind::Done => {
                 if (lifecycle == RequestLifecycle::Chat || lifecycle.is_view()) && let Some(view) = &presentation && view.session.as_ref().is_none_or(|ui|ui.selected.is_none()) { view.handle.working(false)?; }
-                break;
+                // Text that is typed and not entered sits in the tty's line buffer, where a plain
+                // terminal cannot see it. So a release never ends a plain terminal that you have
+                // not left. It attaches again, as a terminal that holds unsent input does.
+                let released = presentation.is_none() && lifecycle.is_worker() && interactive
+                    && failure.is_none() && attached.elapsed() >= SOONEST_RELEASE;
+                if !released { break; }
+                let next = connection(client, false).await?;
+                close_connection(&mut *wire.writer, wire.child.take()).await?;
+                wire.writer = next.writer;
+                wire.child = next.child;
+                reader = FrameReader::new(BufReader::new(next.reader));
+                write_command(&mut *wire.writer, &command).await?;
+                attached = Instant::now();
+                ready = false;
+                shown_before = true;
             }
             RuntimeEventKind::MainReady { .. } => {
                 ready = true;
                 if let Some(ui) = presentation.as_mut().and_then(|view| view.session.as_deref_mut()).filter(|_|lifecycle.input_ready(ready)) {
-                    while let Some(input) = ui.queued.pop_front() {
-                        let input_id = input.id.clone();
-                        ui.submitted.push_back(input.clone());
-                        write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput {
-                            origin: Some(agent_cli::protocol::InputOrigin::Cli), input_id, input: input.input.text, attachments: (!input.input.attachments.is_empty()).then_some(input.input.attachments), mode: input.mode }).await?;
-                    }
+                    submit_queued(&mut ui.queued, &mut ui.submitted, &mut *wire.writer).await?;
                 }
                 if arguments.json { display(&event, true)?; }
             }
@@ -5015,12 +5377,7 @@ async fn request_presented(
                     .and_then(|view| view.session.as_deref_mut())
                     .filter(|_|lifecycle.input_ready(ready))
                 {
-                    while let Some(input) = ui.queued.pop_front() {
-                        let input_id = input.id.clone();
-                        ui.submitted.push_back(input.clone());
-                        write_command(&mut *wire.writer, &RuntimeCommand::SubmitInput {
-                            origin: Some(agent_cli::protocol::InputOrigin::Cli), input_id, input: input.input.text, attachments: (!input.input.attachments.is_empty()).then_some(input.input.attachments), mode: input.mode }).await?;
-                    }
+                    submit_queued(&mut ui.queued, &mut ui.submitted, &mut *wire.writer).await?;
                 } else if arguments.json {
                     display(&event, true)?;
                 } else {
@@ -5477,13 +5834,16 @@ use hang_limit::TEST_HANG_LIMIT;
 mod tests {
     use crate::{
         Action, Arguments, INTERFACE_ANSWER_WAIT, KeptInput, ModelArgs, TEST_HANG_LIMIT,
-        TerminalEnd, UnsavedInput, executable_fixture::write_executable, fake_rex,
-        interface_answer, local_service_command, present_kept_input,
+        TerminalEnd, UiRecovery, UiRecoveryOwner, UnsavedInput, all_unsent,
+        executable_fixture::write_executable, fake_rex, interface_answer, local_service_command,
+        present_kept_input, unread_submissions,
     };
+    use agent_cli::attachments::AttachmentRef;
     use agent_cli::models::{ModelProvider, ModelSelection, Reasoning};
     use agent_cli::protocol::{ImportPhase, ImportProgress, SearchMode};
     use agent_cli::rex::RexClient;
     use agent_cli::serialized_spawn::SerializedSpawn;
+    use agent_cli::tui::{TuiInput, attachments::ComposerInput};
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use clap::Parser;
     use std::path::{Path, PathBuf};
@@ -5763,6 +6123,133 @@ mod tests {
             "{}",
             shown.screen
         );
+    }
+
+    #[test]
+    fn keys_typed_after_the_last_read_keep_only_what_a_person_typed() {
+        use crate::typed_text;
+        assert_eq!(
+            typed_text("Check the café ✓".as_bytes()).as_deref(),
+            Some("Check the café ✓")
+        );
+        assert_eq!(
+            typed_text(b"Tag teh\x7f\x7fhe build\r").as_deref(),
+            Some("Tag the build\n")
+        );
+        let replies_around_a_note = [
+            &b"\x1b[I\x1b[O"[..],
+            b"\x1b[<0;12;5M\x1b[<0;12;5m",
+            b"\x1b[12;34R",
+            b"\x1bOA\x1b[27u",
+            b"\x1b]11;rgb:0000/0000/0000\x07",
+            b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\",
+            b"\x1bP>|terminal 1.0\x1b\\",
+            b"note",
+            b"\x1b[200~ pasted\x1b[201~",
+            b"\x1b[?62;4c",
+        ]
+        .concat();
+        assert_eq!(
+            typed_text(&replies_around_a_note).as_deref(),
+            Some("note pasted")
+        );
+        assert_eq!(typed_text(b""), None);
+        assert_eq!(typed_text(b"\x1b[I\x1b[12;34R\x1b]11;rgb:0/0/0\x07"), None);
+        assert_eq!(typed_text(b"\r \x1b[O"), None);
+        assert_eq!(typed_text(b"\x1b]11;rgb:0000/00"), None, "a cut reply");
+    }
+
+    #[test]
+    fn inputs_sent_after_the_last_read_are_kept_for_recovery_in_order() {
+        use crate::unread_submissions;
+        use agent_cli::{protocol::InputMode, tui::TuiInput};
+        let (sender, mut inputs) = tokio::sync::mpsc::unbounded_channel();
+        sender
+            .send(TuiInput::Submit("Check the release notes".into()))
+            .unwrap();
+        sender.send(TuiInput::Interrupt).unwrap();
+        sender
+            .send(TuiInput::Queue("Then tag the build".into()))
+            .unwrap();
+        let kept: Vec<_> = unread_submissions(&mut inputs)
+            .into_iter()
+            .map(|queued| (queued.input.text, queued.mode))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                ("Check the release notes".to_owned(), InputMode::Steer),
+                ("Then tag the build".to_owned(), InputMode::FollowUp),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_flush_keeps_unsent_inputs_in_the_order_they_were_typed() {
+        use crate::{QueuedInput, submit_queued, unplaced_inputs, unread_submissions};
+        use agent_cli::{protocol::InputMode, tui::TuiInput};
+        use std::collections::VecDeque;
+        let typed = |text: &str| QueuedInput {
+            id: text.to_owned(),
+            input: text.into(),
+            mode: InputMode::Steer,
+        };
+        let mut queued = VecDeque::from([typed("first"), typed("second")]);
+        let mut submitted = VecDeque::new();
+        let (mut coordinator, closed) = tokio::io::duplex(1);
+        drop(closed);
+        submit_queued(&mut queued, &mut submitted, &mut coordinator)
+            .await
+            .expect_err("The coordinator's connection is closed");
+        let (sender, mut inputs) = tokio::sync::mpsc::unbounded_channel();
+        sender.send(TuiInput::Submit("third".into())).unwrap();
+        let orphaned = [typed("zeroth")];
+        let kept: Vec<_> = unplaced_inputs(
+            &orphaned,
+            &submitted,
+            &queued,
+            unread_submissions(&mut inputs),
+        )
+        .into_iter()
+        .map(|queued| queued.input.text)
+        .collect();
+        assert_eq!(kept, ["zeroth", "first", "second", "third"]);
+    }
+
+    #[test]
+    fn feedback_sent_after_the_last_read_is_kept_with_its_attachments_and_shown_if_the_save_fails()
+    {
+        let screenshot = AttachmentRef {
+            id: "attachment-1".into(),
+            name: "frozen-pane.png".into(),
+            media_type: "image/png".into(),
+            size_bytes: 12,
+            sha256: "0".repeat(64),
+        };
+        let (sender, mut inputs) = tokio::sync::mpsc::unbounded_channel();
+        sender.send(TuiInput::Submit("first".into())).unwrap();
+        sender
+            .send(TuiInput::Feedback(ComposerInput {
+                text: "The pane froze".into(),
+                attachments: vec![screenshot.clone()],
+                ..ComposerInput::default()
+            }))
+            .unwrap();
+        sender.send(TuiInput::Queue("third".into())).unwrap();
+        let kept = unread_submissions(&mut inputs);
+        let texts: Vec<_> = kept.iter().map(|input| input.input.text.as_str()).collect();
+        assert_eq!(texts, ["first", "/feedback The pane froze", "third"]);
+        assert_eq!(kept[1].input.attachments, [screenshot]);
+
+        let shown = all_unsent(vec![UiRecovery {
+            owner: UiRecoveryOwner::Conversation {
+                conversation_id: "1".into(),
+            },
+            draft: ComposerInput::default(),
+            queued_inputs: kept,
+        }]);
+        assert_eq!(shown.text, "first\n/feedback The pane froze\nthird");
+        assert_eq!(shown.attachment_count(), 1);
     }
 
     #[tokio::test]

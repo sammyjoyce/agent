@@ -944,6 +944,7 @@ impl Coordinator {
                 }],
             },
             background: None,
+            observer_release_after_seconds: None,
         };
         let claim = OwnerClaim::acquire(&world.state, &script, None).unwrap();
         let runtime = Arc::new(Runtime::start(&script, claim).unwrap());

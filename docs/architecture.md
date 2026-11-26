@@ -348,18 +348,82 @@ a quick failure closes its pane too. When you quit a task's terminal, or its
 task's terminal in a new window of the same session. A session whose last pane
 closed stays in Rex, empty, until then.
 
-A pane that closes takes its screen with it, so `run-task` does not exit while
-it still shows you where your unsent input went. When `run-task` fails, for
-example because it lost its coordinator, it saves the unsent input to a private
-recovery file. It then prints the file's path and waits for Enter before it
-exits. If the save fails, it prints the input and waits in the same way. While
-it waits, it reports to Rex that it is blocked, so the pane's tab and the
-session picker show that it needs you. A `run-task` that kept nothing exits at
-once, so a failure at startup leaves no pane. SIGTERM and SIGHUP ask `run-task`
-to end. It saves the unsent input, prints the path and exits without waiting.
-If that save fails, it prints the input and waits for Enter as above, because
-the input would leave with the pane. A second signal or a closed terminal ends
-that wait. When you quit the terminal yourself, it saves nothing.
+A terminal does not hold its pane open on finished work. Work is finished when
+its task is resolved, or its agent is done or failed, with no input waiting and
+no turn running. The coordinator releases each terminal attached to it 15
+minutes after the work finished or after the terminal attached, whichever is
+later. Input or a reopened task before then cancels every pending release, and
+the next finish starts the grace again. A released terminal's request ends
+normally, with `done` and no failure. A terminal that holds nothing then
+exits, and Rex closes the pane. The coordinator's
+`observer_release_after_seconds` setting changes the 15 minutes.
+
+A release ends only a terminal that holds nothing. A released terminal exits
+when all of these are true:
+
+- it shows its own task;
+- its composer is empty;
+- no other conversation has a draft;
+- no input is queued, submitted, unread or waiting for admission.
+
+Any other terminal sends its `run_task` again. It is attached to its task
+again, and a new grace starts. Nothing new crosses the protocol for this. A
+queued input waits for the task to be ready. A submitted input is one that the
+terminal wrote and the task has not placed. An unread input is one that you
+sent and the terminal has not read. An input waits for admission when you sent
+it in a conversation that you switched to and it is not yet confirmed. A
+`--no-tui` terminal attaches again after every release, because it cannot see
+a line that you typed and did not enter.
+
+Before a terminal decides to exit, it stops reading keys. It first reads the
+keys that have already arrived, and it checks its composer and its unread
+inputs after them. So a key that arrives while the terminal decides is not
+lost. It keeps the terminal attached. The terminal reads the keys once more as
+it stops its interface. A key that arrived after the decision is saved as
+unsent input, and the terminal waits for Enter. After the interface stops, a
+terminal that ended by itself and kept nothing checks its input once more,
+right before the process exits. A quit or a signal skips the check. A terminal
+in line mode reports only lines that you ended with Enter, so the check turns
+line mode off while it reads, and then restores it. It keeps the text that you
+typed and drops the terminal's own replies, such as focus, mouse and cursor
+reports. Any text left is saved as a draft, and the terminal waits for Enter.
+Otherwise the process exits at once, without the runtime's teardown, which can
+take milliseconds. A key that arrives between the check and the exit is still
+lost with the pane.
+
+The task places or rejects a submitted input whatever conversation the
+terminal shows. A rejected input goes back to the task's draft. The composer
+holds that draft only while the task is in view.
+
+An input can still be submitted when a release ends its request, for example
+because you sent it as the release arrived. The coordinator may not have read
+it. A new request does not write it again, because the coordinator does not
+ignore a repeated input ID, and a repeat of a placed input opens the task
+again. The terminal keeps such an input apart as orphaned and attaches again.
+If the task places the input after all, the terminal drops it. An orphaned
+input does not keep a terminal attached at a later release.
+
+If the coordinator refuses the request, for example because the task's binding
+moved to another pane, `run-task` exits. A pane that closes takes its screen
+with it, so `run-task` does not exit while it still shows you where your unsent
+input went. Whenever `run-task` ends without being asked to, it saves the
+unsent input of every conversation it viewed, in one private recovery file for
+each. The task's file also takes each orphaned or submitted input. A file lists
+inputs in the order you typed them, and a `/feedback` that the terminal had not
+read yet is among them, with its attachments. `run-task` then prints each
+file's path and waits for Enter before it exits. If a save fails, it prints the
+error and the input and waits in the same way. While it waits, it reports to
+Rex that it is blocked, so the pane's tab and the session picker show that it
+needs you. A `run-task` that kept nothing exits at once, so a failure at
+startup leaves no pane.
+
+SIGTERM and SIGHUP ask `run-task` to end. It saves the same input, prints the
+paths and exits without waiting. If a save fails, it prints the input and waits
+for Enter as above, because the input would leave with the pane. A second
+signal or a closed terminal ends that wait. When you quit the terminal
+yourself, it saves only the orphaned inputs, because you sent them. It then
+prints the path and waits for Enter. A quit with no orphaned input saves
+nothing.
 
 A recorded pane that closed with its program still proves its session, because
 Rex keeps the session and no longer has the block. So a create whose program
