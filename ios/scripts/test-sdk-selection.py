@@ -90,6 +90,15 @@ exit "$LOOKUP_STATUS"
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("CHILD", result.stdout)
 
+    def test_directory_sdk_settings_never_launches_child(self):
+        sim = self.sdks["iPhoneSimulator27.3"]
+        settings = Path(sim) / "SDKSettings.json"
+        settings.unlink()
+        settings.mkdir()
+        result = self.run_wrapper("iphonesimulator", None, sim)
+        self.assertEqual(result.returncode, 65, result.stderr)
+        self.assertNotIn("CHILD", result.stdout)
+
     def test_missing_child_rejected(self):
         result = subprocess.run(["bash", str(SCRIPT), "iphonesimulator"],
                                 capture_output=True, text=True)

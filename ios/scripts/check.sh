@@ -332,7 +332,7 @@ for suite in "${suites[@]}"; do
         CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES test
       ;;
     rendering)
-      with_sdk iphonesimulator python3 "$native_dir/scripts/test-notification-tap.py" --watch "$simulator_id" \
+      python3 "$native_dir/scripts/test-notification-tap.py" --watch "$simulator_id" \
         "$run_dir/notification-tap" &
       notification_watcher=$!
       # App Group access is enforced in the simulator too. Ad-hoc signing

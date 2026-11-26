@@ -32,7 +32,7 @@ fi
 SDKROOT=$(env -u SDKROOT xcrun --sdk "$selection" --show-sdk-path)
 # Also reject a successful lookup with empty, wrong-platform or unusable output.
 if [[ "$SDKROOT" != /* || ! "${SDKROOT##*/}" =~ ^${platform}([0-9]+(\.[0-9]+)*)?\.sdk$ \
-  || ! -r "$SDKROOT/SDKSettings.json" ]]; then
+  || ! -f "$SDKROOT/SDKSettings.json" || ! -r "$SDKROOT/SDKSettings.json" ]]; then
   printf 'SDK lookup did not return readable target SDK settings.\n' >&2
   exit 65
 fi
