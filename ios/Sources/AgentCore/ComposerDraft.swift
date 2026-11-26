@@ -4,12 +4,15 @@ import Foundation
 
 private enum ComposerDraftError: Error, LocalizedError {
   case invalidRecord, tooLarge, staleOwner
+  case unsupportedVersion(Int)
   var errorDescription: String? {
     switch self {
     case .invalidRecord: "The saved unsent draft could not be verified. It was preserved."
     case .tooLarge: "The unsent draft is too large to save. Shorten its text before retrying."
     case .staleOwner:
       "A newer unsent draft was saved by another owner. Reopen the composer before editing the saved draft."
+    case .unsupportedVersion(let version):
+      "This app cannot open draft format \(version). The draft was preserved."
     }
   }
 }
@@ -30,14 +33,16 @@ public struct ComposerSubmission: Sendable, Equatable {
   public let outboxURLs: [URL]
   public var text: String
   public var attachments: [LocalAttachment]
+  public let workResponse: RecoveredWorkResponse.Metadata?
   public init(
     identity: ComposerInputIdentity, outboxURLs: [URL], text: String,
-    attachments: [LocalAttachment]
+    attachments: [LocalAttachment], workResponse: RecoveredWorkResponse.Metadata? = nil
   ) {
     self.identity = identity
     self.outboxURLs = outboxURLs
     self.text = text
     self.attachments = attachments
+    self.workResponse = workResponse
   }
 }
 
@@ -172,11 +177,14 @@ public struct ComposerDraft: Sendable, Equatable {
   /// The start of `text` that older Sends returned while `submission` was admitting.
   public var returnedText: String
   public var addressing: DraftAddressing
+  public var workResponse: WorkResponseReference?
+  public var recoveredWorkResponse: RecoveredWorkResponse?
   public init(
     text: String = "", mode: InputMode = .steer, attachments: [LocalAttachment] = [],
     consumedTransfers: Set<UUID> = [], composerID: UUID? = nil,
     submission: ComposerSubmission? = nil, returnedText: String = "",
-    addressing: DraftAddressing = DraftAddressing()
+    addressing: DraftAddressing = DraftAddressing(), workResponse: WorkResponseReference? = nil,
+    recoveredWorkResponse: RecoveredWorkResponse? = nil
   ) {
     self.text = text
     self.mode = mode
@@ -186,6 +194,8 @@ public struct ComposerDraft: Sendable, Equatable {
     self.submission = submission
     self.returnedText = returnedText
     self.addressing = addressing
+    self.workResponse = workResponse
+    self.recoveredWorkResponse = recoveredWorkResponse
   }
 }
 
@@ -198,18 +208,20 @@ public actor ComposerDraftStore {
     let outboxPaths: [String]
     let text: String
     let attachments: [AttachmentRef]
+    let workResponse: RecoveredWorkResponse.Metadata?
     /// A record from a build that kept the receipt in the first recipient's outbox alone names
     /// that outbox under `outboxPath`, and loads as a submission held there alone.
     private enum LegacyKeys: String, CodingKey { case outboxPath }
 
     init(
       identity: ComposerInputIdentity, outboxPaths: [String], text: String,
-      attachments: [AttachmentRef]
+      attachments: [AttachmentRef], workResponse: RecoveredWorkResponse.Metadata?
     ) {
       self.identity = identity
       self.outboxPaths = outboxPaths
       self.text = text
       self.attachments = attachments
+      self.workResponse = workResponse
     }
 
     init(from decoder: any Decoder) throws {
@@ -220,7 +232,14 @@ public actor ComposerDraftStore {
         ?? [decoder.container(keyedBy: LegacyKeys.self).decode(String.self, forKey: .outboxPath)]
       text = try keys.decode(String.self, forKey: .text)
       attachments = try keys.decode([AttachmentRef].self, forKey: .attachments)
+      workResponse = try keys.decodeIfPresent(
+        RecoveredWorkResponse.Metadata.self, forKey: .workResponse)
     }
+  }
+  private struct RecoveredResponse: Codable {
+    let metadata: RecoveredWorkResponse.Metadata
+    let text: String
+    let attachments: [AttachmentRef]
   }
   private struct Record: Codable {
     let revision: UInt64
@@ -233,6 +252,39 @@ public actor ComposerDraftStore {
     let returnedText: String?
     /// Absent from records saved before addressing was stored, and whenever it is empty.
     let addressing: DraftAddressing?
+    let workResponse: WorkResponseReference?
+    let recoveredWorkResponse: RecoveredResponse?
+
+    var hasWorkResponse: Bool {
+      workResponse != nil || submission?.workResponse != nil || recoveredWorkResponse != nil
+    }
+  }
+
+  /// An old reader requires revision, text and files at the root. Keeping those fields only
+  /// inside the envelope makes rollback fail before it can adopt or overwrite the work draft.
+  private struct DraftFile: Codable {
+    static var currentVersion: Int { 1 }
+    let version: Int
+    let draft: Record
+
+    init(_ draft: Record) {
+      version = Self.currentVersion
+      self.draft = draft
+    }
+
+    init(from decoder: any Decoder) throws {
+      let keys = try decoder.container(keyedBy: CodingKeys.self)
+      if keys.contains(.version) {
+        version = try keys.decode(Int.self, forKey: .version)
+        guard version == Self.currentVersion else {
+          throw ComposerDraftError.unsupportedVersion(version)
+        }
+        draft = try keys.decode(Record.self, forKey: .draft)
+      } else {
+        version = Self.currentVersion
+        draft = try Record(from: decoder)
+      }
+    }
   }
   private static let maximumRecordBytes = 512 * 1024
   private let url: URL
@@ -245,11 +297,17 @@ public actor ComposerDraftStore {
     draft: ComposerDraft, revision: UInt64, retiredAttachments: [LocalAttachment]
   ) {
     guard let data = try contents() else { return (ComposerDraft(), 0, []) }
-    let record = try JSONDecoder().decode(Record.self, from: data)
+    let record = try JSONDecoder().decode(DraftFile.self, from: data).draft
     let submitted = record.submission
-    let references = (submitted?.attachments ?? []) + record.attachments
-    guard references.count <= AttachmentLimits.maximumCount,
+    let ordinarySubmittedFiles = submitted?.workResponse == nil ? submitted?.attachments ?? [] : []
+    let recoveredFiles = record.recoveredWorkResponse?.attachments ?? []
+    let references = (submitted?.attachments ?? []) + record.attachments + recoveredFiles
+    guard record.attachments.count + ordinarySubmittedFiles.count <= AttachmentLimits.maximumCount,
+      (submitted?.attachments.count ?? 0) <= AttachmentLimits.maximumCount,
+      recoveredFiles.count <= AttachmentLimits.maximumCount,
       Set(references.map(\.id)).count == references.count,
+      Self.validWorkResponses(
+        record.workResponse, submitted?.workResponse, record.recoveredWorkResponse != nil),
       submitted.map({ value in
         !value.outboxPaths.isEmpty
           && value.outboxPaths.allSatisfy { !$0.isEmpty && !$0.hasPrefix("/") }
@@ -264,10 +322,17 @@ public actor ComposerDraftStore {
             outboxURL: url.deletingLastPathComponent().appending(path: $0).standardizedFileURL)
         }
       } ?? false
-    var files: [LocalAttachment] = []
-    for reference in (owned ? [] : submitted?.attachments ?? []) + record.attachments {
-      guard let file = try await store.existing(reference) else { throw AttachmentError.changed }
-      files.append(file)
+    let files = try await restoreFiles(
+      (owned ? [] : ordinarySubmittedFiles) + record.attachments, from: store)
+    var recovered: RecoveredWorkResponse?
+    if let stored = record.recoveredWorkResponse {
+      recovered = try await RecoveredWorkResponse(
+        metadata: stored.metadata, text: stored.text,
+        attachments: restoreFiles(stored.attachments, from: store))
+    } else if !owned, let submitted, let metadata = submitted.workResponse {
+      recovered = try await RecoveredWorkResponse(
+        metadata: metadata, text: submitted.text,
+        attachments: restoreFiles(submitted.attachments, from: store))
     }
     var retired: [LocalAttachment] = []
     if owned {
@@ -282,28 +347,65 @@ public actor ComposerDraftStore {
     savedRevision = max(savedRevision ?? record.revision, record.revision)
     let returned = record.returnedText.flatMap { record.text.hasPrefix($0) ? $0 : nil } ?? ""
     let typed = record.text.dropFirst(returned.count).dropFirst(returned.isEmpty ? 0 : 2)
-    let text = [returned[...], owned ? "" : submitted?.text[...] ?? "", typed]
+    let returnedSubmission = !owned && submitted?.workResponse == nil ? submitted?.text ?? "" : ""
+    let text = [returned[...], returnedSubmission[...], typed]
       .filter { !$0.isEmpty }.joined(separator: "\n\n")
     var addressing = record.addressing ?? DraftAddressing()
     // An outbox holds the Send this record was saved for, and whom that draft was for went with
     // it. Only a draft begun since keeps an address.
-    if owned, record.text.isEmpty, record.attachments.isEmpty { addressing = DraftAddressing() }
-    return (
-      ComposerDraft(
-        text: text, mode: record.mode, attachments: files,
-        consumedTransfers: record.consumedTransfers, composerID: record.composerID,
-        addressing: addressing),
-      record.revision, retired
-    )
+    if owned, submitted?.workResponse == nil, record.text.isEmpty, record.attachments.isEmpty {
+      addressing = DraftAddressing()
+    }
+    var draft = ComposerDraft(
+      text: text, mode: record.mode, attachments: files,
+      consumedTransfers: record.consumedTransfers, composerID: record.composerID,
+      addressing: addressing, workResponse: record.workResponse, recoveredWorkResponse: recovered)
+    if let recovered, submitted?.workResponse != nil, text.isEmpty, files.isEmpty,
+      addressing.isEmpty
+    {
+      draft.text = recovered.text
+      draft.mode = recovered.metadata.mode
+      draft.attachments = recovered.attachments
+      draft.addressing = recovered.metadata.addressing
+      draft.workResponse = recovered.metadata.reference
+      draft.recoveredWorkResponse = nil
+    }
+    return (draft, record.revision, retired)
+  }
+
+  private func restoreFiles(_ references: [AttachmentRef], from store: AttachmentStore) async throws
+    -> [LocalAttachment]
+  {
+    var files: [LocalAttachment] = []
+    for reference in references {
+      guard let file = try await store.existing(reference) else { throw AttachmentError.changed }
+      files.append(file)
+    }
+    return files
+  }
+
+  private static func validWorkResponses(
+    _ active: WorkResponseReference?, _ submitted: RecoveredWorkResponse.Metadata?,
+    _ recovered: Bool
+  ) -> Bool {
+    [active != nil, submitted != nil, recovered].count { $0 } <= 1
   }
 
   /// Returns false only when a newer complete record already owns the disk.
   @discardableResult public func save(_ draft: ComposerDraft, revision: UInt64) throws -> Bool {
-    let references = (draft.submission?.attachments ?? []) + draft.attachments
-    guard references.count <= AttachmentLimits.maximumCount else {
+    let submittedFiles = draft.submission?.attachments ?? []
+    let recoveredFiles = draft.recoveredWorkResponse?.attachments ?? []
+    let references = submittedFiles + draft.attachments + recoveredFiles
+    let ordinarySubmittedCount = draft.submission?.workResponse == nil ? submittedFiles.count : 0
+    guard draft.attachments.count + ordinarySubmittedCount <= AttachmentLimits.maximumCount,
+      submittedFiles.count <= AttachmentLimits.maximumCount,
+      recoveredFiles.count <= AttachmentLimits.maximumCount
+    else {
       throw AttachmentError.tooMany
     }
     guard Set(references.map(\.id)).count == references.count,
+      Self.validWorkResponses(
+        draft.workResponse, draft.submission?.workResponse, draft.recoveredWorkResponse != nil),
       draft.submission.map({ $0.identity.composerID == draft.composerID }) ?? true,
       draft.submission.map({ !$0.outboxURLs.isEmpty }) ?? true
     else { throw ComposerDraftError.invalidRecord }
@@ -312,15 +414,22 @@ public actor ComposerDraftStore {
         Submission(
           identity: value.identity,
           outboxPaths: try value.outboxURLs.map { try relativeOutboxPath($0) }, text: value.text,
-          attachments: value.attachments.map(\.reference))
+          attachments: value.attachments.map(\.reference), workResponse: value.workResponse)
       }
     let record = Record(
       revision: revision, text: draft.text, mode: draft.mode,
       attachments: draft.attachments.map(\.reference), consumedTransfers: draft.consumedTransfers,
       composerID: draft.composerID, submission: submission,
       returnedText: draft.returnedText.isEmpty ? nil : draft.returnedText,
-      addressing: draft.addressing.isEmpty ? nil : draft.addressing)
-    let data = try JSONEncoder().encode(record)
+      addressing: draft.addressing.isEmpty ? nil : draft.addressing,
+      workResponse: draft.workResponse,
+      recoveredWorkResponse: draft.recoveredWorkResponse.map {
+        RecoveredResponse(
+          metadata: $0.metadata, text: $0.text, attachments: $0.attachments.map(\.reference))
+      })
+    let data =
+      try record.hasWorkResponse
+      ? JSONEncoder().encode(DraftFile(record)) : JSONEncoder().encode(record)
     guard data.count <= Self.maximumRecordBytes else { throw ComposerDraftError.tooLarge }
     let directory = url.deletingLastPathComponent()
     try FileManager.default.createDirectory(

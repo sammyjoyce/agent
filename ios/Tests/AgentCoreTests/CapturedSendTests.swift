@@ -1,6 +1,7 @@
 import Foundation
 import Network
 import Testing
+import UniformTypeIdentifiers
 
 @testable import AgentCore
 @testable import AgentUI
@@ -35,13 +36,14 @@ private struct Lab {
 }
 
 @MainActor private func withLab(
+  tcp: Bool = false, holdingPersonal personalGate: DialGate? = nil,
   _ body: @MainActor (Lab, Coordinators) async throws -> Void
 ) async throws {
   let workFixture = FixtureCoordinator()
   let personalFixture = FixtureCoordinator()
-  let (workListener, workPort) = try await listen(workFixture)
+  let (workListener, workPort) = try await listen(workFixture, tcp: tcp)
   defer { workListener.cancel() }
-  let (personalListener, personalPort) = try await listen(personalFixture)
+  let (personalListener, personalPort) = try await listen(personalFixture, tcp: tcp)
   defer { personalListener.cancel() }
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
@@ -52,20 +54,23 @@ private struct Lab {
     workFixture: workFixture, personalFixture: personalFixture, root: root, defaults: defaults,
     inbox: SharedDraftInbox(containerURL: root),
     transport: CoordinatorTransport { address in
-      LineConnection(
-        connection: NWConnection(
-          to: [4002, 4004].contains(address.port) ? personalPort : workPort, using: .tcp))
+      let personal = [4002, 4004].contains(address.port)
+      if personal { try await personalGate?.pass() }
+      return LineConnection(
+        connection: NWConnection(to: personal ? personalPort : workPort, using: .tcp))
     })
   let coordinators = await lab.launch()
   await coordinators.setActive(true)
   do {
     try await body(lab, coordinators)
   } catch {
+    await personalGate?.open()
     await coordinators.setActive(false)
     await workFixture.stop()
     await personalFixture.stop()
     throw error
   }
+  await personalGate?.open()
   await coordinators.setActive(false)
   await workFixture.stop()
   await personalFixture.stop()
@@ -80,6 +85,8 @@ private struct Lab {
     try await Task.sleep(for: .milliseconds(5))
   }
 }
+
+@MainActor private final class Flag { var raised = false }
 
 private func interrupts(_ fixture: FixtureCoordinator) async -> Int {
   await fixture.received().filter { if case .interrupt = $0 { true } else { false } }.count
@@ -107,7 +114,793 @@ private func replies(_ prefix: String, _ count: Int, next: String? = nil) -> Nat
     messages: (0..<count).map { reply("\(prefix)-\($0)") }, nextCursor: next, pageComplete: true)
 }
 
+@MainActor private func orchardWorkTarget(
+  _ chat: ChatModel, lane: ProfileID, conversation: String = "orchard-conversation"
+) throws -> WorkResponseTarget {
+  var snapshot = try #require(chat.snapshots[lane])
+  snapshot.activeWorkSupported = true
+  snapshot.taskGraph = .init(
+    conversations: [], nodes: [], omitted: 0,
+    work: [
+      .init(
+        conversationId: conversation, detail: "Pick a delivery date", id: "task:orchard-17",
+        isJob: false, status: .waitingOwner, taskId: "orchard-17", title: "Orchard shipment")
+    ])
+  chat.apply(snapshot, lane: lane)
+  let row = try #require(chat.activeWorkSummary.items.first { $0.lane == lane })
+  return try #require(row.responseTarget())
+}
+
 @Suite struct CapturedSendTests {
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func cancellingDuringWorkFileImportKeepsItsBytesAndRecipient() async throws {
+    try await withLab(tcp: true) { lab, coordinators in
+      let (work, personal) = try await addWorkAndPersonal(coordinators)
+      let chat = coordinators.chat
+      let target = try orchardWorkTarget(chat, lane: work)
+      try #require(await chat.respond(inChatTo: target))
+      let url = lab.root.appending(path: "Orchard.png")
+      let png = try #require(
+        Data(
+          base64Encoded:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGMwqAr5DwAD2gH+dalcPgAAAABJRU5ErkJggg=="
+        ))
+      try png.write(to: url)
+      let loading = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+      let gate = DispatchSemaphore(value: 0)
+      defer { gate.signal() }
+      let provider = NSItemProvider()
+      provider.registerFileRepresentation(
+        forTypeIdentifier: UTType.png.identifier, visibility: .all
+      ) { done in
+        DispatchQueue.global().async {
+          gate.wait()
+          done(url, false, nil)
+        }
+        loading.continuation.yield(())
+        return nil
+      }
+      let importTask = try #require(chat.attach(providers: [provider]))
+      for await _ in loading.stream { break }
+      #expect(chat.attachments.isEmpty)
+      chat.clearComposerContext()
+      chat.setChip(personal)
+      #expect(
+        chat.workResponseTarget == target, "The in-flight file still belongs to the work response")
+      #expect(chat.startSend() == nil)
+      gate.signal()
+      await importTask.value
+      let file = try #require(chat.attachments.first)
+      let bytes = try Data(contentsOf: file.url)
+      #expect(!bytes.isEmpty && file.reference.name == "Image.jpg")
+      chat.clearComposerContext()
+      #expect(chat.workResponseTarget == nil && chat.destination == .chip(work))
+      #expect(chat.attachments == [file])
+      chat.draft = "See the orchard image"
+      await chat.send()
+      try await eventually("Work received the file and note") {
+        await submitted(lab.workFixture) == ["See the orchard image"]
+      }
+      #expect(await lab.workFixture.uploaded(file.id) == bytes)
+      #expect(await submitted(lab.personalFixture).isEmpty)
+      #expect(await lab.personalFixture.uploaded(file.id) == nil)
+    }
+  }
+
+  @MainActor
+  @Test(.timeLimit(.minutes(1)), arguments: [Dictation.Landing.keep, .send], [false, true])
+  func workDictationLandsBeforeCancellationOrSharedDraftTakesOver(
+    _ landing: Dictation.Landing, sharing: Bool
+  ) async throws {
+    try await withLab(tcp: true) { lab, coordinators in
+      let (work, personal) = try await addWorkAndPersonal(coordinators)
+      let chat = coordinators.chat
+      let workTarget = try orchardWorkTarget(chat, lane: work)
+      try #require(await chat.respond(inChatTo: workTarget))
+      let words = "Keep Friday for the orchard delivery"
+      var script = ScriptedSpeech.Script()
+      script.takes = [words]
+      let speech = ScriptedSpeech(script)
+      speech.hold()
+      defer { speech.release() }
+      let dictation = Dictation(
+        engine: speech.engine,
+        holdDelay: landing == .send ? .milliseconds(5) : .seconds(30))
+      dictation.setForeground(true)
+      try await eventually("the scripted speech engine is ready") { dictation.model == .ready }
+      let target = DictationTarget(chat: chat)
+      dictation.mic(.down, in: target)
+      if landing == .keep { dictation.mic(.up(onMic: true), in: target) }
+      let gesture: Dictation.Gesture = landing == .keep ? .toggled : .holding
+      try await eventually("the dictation is listening") {
+        dictation.take?.stage == .listening(gesture)
+      }
+      if landing == .keep { dictation.mic(.down, in: target) }
+      dictation.mic(.up(onMic: true), in: target)
+      try await eventually("transcription is held before landing") {
+        dictation.take?.stage == .transcribing(landing) && speech.heldFinishes == 1
+      }
+
+      let sharedNote = "Ordinary note about the bus"
+      var share: Task<Void, Never>?
+      if sharing {
+        try await lab.inbox.enqueue(images: [], note: sharedNote)
+        let mark = chat.draftMark
+        share = Task { await chat.receiveSharedDrafts() }
+        try await eventually("the shared draft is waiting for the producer") {
+          chat.draftMark != mark
+        }
+      } else {
+        chat.clearComposerContext()
+        chat.setChip(personal)
+        if landing == .send {
+          try await coordinators.update(
+            work, name: TagName("Work"),
+            address: CoordinatorAddress(host: "100.64.1.2", port: 4003))
+          try await eventually("Work's replacement is connected") {
+            chat.snapshots[work]?.connection == .connected
+          }
+        }
+      }
+      #expect(chat.workResponseTarget == workTarget && chat.draft.isEmpty)
+      #expect(chat.recoveredWorkResponse == nil && chat.startSend() == nil)
+      speech.release()
+      try await eventually("the real landing path has finished") { dictation.take == nil }
+      await share?.value
+      if landing == .send { #expect(dictation.notice == .notSent(.draftChanged)) }
+      #expect(await submitted(lab.workFixture).isEmpty)
+      #expect(await submitted(lab.personalFixture).isEmpty)
+
+      if sharing {
+        #expect(chat.draft == sharedNote && chat.workResponseTarget == nil)
+        #expect(chat.recoveredWorkResponse?.text == words)
+        #expect(chat.recoveredWorkResponse?.metadata.reference == workTarget.reference)
+        chat.setChip(personal)
+        await chat.send()
+        try await eventually("Personal received only the share") {
+          await submitted(lab.personalFixture) == [sharedNote]
+        }
+        await chat.restoreRecoveredWorkResponse()
+        try #require(await chat.respond(inChatTo: orchardWorkTarget(chat, lane: work)))
+      } else {
+        #expect(chat.draft == words && chat.workResponseTarget == workTarget)
+        if landing == .send {
+          #expect(chat.startSend() == nil, "The old session epoch cannot send")
+        }
+        chat.clearComposerContext()
+        #expect(chat.destination == .chip(work) && chat.draft == words)
+      }
+      await lab.workFixture.placeEachSubmit()
+      await chat.send()
+      try await eventually("Work received only the dictated words and the transcript shows them") {
+        let sent = await submitted(lab.workFixture)
+        return sent.count == 1 && sent[0].hasSuffix(words) && !sent[0].contains(sharedNote)
+          && chat.snapshots[work]?.rows.contains { $0.role == .user && $0.text == sent[0] } == true
+      }
+      #expect(await submitted(lab.personalFixture) == (sharing ? [sharedNote] : []))
+    }
+  }
+
+  @MainActor @Test(.timeLimit(.minutes(1)), arguments: [true, false])
+  func workPickerHoldsTheResponseWhileAControlComesBack(picked: Bool) async throws {
+    let gate = DialGate()
+    try await withLab(tcp: true, holdingPersonal: gate) { lab, coordinators in
+      let (work, personal) = try await addWorkAndPersonal(coordinators)
+      let chat = coordinators.chat
+      chat.setChip(personal)
+      chat.draft = "/status"
+      await gate.arm()
+      await chat.send()
+      try await eventually("Personal's /status is still dialing") { await gate.waiting }
+      let workTarget = try orchardWorkTarget(chat, lane: work)
+      try #require(await chat.respond(inChatTo: workTarget))
+      let workText = "Friday suits the orchard delivery"
+      chat.draft = workText
+      let picker = try #require(chat.beginPicker())
+      defer { chat.endPicker(picker) }
+      let mark = chat.draftMark
+      await gate.fail()
+      try await eventually("/status came back unsent") { chat.draftMark != mark }
+      try #require(
+        chat.draft == workText && chat.workResponseTarget == workTarget,
+        "The Work response keeps the editor while its picker is open")
+      let bytes = Data("Invented orchard delivery plan".utf8)
+      if picked {
+        let url = lab.root.appending(path: "Delivery plan.txt")
+        try bytes.write(to: url)
+        let importing = try #require(chat.attach(urls: [url]))
+        chat.endPicker(picker)
+        await importing.value
+      } else {
+        chat.endPicker(picker)
+      }
+      try await eventually("/status took the editor") { chat.draft == "/status" }
+      #expect(chat.destination == .chip(personal) && chat.attachments.isEmpty)
+      let parked = try #require(chat.recoveredWorkResponse)
+      #expect(parked.text == workText && parked.metadata.reference == workTarget.reference)
+      #expect(parked.attachments.count == (picked ? 1 : 0))
+
+      chat.draft = ""
+      await chat.restoreRecoveredWorkResponse()
+      try #require(await chat.respond(inChatTo: orchardWorkTarget(chat, lane: work)))
+      await chat.send()
+      try await eventually("Work received the response") {
+        await submitted(lab.workFixture).count == 1
+      }
+      let received = await lab.workFixture.received().compactMap {
+        if case .submit(let request) = $0 { request } else { nil }
+      }
+      let sent = try #require(received.first)
+      #expect(sent.text.hasSuffix("My response:\n\(workText)"))
+      #expect(sent.attachments?.map(\.id) == (picked ? parked.attachments.map(\.id) : nil))
+      for file in parked.attachments {
+        #expect(await lab.workFixture.uploaded(file.id) == bytes)
+      }
+      #expect(await submitted(lab.personalFixture).isEmpty)
+      #expect(await lab.personalFixture.uploadCount() == 0)
+    }
+  }
+
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func workPickerHoldsTheResponseWhileAShareWaits() async throws {
+    try await withLab(tcp: true) { lab, coordinators in
+      let (work, personal) = try await addWorkAndPersonal(coordinators)
+      let chat = coordinators.chat
+      let workTarget = try orchardWorkTarget(chat, lane: work)
+      try #require(await chat.respond(inChatTo: workTarget))
+      let workText = "Friday suits the orchard delivery"
+      chat.draft = workText
+      let picker = try #require(chat.beginPicker())
+      defer { chat.endPicker(picker) }
+      let sharedNote = "Invented timetable for the Saturday bus"
+      try await lab.inbox.enqueue(images: [], note: sharedNote)
+      let mark = chat.draftMark
+      let share = Task { await chat.receiveSharedDrafts() }
+      try await eventually("the share is waiting") { chat.draftMark != mark }
+      try #require(
+        chat.draft == workText && chat.workResponseTarget == workTarget,
+        "The Work response keeps the editor while its picker is open")
+      let bytes = Data("Invented orchard delivery plan".utf8)
+      let url = lab.root.appending(path: "Delivery plan.txt")
+      try bytes.write(to: url)
+      let importing = try #require(chat.attach(urls: [url]))
+      chat.endPicker(picker)
+      await importing.value
+      await share.value
+      #expect(chat.draft == sharedNote && chat.attachments.isEmpty)
+      #expect(chat.workResponseTarget == nil)
+      let parked = try #require(chat.recoveredWorkResponse)
+      #expect(parked.text == workText && parked.metadata.reference == workTarget.reference)
+      let file = try #require(parked.attachments.first)
+      #expect(parked.attachments.count == 1)
+
+      chat.setChip(personal)
+      await chat.send()
+      try await eventually("Personal received only the share") {
+        await submitted(lab.personalFixture) == [sharedNote]
+      }
+      await chat.restoreRecoveredWorkResponse()
+      try #require(await chat.respond(inChatTo: orchardWorkTarget(chat, lane: work)))
+      await chat.send()
+      try await eventually("Work received the response") {
+        await submitted(lab.workFixture).count == 1
+      }
+      let received = await lab.workFixture.received().compactMap {
+        if case .submit(let request) = $0 { request } else { nil }
+      }
+      let sent = try #require(received.first)
+      #expect(sent.text.hasSuffix("My response:\n\(workText)"))
+      #expect(sent.attachments?.map(\.id) == [file.id])
+      #expect(await lab.workFixture.uploaded(file.id) == bytes)
+      #expect(await lab.personalFixture.uploadCount() == 0)
+    }
+  }
+
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func workPickerHoldsSendFromAnotherWindow() async throws {
+    try await withLab(tcp: true) { lab, coordinators in
+      let (work, _) = try await addWorkAndPersonal(coordinators)
+      let chat = coordinators.chat
+      let workTarget = try orchardWorkTarget(chat, lane: work)
+      try #require(await chat.respond(inChatTo: workTarget))
+      let workText = "Friday suits the orchard delivery"
+      chat.draft = workText
+      let picker = try #require(chat.beginPicker())
+      defer { chat.endPicker(picker) }
+      try #require(
+        chat.sendBlocker == .preparingAttachments && !chat.canSend,
+        "Send waits for the picker that holds the Work response")
+      #expect(chat.startSend() == nil)
+      #expect(chat.draft == workText && chat.workResponseTarget == workTarget)
+      let bytes = Data("Invented orchard delivery plan".utf8)
+      let url = lab.root.appending(path: "Delivery plan.txt")
+      try bytes.write(to: url)
+      let importing = try #require(chat.attach(urls: [url]))
+      chat.endPicker(picker)
+      await importing.value
+      let file = try #require(chat.attachments.first)
+      #expect(chat.canSend)
+      await chat.send()
+      try await eventually("Work received the response") {
+        await submitted(lab.workFixture).count == 1
+      }
+      let received = await lab.workFixture.received().compactMap {
+        if case .submit(let request) = $0 { request } else { nil }
+      }
+      let sent = try #require(received.first)
+      #expect(sent.text.hasSuffix("My response:\n\(workText)"))
+      #expect(sent.attachments?.map(\.id) == [file.id])
+      #expect(await lab.workFixture.uploaded(file.id) == bytes)
+      #expect(await submitted(lab.personalFixture).isEmpty)
+    }
+  }
+
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func workPickerHoldsItsItemFromAnotherWindow() async throws {
+    try await withLab(tcp: true) { lab, coordinators in
+      let (work, personal) = try await addWorkAndPersonal(coordinators)
+      let chat = coordinators.chat
+      let workTarget = try orchardWorkTarget(chat, lane: work)
+      let personalTarget = try orchardWorkTarget(chat, lane: personal)
+      try #require(await chat.respond(inChatTo: workTarget))
+      let picker = try #require(chat.beginPicker())
+      defer { chat.endPicker(picker) }
+      let tookPersonal = await chat.respond(inChatTo: personalTarget)
+      try #require(
+        !chat.canSelectWorkResponse && !tookPersonal,
+        "Another item waits for the picker that holds the Work response")
+      #expect(chat.workResponseTarget == workTarget)
+      let bytes = Data("Invented orchard delivery plan".utf8)
+      let url = lab.root.appending(path: "Delivery plan.txt")
+      try bytes.write(to: url)
+      let importing = try #require(chat.attach(urls: [url]))
+      chat.endPicker(picker)
+      await importing.value
+      let file = try #require(chat.attachments.first)
+      #expect(chat.workResponseTarget == workTarget && chat.canSelectWorkResponse)
+      chat.draft = "Plan attached"
+      await chat.send()
+      try await eventually("Work received the file") {
+        await submitted(lab.workFixture).count == 1
+      }
+      let received = await lab.workFixture.received().compactMap {
+        if case .submit(let request) = $0 { request } else { nil }
+      }
+      #expect(received.first?.attachments?.map(\.id) == [file.id])
+      #expect(await lab.workFixture.uploaded(file.id) == bytes)
+      #expect(await lab.personalFixture.uploadCount() == 0)
+      #expect(await chat.respond(inChatTo: personalTarget))
+    }
+  }
+
+  @MainActor @Test(.timeLimit(.minutes(1)), arguments: [false, true])
+  func onlyAWaitingShareStopsAHeldWorkDictationSend(batchWaiting: Bool) async throws {
+    try await withLab(tcp: true) { lab, coordinators in
+      let (work, _) = try await addWorkAndPersonal(coordinators)
+      let chat = coordinators.chat
+      let workTarget = try orchardWorkTarget(chat, lane: work)
+      try #require(await chat.respond(inChatTo: workTarget))
+      let words = "Friday suits the orchard delivery"
+      var script = ScriptedSpeech.Script()
+      script.takes = [words]
+      let speech = ScriptedSpeech(script)
+      speech.hold()
+      defer { speech.release() }
+      let dictation = Dictation(engine: speech.engine, holdDelay: .milliseconds(5))
+      dictation.setForeground(true)
+      try await eventually("the scripted speech engine is ready") { dictation.model == .ready }
+      let target = DictationTarget(chat: chat)
+      dictation.mic(.down, in: target)
+      try await eventually("the mic is held to talk") {
+        dictation.take?.stage == .listening(.holding)
+      }
+      dictation.mic(.up(onMic: true), in: target)
+      try await eventually("transcription is held before landing") {
+        dictation.take?.stage == .transcribing(.send) && speech.heldFinishes == 1
+      }
+
+      let sharedNote = "Invented timetable for the Saturday bus"
+      if batchWaiting { try await lab.inbox.enqueue(images: [], note: sharedNote) }
+      let mark = chat.draftMark
+      let activated = Flag()
+      let activation = Task { @MainActor in
+        await chat.receiveSharedDrafts()
+        activated.raised = true
+      }
+      try await eventually("the activation ended or waits for the take") {
+        activated.raised || chat.draftMark != mark
+      }
+      try #require(
+        (chat.draftMark != mark) == batchWaiting,
+        "Only a waiting share changes the draft the take began in")
+      speech.release()
+      try await eventually("the real landing path has finished") { dictation.take == nil }
+      await activation.value
+
+      if batchWaiting {
+        #expect(dictation.notice == .notSent(.draftChanged))
+        #expect(chat.draft == sharedNote && chat.workResponseTarget == nil)
+        #expect(chat.recoveredWorkResponse?.text == words)
+        #expect(await submitted(lab.workFixture).isEmpty)
+      } else {
+        #expect(dictation.notice == nil)
+        try await eventually("Work received the dictated response") {
+          let sent = await submitted(lab.workFixture)
+          return sent.count == 1 && sent[0].hasSuffix("My response:\n\(words)")
+        }
+      }
+      #expect(await submitted(lab.personalFixture).isEmpty)
+    }
+  }
+
+  @MainActor @Test(.timeLimit(.minutes(1)), arguments: [false, true])
+  func workResponseSurvivesFreshReopenBeforeOutboxOwnership(startedSend: Bool) async throws {
+    try await withLab { lab, coordinators in
+      let (work, personal) = try await addWorkAndPersonal(coordinators)
+      let chat = coordinators.chat
+      let note = "Schedule the orchard shipment on Friday"
+      let bytes = Data("Invented orchard plan".utf8)
+      chat.draft = note
+      await chat.attach(data: bytes, name: "Orchard.txt", mediaType: "text/plain")
+      let file = try #require(chat.attachments.first)
+      try #require(chat.scope == .all && chat.destination == .open)
+      let target = try orchardWorkTarget(chat, lane: work)
+      try #require(await chat.respond(inChatTo: target))
+
+      let cold: Coordinators
+      if startedSend {
+        let held = try PipedCopy(replacing: file.url)
+        defer { held.release() }
+        let sending = try #require(chat.startSend())
+        try await held.opened()
+        #expect(lab.outbox(work).isEmpty)
+        try bytes.write(to: file.url, options: .atomic)
+        await coordinators.setActive(false)
+        cold = await lab.launch()
+        held.release()
+        await sending.value
+      } else {
+        await coordinators.setActive(false)
+        cold = await lab.launch()
+      }
+      await cold.setActive(true)
+      let reopened = cold.chat
+      try await eventually("both reopened profiles connected") {
+        [work, personal].allSatisfy { reopened.snapshots[$0]?.connection == .connected }
+      }
+      #expect(reopened.draftReady)
+      #expect(reopened.scope == .all && reopened.draft == note)
+      #expect(reopened.attachments.map(\.reference) == [file.reference])
+      #expect(reopened.workResponseTarget?.reference == target.reference)
+      #expect(reopened.workResponseTarget?.laneEpoch == nil)
+      #expect(reopened.startSend() == nil, "A fresh session must not reuse the captured epoch")
+      let wrong = try orchardWorkTarget(reopened, lane: work, conversation: "replaced-conversation")
+      #expect(await !reopened.respond(inChatTo: wrong))
+      #expect(reopened.startSend() == nil)
+      #expect(await submitted(lab.workFixture).isEmpty)
+      #expect(await submitted(lab.personalFixture).isEmpty)
+
+      let same = try orchardWorkTarget(reopened, lane: work)
+      try #require(await reopened.respond(inChatTo: same))
+      await reopened.send()
+      try await eventually("Work received the reselected response") {
+        await submitted(lab.workFixture).count == 1
+      }
+      let received = await lab.workFixture.received().compactMap {
+        if case .submit(let request) = $0 { request } else { nil }
+      }
+      let sent = try #require(received.first)
+      #expect(sent.text.contains("Conversation ID: \"orchard-conversation\""))
+      #expect(sent.text.hasSuffix("My response:\n\(note)"))
+      #expect(sent.replyTo == nil && sent.attachments?.map(\.name) == ["Orchard.txt"])
+      #expect(await submitted(lab.personalFixture).isEmpty)
+      await cold.setActive(false)
+    }
+  }
+
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func refusedWorkResponseStaysSeparateFromNewPersonalDraftAfterReopen() async throws {
+    try await withLab { lab, coordinators in
+      let (work, personal) = try await addWorkAndPersonal(coordinators)
+      let chat = coordinators.chat
+      let workText = "Ship the sample apples on Friday"
+      let personalText = "Ask about the Saturday bus"
+      chat.draft = workText
+      await chat.attach(data: Data("Apples".utf8), name: "Work.txt", mediaType: "text/plain")
+      let workFile = try #require(chat.attachments.first)
+      let target = try orchardWorkTarget(chat, lane: work)
+      try #require(await chat.respond(inChatTo: target))
+      let held = try PipedCopy(replacing: workFile.url)
+      defer { held.release() }
+      let sending = try #require(chat.startSend())
+      try await held.opened()
+      chat.show(.one(personal))
+      chat.edit(personalText, committed: personalText)
+      await chat.attach(data: Data("Bus".utf8), name: "Personal.txt", mediaType: "text/plain")
+      #expect(chat.destination == .begunIn(personal))
+      #expect(chat.attachments.map(\.reference.name) == ["Personal.txt"])
+      try await coordinators.update(
+        work, name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4003))
+      held.finish()
+      await sending.value
+      #expect(chat.draft == personalText && chat.workResponseTarget == nil)
+      #expect(chat.recoveredWorkResponse?.text == workText)
+      #expect(lab.outbox(work).isEmpty)
+      #expect(await submitted(lab.workFixture).isEmpty)
+      await coordinators.setActive(false)
+
+      let cold = await lab.launch()
+      let reopened = cold.chat
+      await cold.setActive(true)
+      try await eventually("both profiles connected after refusal") {
+        [work, personal].allSatisfy { reopened.snapshots[$0]?.connection == .connected }
+      }
+      #expect(reopened.draftReady)
+      #expect(reopened.draft == personalText && reopened.destination == .begunIn(personal))
+      #expect(reopened.workResponseTarget == nil)
+      #expect(reopened.recoveredWorkResponse?.metadata.reference == target.reference)
+      #expect(reopened.recoveredWorkResponse?.attachments.map(\.reference) == [workFile.reference])
+      #expect(reopened.attachments.map(\.reference.name) == ["Personal.txt"])
+      #expect(!reopened.canRestoreWorkResponse)
+      reopened.show(.one(work))
+      #expect(reopened.startSend() == nil, "The Personal note cannot be sent to Work")
+      reopened.show(.one(personal))
+      await reopened.send()
+      try await eventually("Personal received only the newer note") {
+        await submitted(lab.personalFixture) == [personalText]
+      }
+      #expect(await submitted(lab.workFixture).isEmpty)
+
+      await reopened.restoreRecoveredWorkResponse()
+      #expect(reopened.recoveredWorkResponse == nil)
+      #expect(
+        reopened.draft == workText && reopened.attachments.map(\.reference) == [workFile.reference])
+      #expect(reopened.workResponseTarget?.reference == target.reference)
+      reopened.show(.all)
+      #expect(reopened.startSend() == nil)
+      let freshTarget = try orchardWorkTarget(reopened, lane: work)
+      try #require(await reopened.respond(inChatTo: freshTarget))
+      await reopened.send()
+      try await eventually("Work received only the recovered response") {
+        await submitted(lab.workFixture).count == 1
+      }
+      let received = await lab.workFixture.received().compactMap {
+        if case .submit(let request) = $0 { request } else { nil }
+      }
+      let sent = try #require(received.first)
+      #expect(sent.text.hasSuffix("My response:\n\(workText)"))
+      #expect(!sent.text.contains(personalText))
+      #expect(sent.attachments?.map(\.name) == ["Work.txt"])
+      #expect(await submitted(lab.personalFixture) == [personalText])
+      await cold.setActive(false)
+    }
+  }
+
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func workResponseTreatsNewMentionsLiterallyButPreservesExistingTags() async throws {
+    try await withLab { lab, coordinators in
+      let (work, _) = try await addWorkAndPersonal(coordinators)
+      let chat = coordinators.chat
+      chat.draft = "@Personal Existing Personal note"
+      let target = try orchardWorkTarget(chat, lane: work)
+      try #require(await chat.respond(inChatTo: target))
+      #expect(chat.startSend() == nil)
+      #expect(chat.draft == "@Personal Existing Personal note")
+      chat.clearComposerContext()
+      chat.draft = ""
+
+      try #require(await chat.respond(inChatTo: target))
+      let mention = "@alex Friday works"
+      chat.edit(mention, committed: mention)
+      chat.promoteTypedTag()
+      #expect(chat.draft == mention)
+      #expect(chat.pickerMatches.isEmpty)
+      await chat.send()
+      try await eventually("Work received the literal mention") {
+        await submitted(lab.workFixture).first?.hasSuffix("My response:\n\(mention)") == true
+      }
+      #expect(await submitted(lab.personalFixture).isEmpty)
+    }
+  }
+
+  enum WorkCancel: CaseIterable { case untouched, edited, relaunched }
+
+  @MainActor @Test(.timeLimit(.minutes(1)), arguments: WorkCancel.allCases)
+  func cancellingAWorkResponseRestoresOnlyAnUntouchedDraftsRecipients(_ kind: WorkCancel)
+    async throws
+  {
+    try await withLab { lab, coordinators in
+      let (work, personal) = try await addWorkAndPersonal(coordinators)
+      var chat = coordinators.chat
+      let note = "Invented note about the harvest supper"
+      chat.draft = note
+      let before = chat.draftAddressing
+      try #require(chat.addressing == .to([work, personal], body: note))
+      try #require(await chat.respond(inChatTo: orchardWorkTarget(chat, lane: work)))
+      var cold: Coordinators?
+      switch kind {
+      case .edited: chat.draft = note + " and the orchard"
+      case .relaunched:
+        await coordinators.setActive(false)
+        let reopened = await lab.launch()
+        await reopened.setActive(true)
+        chat = reopened.chat
+        cold = reopened
+        try await eventually("both reopened profiles connected") {
+          [work, personal].allSatisfy { chat.snapshots[$0]?.connection == .connected }
+        }
+        try #require(chat.workResponseTarget != nil)
+      case .untouched: break
+      }
+      let text = chat.draft
+      chat.clearComposerContext()
+      #expect(chat.workResponseTarget == nil && chat.draft == text)
+      let recipients = kind == .untouched ? [work, personal] : [work]
+      if kind == .untouched {
+        #expect(chat.draftAddressing == before)
+      } else {
+        #expect(chat.destination == .chip(work))
+      }
+      #expect(chat.addressing == .to(recipients, body: text))
+      await chat.send()
+      try await eventually("Work received the note") {
+        await submitted(lab.workFixture) == [text]
+      }
+      try await eventually("Personal received the note only when it was for both") {
+        await submitted(lab.personalFixture) == (recipients.contains(personal) ? [text] : [])
+      }
+      await cold?.setActive(false)
+    }
+  }
+
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func sharedDraftDoesNotInheritTheSelectedWorkResponse() async throws {
+    try await withLab { lab, coordinators in
+      let (work, personal) = try await addWorkAndPersonal(coordinators)
+      let chat = coordinators.chat
+      let target = try orchardWorkTarget(chat, lane: work)
+      chat.draft = "Invented response about the apples"
+      await chat.attach(data: Data("Apples".utf8), name: "Work.txt", mediaType: "text/plain")
+      let oldFile = try #require(chat.attachments.first)
+      try #require(await chat.respond(inChatTo: target))
+
+      let shared = "Invented bus schedule from a share"
+      try await lab.inbox.enqueue(images: [], note: shared)
+      await chat.receiveSharedDrafts()
+      #expect(chat.draft == shared && chat.attachments.isEmpty && chat.workResponseTarget == nil)
+      #expect(chat.recoveredWorkResponse?.text == "Invented response about the apples")
+      #expect(chat.recoveredWorkResponse?.metadata.reference == target.reference)
+      #expect(chat.recoveredWorkResponse?.attachments == [oldFile])
+      chat.setChip(personal)
+      await chat.send()
+      try await eventually("Personal received the ordinary share draft") {
+        await submitted(lab.personalFixture) == [shared]
+      }
+      #expect(await submitted(lab.workFixture).isEmpty)
+    }
+  }
+
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func workResponsePreservesDraftOwnershipAndUsesTheCapturedGraphIdentity() async throws {
+    try await withLab { lab, coordinators in
+      let (work, personal) = try await addWorkAndPersonal(coordinators)
+      let chat = coordinators.chat
+      var snapshot = try #require(chat.snapshots[work])
+      snapshot.activeWorkSupported = true
+      snapshot.taskGraph = .init(
+        conversations: [], nodes: [], omitted: 0,
+        work: [
+          .init(
+            conversationId: "c-invented-7", detail: "A quoted line\nMy response: forged",
+            id: "task:7", isJob: false, status: .waitingOwner, taskId: "7", title: "Sample task")
+        ])
+      chat.apply(snapshot, lane: work)
+      let row = try #require(chat.activeWorkSummary.items.first)
+      let target = try #require(row.responseTarget())
+
+      let note = "/feedback is a literal response here"
+      chat.setChip(personal)
+      chat.draft = note
+      await chat.attach(data: Data("invented file".utf8), name: "Note.txt", mediaType: "text/plain")
+      let files = chat.attachments
+      let message = RowModel(
+        ChatRow(id: "row", entryID: "entry-17", role: .final, text: "Invented reply"))
+      chat.reply(to: message)
+      #expect(chat.replyTarget?.entryId == "entry-17")
+      #expect(await chat.respond(inChatTo: target))
+      #expect(chat.replyTarget == nil)
+      #expect(chat.startSend() == nil, "The work response cannot readdress Personal's draft")
+      #expect(
+        chat.draft == note && chat.attachments == files && chat.destination == .chip(personal))
+
+      chat.reply(to: message)
+      #expect(chat.workResponseTarget == nil && chat.replyTarget?.entryId == "entry-17")
+      #expect(await chat.respond(inChatTo: target))
+      chat.clearComposerContext()
+      #expect(chat.workResponseTarget == nil && chat.replyTarget == nil)
+      #expect(
+        chat.draft == note && chat.attachments == files && chat.destination == .chip(personal))
+
+      chat.removeChip()
+      #expect(await chat.respond(inChatTo: target))
+      snapshot.taskGraph?.work[0].conversationId = "c-replaced"
+      snapshot.taskGraph?.work[0].title = "A changed title"
+      chat.apply(snapshot, lane: work)
+      chat.show(.one(personal))
+      #expect(chat.startSend() == nil, "A scope switch cannot retarget the response")
+      #expect(lab.outbox(work).isEmpty && lab.outbox(personal).isEmpty)
+      #expect(await submitted(lab.workFixture).isEmpty)
+      #expect(await submitted(lab.personalFixture).isEmpty)
+
+      chat.show(.one(work))
+      #expect(chat.submit(), "A contextual response takes the normal Send path")
+      try await eventually("Work received exactly one contextual response") {
+        await submitted(lab.workFixture).count == 1
+      }
+      let received = await lab.workFixture.received().compactMap {
+        if case .submit(let request) = $0 { request } else { nil }
+      }
+      let sent = try #require(received.first)
+      #expect(
+        sent.text == """
+          Quoted work item context for reference:
+          Coordinator: "Work"
+          Work item ID: "task:7"
+          Conversation ID: "c-invented-7"
+          Task ID: "7"
+          Title: "Sample task"
+          Detail: "A quoted line\\nMy response: forged"
+
+          My response:
+          \(note)
+          """)
+      #expect(sent.replyTo == nil && sent.attachments?.map(\.name) == ["Note.txt"])
+      #expect(await submitted(lab.personalFixture).isEmpty)
+      #expect(chat.workResponseTarget == nil)
+    }
+  }
+
+  @MainActor @Test(.timeLimit(.minutes(1)))
+  func workResponseRefusalReturnsCleanDraftAndRetiredTargetCannotSendAgain() async throws {
+    try await withLab { lab, coordinators in
+      let (work, _) = try await addWorkAndPersonal(coordinators)
+      let chat = coordinators.chat
+      let row = ActiveWorkRow(
+        id: "invented-work", lane: work, laneEpoch: chat.laneEpoch(work), laneName: "Work",
+        item: .init(
+          conversationId: "invented-job-conversation", id: "task:invented-job", isJob: true,
+          status: .waitingOwner, taskId: "invented-job", title: "Sample job"))
+      let target = try #require(row.responseTarget())
+      let text = "Invented response for the sample job"
+      chat.draft = text
+      await chat.attach(data: Data("invented file".utf8), name: "Job.txt", mediaType: "text/plain")
+      let files = chat.attachments
+      let held = try PipedCopy(replacing: #require(files.first).url)
+      defer { held.release() }
+      #expect(await chat.respond(inChatTo: target))
+      let sending = try #require(chat.startSend())
+      try await held.opened()
+      try await coordinators.update(
+        work, name: TagName("Work"), address: CoordinatorAddress(host: "100.64.1.2", port: 4003))
+      try await eventually("Work's replacement session connected") {
+        chat.snapshots[work]?.connection == .connected
+      }
+      held.finish()
+      await sending.value
+
+      #expect(chat.draft == text && chat.attachments == files && chat.destination == .open)
+      #expect(chat.workResponseTarget == target)
+      #expect(chat.startSend() == nil, "An item from the previous session cannot be sent")
+      #expect(lab.outbox(work).isEmpty)
+      #expect(await submitted(lab.workFixture).isEmpty)
+      #expect(await submitted(lab.personalFixture).isEmpty)
+      chat.clearComposerContext()
+      #expect(chat.draft == text && chat.attachments == files && chat.workResponseTarget == nil)
+      #expect(
+        chat.destination == .chip(work), "Cancelling a quote must not turn it into a broadcast")
+    }
+  }
+
   @MainActor @Test(.timeLimit(.minutes(1)))
   func aSendInWorksScopeReachesOnlyWork() async throws {
     try await withLab { lab, coordinators in

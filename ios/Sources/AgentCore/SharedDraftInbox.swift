@@ -53,6 +53,17 @@ public struct SharedDraftInbox: Sendable {
     } catch { return false }
   }
 
+  /// Whether a complete batch waits to be consumed. It reads without the lock, so the share
+  /// extension never finds the inbox busy because of it.
+  public func hasWaitingBatch() -> Bool {
+    let entries = try? FileManager.default.contentsOfDirectory(
+      at: directory, includingPropertiesForKeys: nil)
+    return (entries ?? []).contains { url in
+      guard let id = UUID(uuidString: url.lastPathComponent) else { return false }
+      return !exists(receipt(id)) && (try? read(id)) != nil
+    }
+  }
+
   /// Reuse `id` only to retry this exact transfer, never to dedupe image content.
   /// A committed batch survives cancellation; cancel is checked before publication.
   @discardableResult public func enqueue(

@@ -1,4 +1,5 @@
 import AgentCore
+import CryptoKit
 import Foundation
 import Network
 import XCTest
@@ -26,6 +27,7 @@ actor InteractionPeer {
   private var servedJobs: [ScheduledJobStatus] = []
   private var activeWorkSnapshot: TaskGraphSnapshot?
   private var inspectedConversations: [String: [HistoryMessage]] = [:]
+  private var uploads: [String: Data] = [:]
   private var dreamsSummaries: [DreamsRunSummary] = []
   private var dreamsDetails: [String: DreamsRunDetail] = [:]
   private var dreamsApplyRequests: [NativeRequestDreamsApply] = []
@@ -185,6 +187,24 @@ actor InteractionPeer {
     for socket in sockets.values { socket.cancel() }
     sockets = [:]
   }
+  private func acceptUpload(_ chunk: AttachmentRequestUpload, on socket: NWConnection)
+    async throws
+  {
+    var received = uploads[chunk.id] ?? Data()
+    received.append(try XCTUnwrap(Data(base64Encoded: chunk.dataBase64)))
+    uploads[chunk.id] = received
+    let attachment =
+      chunk.complete
+      ? AttachmentRef(
+        id: chunk.id, mediaType: chunk.mediaType, name: chunk.name,
+        sha256: SHA256.hash(data: received).map { String(format: "%02x", $0) }.joined(),
+        sizeBytes: received.count) : nil
+    try await emit(
+      .attachment(
+        .init(response: .uploaded(.init(attachment: attachment, nextOffset: received.count)))),
+      to: socket)
+    try await emit(.done, to: socket)
+  }
   private func accept(_ socket: NWConnection) async {
     let id = UUID()
     sockets[id] = socket
@@ -199,6 +219,10 @@ actor InteractionPeer {
       if case .identify = request {
         try await emit(
           .identity(.init(coordinatorId: coordinator.uuidString.lowercased())), to: socket)
+        request = try await read(socket, &data)
+      }
+      while case .attachment(let value) = request, case .upload(let chunk) = value.request {
+        try await acceptUpload(chunk, on: socket)
         request = try await read(socket, &data)
       }
       switch request {
@@ -219,7 +243,8 @@ actor InteractionPeer {
               inputOrigins: settingsValue == nil && origins == nil ? nil : true,
               model: "fixture/model",
               sidechats: sidechatsAdvertised,
-              workInspection: servedJobs.isEmpty ? nil : true, working: working)), to: socket)
+              workInspection: servedJobs.isEmpty && inspectedConversations.isEmpty ? nil : true,
+              working: working)), to: socket)
         try await emitHistory(try XCTUnwrap(initial), to: socket)
         if let activeWorkSnapshot {
           try await emit(.taskGraph(.init(graph: activeWorkSnapshot)), to: socket)

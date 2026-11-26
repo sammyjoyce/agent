@@ -90,7 +90,7 @@ final class ChatModel {
   @ObservationIgnored private let composerLogger = Logger(
     subsystem: "dev.jessfraz.Agent", category: "Composer")
   private enum Admission {
-    case pending(text: String, submission: ComposerSubmission?)
+    case pending(ComposerSubmission)
     case saved
   }
   private struct ReturnedText {
@@ -334,7 +334,8 @@ final class ChatModel {
       for item in graph.work where !isCurrentlyViewedWorkItem(item, snapshot: snapshot) {
         rows.append(
           ActiveWorkRow(
-            id: "\(lane.id)-\(item.id)", lane: lane.id, laneName: name(lane.id), item: item
+            id: "\(lane.id)-\(item.id)", lane: lane.id, laneEpoch: laneEpoch(lane.id),
+            laneName: name(lane.id), item: item
           ))
       }
     }
@@ -358,17 +359,75 @@ final class ChatModel {
     }
     return ActiveWorkSummary(omittedCount: omitted, items: rows)
   }
-  struct PendingReply: Equatable, Sendable {
+  private struct PendingReply {
     let reference: ReplyReference
     let lane: ProfileID?
   }
+  private enum ComposerContext {
+    case reply(PendingReply)
+    case work(WorkResponseTarget)
+  }
   var previewURL: URL?
-  private(set) var preparingAttachments = false
+  private var draftFileOperations = 0
+  var preparingAttachments: Bool { draftFileOperations > 0 }
+  private enum DraftProducer: Hashable {
+    case dictation
+    case fileImport(UUID)
+    case picker(UUID)
+  }
+  private var draftProducers: Set<DraftProducer> = []
+  private var dictationInProgress: Bool { draftProducers.contains(.dictation) }
+  @ObservationIgnored private var workProducerWaiters: [CheckedContinuation<Void, Never>] = []
+  var producingWorkResponse: Bool { workResponseTarget != nil && !draftProducers.isEmpty }
   var mode: InputMode = .steer { didSet { draftChanged() } }
-  var pendingReply: PendingReply?
+  private var pendingContext: ComposerContext?
+  private(set) var recoveredWorkResponse: RecoveredWorkResponse?
+  private var selectingWorkResponse = false
+  @ObservationIgnored private var draftRevisionAtWorkSelection: Int?
+  private var pendingReply: PendingReply? {
+    if case .reply(let reply) = pendingContext { return reply }
+    return nil
+  }
   var replyTarget: ReplyReference? { pendingReply?.reference }
+  var workResponseTarget: WorkResponseTarget? {
+    if case .work(let target) = pendingContext { return target }
+    return nil
+  }
+  var canSelectWorkResponse: Bool {
+    draftReady && !admitting && !selectingWorkResponse && !preparingAttachments
+      && draftProducers.isEmpty
+      && !pendingSharedImport && recoveredWorkResponse == nil
+      && inspectedConversation == nil && activeSidechat == nil
+  }
+  @discardableResult
+  func respond(inChatTo target: WorkResponseTarget) async -> Bool {
+    let lane = target.reference.lane
+    guard canSelectWorkResponse, isSaved(lane), paired(lane), target.laneEpoch == laneEpoch(lane)
+    else { return false }
+    var reference = target.reference
+    if let existing = workResponseTarget, !composerIsEmpty {
+      guard existing.reference.identifiesSameItem(as: reference) else {
+        failure = "Select the original work item again or cancel its response first."
+        return false
+      }
+      reference = existing.reference
+    } else {
+      draftRevisionAtWorkSelection = draftRevision
+      if addressesByName, destination.chip == nil, restoredFrom == nil {
+        reference.conflictsWithLeadingTags = Addressing.leadingTags(committed).tags.contains {
+          $0.lowercased() != name(lane).lowercased()
+        }
+      }
+    }
+    selectingWorkResponse = true
+    defer { selectingWorkResponse = false }
+    pendingContext = .work(.init(reference: reference, laneEpoch: target.laneEpoch))
+    return await saveDraft()
+  }
   func reply(to row: RowModel) {
-    guard let entryID = row.row.entryID else { return }
+    guard !selectingWorkResponse, !producingWorkResponse, let entryID = row.row.entryID else {
+      return
+    }
     let condensed =
       row.row.text
       .split(whereSeparator: \.isNewline)
@@ -377,13 +436,31 @@ final class ChatModel {
       .joined(separator: " ")
     let excerpt =
       condensed.count > 160 ? String(condensed.prefix(159)) + "…" : condensed
-    pendingReply = PendingReply(
-      reference: ReplyReference(entryId: entryID, excerpt: excerpt, role: row.row.role),
-      lane: row.lane)
+    clearComposerContext()
+    pendingContext = .reply(
+      PendingReply(
+        reference: ReplyReference(entryId: entryID, excerpt: excerpt, role: row.row.role),
+        lane: row.lane))
   }
-  func clearReply() {
-    pendingReply = nil
+  func clearComposerContext() {
+    guard !selectingWorkResponse else { return }
+    if producingWorkResponse {
+      voidHeldDictationSend()
+      return
+    }
+    let work = workResponseTarget?.reference
+    pendingContext = nil
+    guard let work else { return }
+    if draftRevisionAtWorkSelection != draftRevision, !composerIsEmpty,
+      compatibleWithWorkDraft(work)
+    {
+      destination = .chip(work.lane)
+    } else {
+      draftChanged()
+    }
   }
+
+  private var composerIsEmpty: Bool { draft.isEmpty && attachments.isEmpty }
   private(set) var draftReady: Bool
   private(set) var pendingSharedImport = false
   var draftError: String?
@@ -459,7 +536,7 @@ final class ChatModel {
 
   func insertCommand(_ command: SlashCommand) {
     let name = command.usage.prefix(while: { !$0.isWhitespace })
-    guard draftReady, !name.isEmpty else { return }
+    guard draftReady, !name.isEmpty, workResponseTarget == nil else { return }
     let text = draft.drop(while: \.isWhitespace)
     let leading = text.prefix(while: { !$0.isWhitespace })
     if commands.contains(where: { $0.usage.prefix(while: { !$0.isWhitespace }) == leading }) {
@@ -473,23 +550,20 @@ final class ChatModel {
   private var currentDraft: ComposerDraft {
     var value = ComposerDraft(
       text: draft, mode: mode, attachments: attachments, consumedTransfers: consumedTransfers,
-      composerID: composerID,
-      addressing: DraftAddressing(
-        destination: destination, restoredFrom: restoredFrom, source: source))
-    if case .pending(let text, let submission) = admission {
-      if let submission {
-        let submittedIDs = Set(submission.attachments.map(\.id))
-        value.submission = submission
-        value.returnedText = String(splitAfterReturns().returned)
-        value.attachments.removeAll { submittedIDs.contains($0.id) }
-      } else if !text.isEmpty {
-        value.text = insertedAfterReturns(text)
-      }
+      composerID: composerID, addressing: draftAddressing,
+      workResponse: workResponseTarget?.reference, recoveredWorkResponse: recoveredWorkResponse)
+    if case .pending(let submission) = admission {
+      let submittedIDs = Set(submission.attachments.map(\.id))
+      value.submission = submission
+      value.returnedText = String(splitAfterReturns().returned)
+      value.attachments.removeAll { submittedIDs.contains($0.id) }
     }
     return value
   }
   /// Whom the draft is for, as it would be saved.
-  var draftAddressing: DraftAddressing { currentDraft.addressing }
+  var draftAddressing: DraftAddressing {
+    DraftAddressing(destination: destination, restoredFrom: restoredFrom, source: source)
+  }
   private func draftChanged() {
     draftRevision &+= 1
     scheduleDraftSave()
@@ -553,7 +627,11 @@ final class ChatModel {
       composerID = restored.draft.composerID ?? composerID
       retiredDraftFiles = restored.retiredAttachments
       // Last, since the text's and files' didSet drops a restored source while both are empty.
-      adopt(restored.draft)
+      adoptAddressing(restored.draft.addressing)
+      if let reference = restored.draft.workResponse {
+        pendingContext = .work(.init(reference: reference, laneEpoch: nil))
+      }
+      recoveredWorkResponse = restored.draft.recoveredWorkResponse
       persistentRevision = restored.revision
       changingDraft = false
       draftReady = true
@@ -569,8 +647,7 @@ final class ChatModel {
   /// Restores whom the saved draft is for. A chip, stamp or source coordinator not saved now,
   /// whether removed earlier or not loaded, is marked removed, so Send blocks instead of reaching
   /// another.
-  private func adopt(_ saved: ComposerDraft) {
-    let addressing = saved.addressing
+  private func adoptAddressing(_ addressing: DraftAddressing) {
     let named = [addressing.destination.coordinator, addressing.restoredFrom].compactMap { $0 }
     for id in named where !profiles.contains(where: { $0.id == id }) {
       removed[id] = removed[id] ?? "A coordinator"
@@ -580,23 +657,27 @@ final class ChatModel {
     destination = addressing.destination
   }
   func receiveSharedDrafts() async {
-    guard draftReady, !preparingAttachments, !admitting, let sharedInbox, persistence != nil else {
-      return
-    }
-    preparingAttachments = true
-    defer { preparingAttachments = false }
+    guard let sharedInbox else { return }
+    let waiting = sharedInbox.hasWaitingBatch()
+    if waiting { await takeOverFromWorkProducers() }
+    guard draftReady, !preparingAttachments, !admitting, persistence != nil else { return }
+    guard !Task.isCancelled else { return }
+    draftFileOperations += 1
+    defer { draftFileOperations -= 1 }
     do {
       let store = try attachmentStore()
       try await retireAcknowledgedTransfers(in: sharedInbox)
-      // One activation must not drain an unbounded queue or overfill the composer.
-      for _ in 0..<AttachmentLimits.maximumCount {
-        let consumed = try await sharedInbox.consumeNext(into: store) { [self] batch in
-          try await adoptSharedDraft(batch)
+      if waiting {
+        // One activation must not drain an unbounded queue or overfill the composer.
+        for _ in 0..<AttachmentLimits.maximumCount {
+          let consumed = try await sharedInbox.consumeNext(into: store) { [self] batch in
+            try await adoptSharedDraft(batch)
+          }
+          guard consumed else { break }
+          // Only acknowledged IDs may leave the durable host ledger. A crash
+          // before this cleanup is harmless and is reconciled on next launch.
+          try await retireAcknowledgedTransfers(in: sharedInbox)
         }
-        guard consumed else { break }
-        // Only acknowledged IDs may leave the durable host ledger. A crash
-        // before this cleanup is harmless and is reconciled on next launch.
-        try await retireAcknowledgedTransfers(in: sharedInbox)
       }
       draftError = nil
     } catch {
@@ -611,10 +692,12 @@ final class ChatModel {
   }
   private func adoptSharedDraft(_ batch: SharedDraftBatch) async throws {
     if !consumedTransfers.contains(batch.id) {
-      guard batch.attachments.count <= AttachmentLimits.maximumCount - attachments.count else {
+      let existingFiles = workResponseTarget == nil ? attachments.count : 0
+      guard batch.attachments.count <= AttachmentLimits.maximumCount - existingFiles else {
         throw AttachmentError.tooMany
       }
       changingDraft = true
+      parkWorkComposer()
       if !batch.note.isEmpty { draft += (draft.isEmpty ? "" : "\n\n") + batch.note }
       attachments.append(contentsOf: batch.attachments)
       consumedTransfers.insert(batch.id)
@@ -644,7 +727,7 @@ final class ChatModel {
   /// coordinator no longer saved blocks Send as a stale chip does. While a Send is admitting it
   /// changes nothing.
   func setChip(_ id: ProfileID) {
-    guard !admitting else { return }
+    guard !admitting, !producingWorkResponse else { return }
     destination = .chip(id)
   }
 
@@ -652,7 +735,7 @@ final class ChatModel {
   /// text stays literal. While a Send is admitting the chip stays, since a changed draft would keep
   /// the sent text in the composer.
   func removeChip() {
-    guard !admitting, case .chip = destination else { return }
+    guard !admitting, !producingWorkResponse, case .chip = destination else { return }
     destination = .open
   }
 
@@ -1082,13 +1165,38 @@ final class ChatModel {
 
   /// Who Send reaches with the current draft from the scope shown, or why it does not.
   var addressing: Addressing {
-    address(draft, hasAttachments: !attachments.isEmpty, destination: destination, in: scope)
+    guard let target = workResponseTarget else {
+      return address(
+        draft, hasAttachments: !attachments.isEmpty, destination: destination, in: scope)
+    }
+    let reference = target.reference
+    guard isSaved(reference.lane), target.laneEpoch == laneEpoch(reference.lane) else {
+      return .blocked("Select this item again in Active work to send the response.")
+    }
+    guard compatibleWithWorkDraft(reference) else {
+      return .blocked(
+        "This draft is addressed elsewhere. Change its recipient or cancel the work response.")
+    }
+    return address(
+      draft, hasAttachments: !attachments.isEmpty, destination: .chip(reference.lane), in: scope)
+  }
+
+  private func compatibleWithWorkDraft(_ reference: WorkResponseReference) -> Bool {
+    !reference.conflictsWithLeadingTags
+      && [destination.coordinator, restoredFrom].compactMap { $0 }.allSatisfy {
+        $0 == reference.lane
+      }
   }
 
   /// True while the draft is the coordinator's. That is while the coordinator is its chip, the
   /// draft began in its conversation or was restored from it, or a typed tag with its name leads it.
   func addresses(_ id: ProfileID) -> Bool {
+    if recoveredWorkResponse?.metadata.reference.lane == id { return true }
+    if !composerIsEmpty || producingWorkResponse, workResponseTarget?.reference.lane == id {
+      return true
+    }
     if destination.coordinator == id || restoredFrom == id { return true }
+    if let work = workResponseTarget, !work.reference.conflictsWithLeadingTags { return false }
     guard destination.chip == nil, restoredFrom == nil,
       let name = profiles.first(where: { $0.id == id })?.name.description
     else { return false }
@@ -1135,7 +1243,8 @@ final class ChatModel {
   /// Saved coordinators matching an `@` still being typed in the committed text, for the picker
   /// above the composer. A restored draft offers none, since choosing one replaces the draft.
   var pickerMatches: [CoordinatorProfile] {
-    guard addressesByName, destination.chip == nil, restoredFrom == nil, committed.first == "@",
+    guard workResponseTarget == nil, addressesByName, destination.chip == nil, restoredFrom == nil,
+      committed.first == "@",
       !committed.contains(where: \.isWhitespace)
     else { return [] }
     let typed = committed.dropFirst().lowercased()
@@ -1145,7 +1254,7 @@ final class ChatModel {
   }
 
   func choose(_ id: ProfileID) {
-    guard removed[id] == nil else { return }
+    guard removed[id] == nil, workResponseTarget == nil else { return }
     destination = .chip(id)
     draft = ""
   }
@@ -1162,7 +1271,8 @@ final class ChatModel {
   /// draft's text is literal for good, so no tag in it ever becomes the chip, and none does while
   /// an input method is still composing the draft.
   func promoteTypedTag() {
-    guard addressesByName, destination.chip == nil, restoredFrom == nil, committed == draft,
+    guard workResponseTarget == nil, addressesByName, destination.chip == nil, restoredFrom == nil,
+      committed == draft,
       draft.first == "@"
     else { return }
     let word = draft.dropFirst().prefix { !$0.isWhitespace }
@@ -1197,7 +1307,7 @@ final class ChatModel {
   /// coordinator through the Mac, and with no scope veto, since the target is the coordinator the
   /// feed shows. nil for any other draft.
   private var feedbackDraft: FeedbackDraft? {
-    guard activeSidechat == nil else { return nil }
+    guard activeSidechat == nil, workResponseTarget == nil else { return nil }
     let parsed = address(
       draft, hasAttachments: !attachments.isEmpty, destination: destination, in: .all,
       anyConnection: true)
@@ -1225,14 +1335,17 @@ final class ChatModel {
     case sharedImport
     case admitting
     case preparingAttachments
+    case dictating
     case addressing(Addressing)
   }
 
   var sendBlocker: SendBlocker? {
     if !draftReady { return .draftNotRestored }
     if pendingSharedImport { return .sharedImport }
-    if admitting { return .admitting }
+    if admitting || selectingWorkResponse { return .admitting }
     if preparingAttachments { return .preparingAttachments }
+    if workResponseTarget != nil, dictationInProgress { return .dictating }
+    if producingWorkResponse { return .preparingAttachments }
     if feedbackDraft != nil { return nil }
     guard case .to = addressing else { return .addressing(addressing) }
     return nil
@@ -1245,11 +1358,53 @@ final class ChatModel {
   struct DraftMark: Equatable {
     fileprivate let revision: Int
     fileprivate let scope: FeedScope
+    fileprivate let workResponse: WorkResponseTarget?
   }
 
-  var draftMark: DraftMark { DraftMark(revision: draftRevision, scope: scope) }
+  var draftMark: DraftMark {
+    DraftMark(revision: draftRevision, scope: scope, workResponse: workResponseTarget)
+  }
 
-  var dictationAllowed: Bool { draftReady && !admitting && !pendingSharedImport }
+  var dictationAllowed: Bool {
+    guard draftReady, !admitting, !selectingWorkResponse, !pendingSharedImport, !dictationInProgress
+    else { return false }
+    guard let work = workResponseTarget else { return true }
+    return compatibleWithWorkDraft(work.reference) && !preparingAttachments
+  }
+
+  func beginDictation() { draftProducers.insert(.dictation) }
+
+  func endDictation() { endProducing(.dictation) }
+
+  func beginPicker() -> UUID? {
+    guard !preparingAttachments, takesFiles() else { return nil }
+    let picker = UUID()
+    draftProducers.insert(.picker(picker))
+    return picker
+  }
+
+  func endPicker(_ picker: UUID) { endProducing(.picker(picker)) }
+
+  private func endProducing(_ producer: DraftProducer) {
+    draftProducers.remove(producer)
+    resumeWorkProducerWaiters()
+  }
+
+  private func takeOverFromWorkProducers() async {
+    while producingWorkResponse {
+      voidHeldDictationSend()
+      await withCheckedContinuation { workProducerWaiters.append($0) }
+    }
+  }
+
+  private func voidHeldDictationSend() { draftRevision &+= 1 }
+
+  private func resumeWorkProducerWaiters() {
+    guard !producingWorkResponse else { return }
+    let waiters = workProducerWaiters
+    workProducerWaiters.removeAll()
+    for waiter in waiters { waiter.resume() }
+  }
 
   func send() async {
     await startSend()?.value
@@ -1299,6 +1454,7 @@ final class ChatModel {
       return ignoreSend()
     }
     let text = draft
+    let workResponse = workResponseTarget
     let targets: [Target] = recipients.compactMap { id in
       lanes.first { $0.id == id }?.session.map { (id, $0) }
     }
@@ -1307,7 +1463,8 @@ final class ChatModel {
     let original = source
     let addressedTo = DraftAddressing(destination: destination, restoredFrom: restoredFrom)
     let files = attachments
-    let isControl = activeSidechat == nil && CoordinatorSession.isControlInput(text)
+    let isControl =
+      workResponse == nil && activeSidechat == nil && CoordinatorSession.isControlInput(text)
     if !isControl, let reply = pendingReply, let replyLane = reply.lane,
       recipients != [replyLane]
     {
@@ -1316,17 +1473,25 @@ final class ChatModel {
       )
       return ignoreSend()
     }
-    let reply = isControl ? nil : pendingReply
-    if !isControl { clearReply() }
+    let context = isControl ? nil : pendingContext
+    let reply = isControl ? nil : pendingReply?.reference
+    let message = workResponse?.reference.message(with: body) ?? body
+    let workDraft = workResponse.map { captureWorkDraft($0.reference) }
     let submission = submission(
-      ComposerInputIdentity(composerID: composerID), text: text, files: files, at: targets)
+      ComposerInputIdentity(composerID: composerID), text: text, files: files, at: targets,
+      workResponse: workDraft?.metadata)
     sendsStarted += 1
     let sendOrder = sendsStarted
     // Clear the actual bound value before any await. The pending admission
     // retains the recovery copy until the durable outboxes take ownership.
-    admission = .pending(text: text, submission: submission)
+    admission = .pending(submission)
     changingDraft = true
-    draft = ""
+    if workDraft != nil {
+      emptyWorkComposer()
+    } else {
+      if !isControl { pendingContext = nil }
+      draft = ""
+    }
     changingDraft = false
     logComposer(.cleared)
     let clearedRevision = draftRevision
@@ -1335,10 +1500,10 @@ final class ChatModel {
       var departing: [ControlDeparture] = []
       defer {
         admission = nil
-        if !admitted {
+        if !admitted, workDraft == nil {
           putBack(text, of: sendOrder)
-          if pendingReply == nil, let reply {
-            pendingReply = reply
+          if pendingContext == nil {
+            pendingContext = context
           }
         }
         // A composer emptied during the Send kept whom its draft was for until now.
@@ -1346,16 +1511,24 @@ final class ChatModel {
       }
       // The pending identity must be durable before the independent outboxes can
       // claim it. New typing and files remain separate from this submitted note.
-      guard await saveDraft() else { return }
-      admitted = await admit { [self] in
-        let delivery = await deliver(
-          body, mode: mode, files: files, replyTo: reply?.reference, to: targets,
-          receipt: submission.identity)
-        departing = delivery.departing
-        return delivery.admitted
+      let checkpoint = await saveDraft()
+      if checkpoint {
+        admitted = await admit { [self] in
+          let delivery = await deliver(
+            message, mode: mode, files: files, replyTo: reply, to: targets,
+            receipt: submission.identity)
+          departing = delivery.departing
+          return delivery.admitted
+        }
       }
-      // Nothing went, so the text comes back for another try.
-      guard admitted else { return }
+      guard admitted else {
+        if let workDraft {
+          admission = .saved
+          recoverWorkDraft(workDraft, laneEpoch: workResponse?.laneEpoch)
+          if checkpoint { _ = await saveDraft() }
+        }
+        return
+      }
       // The outboxes own this message even if their connections have since stopped.
       admission = .saved
       logComposer(.outboxSaved)
@@ -1375,8 +1548,60 @@ final class ChatModel {
       _ = await saveDraft()
       guard let original else { return }
       if source == original { source = nil }
-      if original.isCarried(by: body, files: files, to: recipients) { await remove(original) }
+      if original.isCarried(by: message, files: files, to: recipients) { await remove(original) }
     }
+  }
+
+  private func captureWorkDraft(_ reference: WorkResponseReference) -> RecoveredWorkResponse {
+    RecoveredWorkResponse(
+      metadata: .init(reference: reference, mode: mode, addressing: draftAddressing),
+      text: draft, attachments: attachments)
+  }
+
+  private func emptyWorkComposer() {
+    pendingContext = nil
+    draft = ""
+    attachments = []
+    destination = .open
+    restoredFrom = nil
+    source = nil
+  }
+
+  private func parkWorkComposer() {
+    guard let work = workResponseTarget else { return }
+    recoveredWorkResponse = captureWorkDraft(work.reference)
+    emptyWorkComposer()
+  }
+
+  private func recoverWorkDraft(_ response: RecoveredWorkResponse, laneEpoch: Int?) {
+    if composerIsEmpty, destination == .open, pendingContext == nil, !preparingAttachments {
+      loadWorkDraft(response, laneEpoch: laneEpoch)
+    } else {
+      recoveredWorkResponse = response
+    }
+    draftChanged()
+  }
+
+  private func loadWorkDraft(_ response: RecoveredWorkResponse, laneEpoch: Int?) {
+    changingDraft = true
+    draft = response.text
+    attachments = response.attachments
+    mode = response.metadata.mode
+    adoptAddressing(response.metadata.addressing)
+    pendingContext = .work(.init(reference: response.metadata.reference, laneEpoch: laneEpoch))
+    changingDraft = false
+  }
+
+  var canRestoreWorkResponse: Bool {
+    draftReady && !admitting && !preparingAttachments && !pendingSharedImport
+      && !dictationInProgress && composerIsEmpty && pendingContext == nil
+  }
+
+  func restoreRecoveredWorkResponse() async {
+    guard canRestoreWorkResponse, let response = recoveredWorkResponse else { return }
+    recoveredWorkResponse = nil
+    loadWorkDraft(response, laneEpoch: nil)
+    _ = await saveDraft()
   }
 
   private var leadingReturns: [(returned: ReturnedText, paragraphEnd: String.Index)] {
@@ -1411,9 +1636,10 @@ final class ChatModel {
     _ text: String, of sendOrder: Int, addressedTo addressing: DraftAddressing? = nil
   ) {
     guard !text.isEmpty else { return }
-    let empty = draft.isEmpty && attachments.isEmpty
-    // It returns as the draft it was, so the scope shown now does not begin it again.
     changingDraft = true
+    parkWorkComposer()
+    let empty = composerIsEmpty
+    // It returns as the draft it was, so the scope shown now does not begin it again.
     draft = insertedAfterReturns(text, olderThan: sendOrder)
     textsReturnedSinceEmpty.insert(
       ReturnedText(sendOrder: sendOrder, text: text),
@@ -1435,6 +1661,7 @@ final class ChatModel {
     for departure in departing {
       if await departure.wrote { return }
     }
+    await takeOverFromWorkProducers()
     putBack(text, of: sendOrder, addressedTo: addressing)
   }
 
@@ -1488,11 +1715,11 @@ final class ChatModel {
   /// The composer's receipt for a Send, held in the outbox of each of its `targets`.
   private func submission(
     _ identity: ComposerInputIdentity, text: String, files: [LocalAttachment],
-    at targets: [Target]
+    at targets: [Target], workResponse: RecoveredWorkResponse.Metadata?
   ) -> ComposerSubmission {
     ComposerSubmission(
       identity: identity, outboxURLs: targets.map(\.session.outboxURL), text: text,
-      attachments: files)
+      attachments: files, workResponse: workResponse)
   }
   private func logComposer(_ event: ComposerEvent, error: (any Error)? = nil) {
     let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
@@ -1573,8 +1800,8 @@ final class ChatModel {
   /// as it was. The input stays queued until a Send carries the copy unchanged.
   func restore(_ inputID: String) async {
     guard let lane = lane(holding: inputID), readyToRestore(from: lane.id) else { return }
-    preparingAttachments = true
-    defer { preparingAttachments = false }
+    draftFileOperations += 1
+    defer { draftFileOperations -= 1 }
     do {
       let store = try attachmentStore()
       guard let restored = await lane.session?.restore(inputID, to: store) else { return }
@@ -1596,8 +1823,8 @@ final class ChatModel {
     guard let hold = holds.first(where: { $0.queue.id == message.queue }),
       let recipient = chosen ?? owner, readyToRestore(from: recipient)
     else { return }
-    preparingAttachments = true
-    defer { preparingAttachments = false }
+    draftFileOperations += 1
+    defer { draftFileOperations -= 1 }
     do {
       let store = try attachmentStore()
       guard let restored = try await hold.store.restore(message.id, to: store) else { return }
@@ -1620,7 +1847,7 @@ final class ChatModel {
       failure = "\(name) is being removed."
       return false
     }
-    guard !admitting, !preparingAttachments, draft.isEmpty, attachments.isEmpty else {
+    guard !admitting, !preparingAttachments, composerIsEmpty, workResponseTarget == nil else {
       failure = "Send or clear the current draft before restoring another message."
       return false
     }
@@ -1641,7 +1868,7 @@ final class ChatModel {
     _ restored: RestoredDraft, for lane: ProfileID,
     source original: (item: String, kind: RestoredSource.Kind)?, _ store: AttachmentStore
   ) async {
-    guard (draft.isEmpty && attachments.isEmpty) || namesNoOneBut(lane) else {
+    guard workResponseTarget == nil, composerIsEmpty || namesNoOneBut(lane) else {
       failure = "Send or clear the current draft before restoring another message."
       for file in restored.attachments { try? await store.remove(file) }
       return
@@ -1666,6 +1893,11 @@ final class ChatModel {
     guard admission == nil, draft.isEmpty && attachments.isEmpty else { return }
     restoredFrom = nil
     source = nil
+    if let work = workResponseTarget, work.reference.conflictsWithLeadingTags {
+      var reference = work.reference
+      reference.conflictsWithLeadingTags = false
+      pendingContext = .work(.init(reference: reference, laneEpoch: work.laneEpoch))
+    }
     switch destination {
     case .begunIn: destination = .open
     // Only Restore sets a chip the composer does not draw, so it goes with the draft it was set for.
@@ -1707,7 +1939,9 @@ final class ChatModel {
   /// The text's begin stamp, in the same turn as the first character typed into an empty
   /// composer. Share imports and a draft reload run under `changingDraft` and never stamp.
   private func stampBegun() {
-    guard !changingDraft, destination == .open, let shown = scope.coordinator else { return }
+    guard !changingDraft, destination == .open,
+      let shown = workResponseTarget?.reference.lane ?? scope.coordinator
+    else { return }
     destination = .begunIn(shown)
   }
 
@@ -1720,7 +1954,7 @@ final class ChatModel {
 
   private func claimBegin() -> BeginClaim? {
     guard draft.isEmpty, attachments.isEmpty, destination == .open,
-      let shown = scope.coordinator
+      let shown = workResponseTarget?.reference.lane ?? scope.coordinator
     else { return nil }
     return BeginClaim(destination: .begunIn(shown), revision: draftRevision)
   }
@@ -1734,14 +1968,35 @@ final class ChatModel {
     if stamps, let claim { destination = claim.destination }
   }
 
+  private func takesFiles() -> Bool {
+    guard draftReady else { return false }
+    if let work = workResponseTarget, !compatibleWithWorkDraft(work.reference) {
+      failure = "Cancel the work response before adding files to this draft."
+      return false
+    }
+    return true
+  }
+
+  private func beginAttachmentImport() -> UUID? {
+    guard takesFiles() else { return nil }
+    let fileImport = UUID()
+    draftProducers.insert(.fileImport(fileImport))
+    draftFileOperations += 1
+    return fileImport
+  }
+
+  private func endAttachmentImport(_ fileImport: UUID) {
+    draftFileOperations -= 1
+    endProducing(.fileImport(fileImport))
+  }
+
   /// Returns the copy it started, or nil when the composer takes no files now.
   @discardableResult
   func attach(urls: [URL]) -> Task<Void, Never>? {
-    guard draftReady, !preparingAttachments else { return nil }
+    guard !preparingAttachments, let fileImport = beginAttachmentImport() else { return nil }
     var claim = claimBegin()
-    preparingAttachments = true
     return Task {
-      defer { preparingAttachments = false }
+      defer { endAttachmentImport(fileImport) }
       do {
         let store = try attachmentStore()
         for url in urls {
@@ -1758,11 +2013,10 @@ final class ChatModel {
   }
   @discardableResult
   func attach(providers: [NSItemProvider]) -> Task<Void, Never>? {
-    guard draftReady, !preparingAttachments else { return nil }
+    guard !preparingAttachments, let fileImport = beginAttachmentImport() else { return nil }
     let claim = claimBegin()
-    preparingAttachments = true
     return Task {
-      defer { preparingAttachments = false }
+      defer { endAttachmentImport(fileImport) }
       var staged: [LocalAttachment] = []
       do {
         guard providers.count <= AttachmentLimits.maximumCount - attachments.count else {
@@ -1789,6 +2043,8 @@ final class ChatModel {
     }
   }
   func attach(data: Data, name: String, mediaType: String) async {
+    guard let fileImport = beginAttachmentImport() else { return }
+    defer { endAttachmentImport(fileImport) }
     await attach(data: data, name: name, mediaType: mediaType, claim: claimBegin())
   }
   private func attach(data: Data, name: String, mediaType: String, claim: BeginClaim?) async {
@@ -1806,11 +2062,10 @@ final class ChatModel {
   #if os(iOS)
     @discardableResult
     func attach(photo: PhotosPickerItem) -> Task<Void, Never>? {
-      guard draftReady, !preparingAttachments else { return nil }
+      guard !preparingAttachments, let fileImport = beginAttachmentImport() else { return nil }
       let claim = claimBegin()
-      preparingAttachments = true
       return Task {
-        defer { preparingAttachments = false }
+        defer { endAttachmentImport(fileImport) }
         do {
           guard let image = try await photo.loadTransferable(type: ImportedPhoto.self) else {
             throw AttachmentError.invalidFile

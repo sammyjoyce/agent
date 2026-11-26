@@ -4,6 +4,7 @@ import SwiftUI
 struct ActiveWorkRow: Identifiable, Equatable, Sendable {
   let id: String
   let lane: ProfileID
+  let laneEpoch: Int
   let laneName: String
   let item: ActiveWorkItem
 
@@ -17,6 +18,17 @@ struct ActiveWorkRow: Identifiable, Equatable, Sendable {
     SavedConversation(
       agentId: child.agentId, conversationId: child.conversationId, host: child.host,
       sourceThreadId: nil, taskId: item.taskId, title: child.title, updatedAt: item.startedAt)
+  }
+
+  func responseTarget(for child: ActiveWorkChild? = nil) -> WorkResponseTarget? {
+    guard (child?.status ?? item.status) == .waitingOwner else { return nil }
+    return WorkResponseTarget(
+      reference: WorkResponseReference(
+        lane: lane, coordinator: laneName, itemID: item.id,
+        conversationID: child?.conversationId ?? item.conversationId, taskID: item.taskId,
+        agentID: child?.agentId, sidechatSlug: item.sidechatSlug, isJob: item.isJob,
+        title: child?.title ?? item.title, detail: child == nil ? item.detail : child?.detail),
+      laneEpoch: laneEpoch)
   }
 }
 
@@ -103,6 +115,7 @@ extension ActiveWorkStatus {
 struct ActiveWorkSheet: View {
   let model: ChatModel
   var openSidechat: ((ProfileID, String) -> Void)? = nil
+  let respond: (WorkResponseTarget) -> Void
   @Environment(\.dismiss) private var dismiss
   @State private var inspection: ActiveWorkInspectionTarget?
 
@@ -122,24 +135,14 @@ struct ActiveWorkSheet: View {
           if !runningItems.isEmpty {
             Section("Running") {
               ForEach(runningItems) { row in
-                ActiveWorkRowButtons(
-                  row: row, showLaneName: model.namesLanes,
-                  openSidechat: openSidechat,
-                  inspect: { lane, conversation in
-                    inspection = ActiveWorkInspectionTarget(lane: lane, conversation: conversation)
-                  })
+                rowButtons(row)
               }
             }
           }
           if !waitingItems.isEmpty {
             Section("Waiting") {
               ForEach(waitingItems) { row in
-                ActiveWorkRowButtons(
-                  row: row, showLaneName: model.namesLanes,
-                  openSidechat: openSidechat,
-                  inspect: { lane, conversation in
-                    inspection = ActiveWorkInspectionTarget(lane: lane, conversation: conversation)
-                  })
+                rowButtons(row)
               }
             }
           }
@@ -169,6 +172,14 @@ struct ActiveWorkSheet: View {
       ConversationInspectionView(owner: model, lane: target.lane, initial: target.conversation)
     }
   }
+
+  private func rowButtons(_ row: ActiveWorkRow) -> some View {
+    ActiveWorkRowButtons(
+      row: row, showLaneName: model.namesLanes, openSidechat: openSidechat,
+      inspect: { lane, conversation in
+        inspection = ActiveWorkInspectionTarget(lane: lane, conversation: conversation)
+      }, respond: respond, responseEnabled: model.canSelectWorkResponse)
+  }
 }
 
 private struct ActiveWorkRowButtons: View {
@@ -176,42 +187,73 @@ private struct ActiveWorkRowButtons: View {
   let showLaneName: Bool
   let openSidechat: ((ProfileID, String) -> Void)?
   let inspect: (ProfileID, SavedConversation) -> Void
+  let respond: (WorkResponseTarget) -> Void
+  let responseEnabled: Bool
 
   var body: some View {
-    Button {
-      if row.item.sidechatSlug != nil, let openSidechat {
-        openSidechat(row.lane, row.item.conversationId)
-      } else {
-        inspect(row.lane, row.inspectionTarget)
+    HStack(spacing: 8) {
+      Button {
+        if row.item.sidechatSlug != nil, let openSidechat {
+          openSidechat(row.lane, row.item.conversationId)
+        } else {
+          inspect(row.lane, row.inspectionTarget)
+        }
+      } label: {
+        HStack(spacing: 8) {
+          ActiveWorkRowContent(row: row, showLaneName: showLaneName)
+          Image(systemName: "chevron.right")
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.tertiary)
+        }
+        .contentShape(Rectangle())
       }
-    } label: {
-      HStack(spacing: 8) {
-        ActiveWorkRowContent(row: row, showLaneName: showLaneName)
-        Image(systemName: "chevron.right")
-          .font(.caption.weight(.semibold))
-          .foregroundStyle(.tertiary)
-      }
-      .contentShape(Rectangle())
+      .buttonStyle(.plain)
+      .accessibilityIdentifier("activeWorkRow:\(row.id)")
+      respondButton(row.responseTarget(), id: row.id)
     }
-    .buttonStyle(.plain)
-    .accessibilityIdentifier("activeWorkRow:\(row.id)")
     if let children = row.item.children, !children.isEmpty {
       ForEach(children, id: \.agentId) { child in
-        Button {
-          inspect(row.lane, row.childInspectionTarget(child))
-        } label: {
-          HStack(spacing: 8) {
-            ActiveWorkChildRowContent(child: child)
-            Spacer(minLength: 4)
-            Image(systemName: "chevron.right")
-              .font(.caption.weight(.semibold))
-              .foregroundStyle(.tertiary)
+        HStack(spacing: 8) {
+          Button {
+            inspect(row.lane, row.childInspectionTarget(child))
+          } label: {
+            HStack(spacing: 8) {
+              ActiveWorkChildRowContent(child: child)
+              Spacer(minLength: 4)
+              Image(systemName: "chevron.right")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.tertiary)
+            }
+            .contentShape(Rectangle())
           }
-          .contentShape(Rectangle())
+          .buttonStyle(.plain)
+          .accessibilityIdentifier("activeWorkChild:\(row.id):\(child.agentId)")
+          respondButton(row.responseTarget(for: child), id: "\(row.id):\(child.agentId)")
         }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier("activeWorkChild:\(row.id):\(child.agentId)")
       }
+    }
+  }
+
+  @ViewBuilder
+  private func respondButton(_ target: WorkResponseTarget?, id: String) -> some View {
+    if let target {
+      Button {
+        respond(target)
+      } label: {
+        Label("Respond in chat", systemImage: "arrowshape.turn.up.left")
+          .labelStyle(.iconOnly)
+          .foregroundStyle(Color.accentColor)
+          .frame(width: 44, height: 44)
+          .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .disabled(!responseEnabled)
+      .help("Respond in chat")
+      .accessibilityLabel("Respond in chat")
+      .accessibilityHint(
+        "Respond to \(target.reference.title) in \(target.reference.coordinator) chat"
+      )
+      .accessibilityIdentifier("activeWorkRespond:\(id)")
     }
   }
 }
