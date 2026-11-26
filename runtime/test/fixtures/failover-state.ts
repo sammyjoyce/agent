@@ -177,6 +177,11 @@ export async function commitGroup(storage: Storage, batches: readonly (readonly 
   return { ...result, seqs };
 }
 
+export async function recoverInterruptedTasks(directory: string): Promise<void> {
+  const { harness } = await openPi(await SqliteStorage.open(await openConversationDatabase(sessionPath(directory))));
+  await harness.close(BACKGROUND_CONTEXT);
+}
+
 /** Commits as a coordinator without the commit barrier does. */
 export async function commitOutsideTheLog(directory: string, text: string): Promise<void> {
   const { harness, root } = await openPi(await SqliteStorage.open(await openConversationDatabase(sessionPath(directory))));
