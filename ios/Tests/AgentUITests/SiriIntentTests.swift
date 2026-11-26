@@ -290,8 +290,7 @@
     }
 
     /// Runs the App Shortcut from the Shortcuts app, which shows the confirmation and the
-    /// outcome. Cancel sends nothing, and Send sends one copy. The test skips, with its steps
-    /// attached, when the Shortcuts app does not reach the confirmation.
+    /// outcome. Cancel sends nothing, and Send sends one copy.
     func testShortcutsAsksBeforeItSends() async throws {
       let (app, work, personal) = try await launchWithAWorkDraft(origins: ["siri"])
       goHome()
@@ -300,16 +299,14 @@
       var log: [String] = []
       defer { attach(log, named: "shortcuts-steps") }
 
-      let asked = try await runSendMessageShortcut(
+      try await runSendMessageShortcut(
         "Check the build", to: "Work", answering: "Cancel", in: shortcuts, log: &log)
       capture("shortcuts-send-confirmation", shortcuts)
-      XCTAssertTrue(
-        asked.contains { $0.contains("Work") && $0.contains("Check the build") }, "\(asked)")
       try await Task.sleep(for: .seconds(3))
       var submits = await work.submitRequests() + personal.submitRequests()
       XCTAssertEqual(submits.map(\.text), [], "Cancel sent a message")
 
-      _ = try await runSendMessageShortcut(
+      try await runSendMessageShortcut(
         "Check the build", to: "Work", answering: "Send", in: shortcuts, log: &log)
       let sentence = NSPredicate(format: "label CONTAINS %@", "Sent to Work.")
       let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
@@ -393,82 +390,47 @@
       } catch { return Sent(value: "threw: \(error)", took: .now - started) }
     }
 
-    /// Runs the Send Message App Shortcut in the Shortcuts app, answers its prompts, taps
-    /// `answer` on the confirmation, and returns the confirmation's texts.
+    private enum ShortcutStep { case tile, message, confirmation }
+
+    private struct NoShortcutsConfirmation: Error {}
+
     private func runSendMessageShortcut(
       _ message: String, to coordinator: String, answering answer: String,
       in shortcuts: XCUIApplication, log: inout [String]
-    ) async throws -> [String] {
+    ) async throws {
       let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
-      let any = { (app: XCUIApplication, label: String) in
-        app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", label))
-          .firstMatch
+      let hosts = [shortcuts, springboard]
+      let labeled = { (query: XCUIElementQuery, label: String) in
+        query.matching(NSPredicate(format: "label == %@", label)).allElementsBoundByIndex
       }
-      var typed = false
-      var chose = false
-      var started = false
+      let sentence = "Send to \(coordinator)? The message reads: \(message)"
+      var step = ShortcutStep.tile
       var scrolls = 0
       let deadline = ContinuousClock.now + .seconds(90)
       while ContinuousClock.now < deadline {
-        let texts =
-          (shortcuts.staticTexts.allElementsBoundByIndex
-          + springboard.staticTexts.allElementsBoundByIndex).map(\.label)
-        let buttons =
-          (shortcuts.buttons.allElementsBoundByIndex
-          + springboard.buttons.allElementsBoundByIndex).map(\.label)
+        let snapshots = hosts.compactMap { try? $0.snapshot() }
+        let texts = snapshots.flatMap { labels(of: .staticText, in: $0) }
+        let buttons = snapshots.flatMap { labels(of: .button, in: $0) }
         log.append("texts \(texts)\nbuttons \(buttons)")
-        let confirm = [shortcuts.buttons[answer], springboard.buttons[answer]]
-          .first { $0.exists && $0.isHittable }
-        if typed || chose, let confirm, texts.contains(where: { $0.contains(message) }) {
-          capture("shortcuts-confirmation-\(answer.lowercased())", shortcuts)
-          log.append("tapped \(answer)")
-          confirm.tap()
-          return texts
-        }
-        if let field = [
-          shortcuts.textFields.firstMatch, springboard.textFields.firstMatch,
-          shortcuts.textViews.firstMatch, springboard.textViews.firstMatch,
-        ]
-        .first(where: { $0.exists && $0.isHittable }), !typed {
-          field.tap()
-          field.typeText(message)
-          typed = true
-          log.append("typed the message")
-          for done in ["Done", "Continue", "Next"] {
-            let button = [shortcuts.buttons[done], springboard.buttons[done]]
-              .first { $0.exists && $0.isHittable }
-            if let button {
-              button.tap()
-              log.append("tapped \(done)")
-              break
-            }
-          }
-          continue
-        }
-        if !chose, started,
-          let option = [any(shortcuts, coordinator), any(springboard, coordinator)]
-            .first(where: { $0.exists && $0.isHittable })
-        {
-          option.tap()
-          chose = true
-          log.append("chose \(coordinator)")
-          continue
-        }
-        if !started {
+        switch step {
+        case .tile:
           for label in ["Continue", "Not Now", "OK", "Get Started"] {
-            let button = shortcuts.buttons[label]
+            let button = shortcuts.buttons[label].firstMatch
             if button.exists && button.isHittable {
               button.tap()
               log.append("dismissed \(label)")
             }
           }
-          let tile = any(shortcuts, "Send Message")
-          let folder = any(shortcuts, "Beep Boop")
-          let library = shortcuts.buttons["Library"]
-          if tile.exists && tile.isHittable {
-            tile.tap()
-            started = true
-            log.append("tapped the Send Message tile")
+          // The folder shows one tile per coordinator, a Send button with the name beside it.
+          let tile = nearest(
+            labeled(shortcuts.buttons, "Send"),
+            to: labeled(shortcuts.staticTexts, coordinator).compactMap { try? $0.snapshot().frame })
+          let folder = shortcuts.buttons["Beep Boop"].firstMatch
+          let library = shortcuts.buttons["Library"].firstMatch
+          if let tile, tile.element.exists && tile.element.isHittable {
+            log.append("tapped the Send tile of \(coordinator) at \(tile.frame)")
+            tile.element.tap()
+            step = .message
           } else if folder.exists && folder.isHittable {
             folder.tap()
             log.append("opened Beep Boop")
@@ -480,13 +442,69 @@
             scrolls += 1
             log.append("scrolled")
           }
+        case .message:
+          let field = hosts.flatMap { [$0.textFields.firstMatch, $0.textViews.firstMatch] }
+            .first { $0.exists && $0.isHittable }
+          guard let field else { break }
+          field.tap()
+          field.typeText(message)
+          step = .confirmation
+          log.append("typed the message")
+          for done in ["Done", "Continue", "Next"] {
+            let predicate = NSPredicate(format: "label == %@", done)
+            let button = hosts.map { $0.buttons.matching(predicate).firstMatch }
+              .first { $0.exists && $0.isHittable }
+            if let button {
+              button.tap()
+              log.append("tapped \(done)")
+              break
+            }
+          }
+          continue
+        case .confirmation:
+          for host in hosts {
+            let asked = host.staticTexts[sentence].firstMatch
+            // The tiles keep their Send buttons under the confirmation, which has its own.
+            guard asked.exists, let askedFrame = try? asked.snapshot().frame,
+              let choice = nearest(labeled(host.buttons, answer), to: [askedFrame]),
+              choice.element.exists && choice.element.isHittable
+            else { continue }
+            capture("shortcuts-confirmation-\(answer.lowercased())", XCUIScreen.main)
+            log.append("tapped \(answer) at \(choice.frame)")
+            choice.element.tap()
+            return
+          }
         }
         try await Task.sleep(for: .seconds(1))
       }
       attach(log, named: "shortcuts-steps-timeout")
-      add(XCTAttachment(string: shortcuts.debugDescription))
-      add(XCTAttachment(string: springboard.debugDescription))
-      throw XCTSkip("The Shortcuts app showed no \(answer) confirmation for \(message)")
+      attach([shortcuts.debugDescription], named: "shortcuts-hierarchy")
+      attach([springboard.debugDescription], named: "springboard-hierarchy")
+      capture("shortcuts-no-confirmation", XCUIScreen.main)
+      XCTFail("Shortcuts showed no \"\(sentence)\" with a \(answer) button, at step \(step)")
+      throw NoShortcutsConfirmation()
+    }
+
+    private func labels(
+      of type: XCUIElement.ElementType, in snapshot: any XCUIElementSnapshot
+    ) -> [String] {
+      var result: [String] = []
+      var stack: [any XCUIElementSnapshot] = [snapshot]
+      while let node = stack.popLast() {
+        if node.elementType == type { result.append(node.label) }
+        stack.append(contentsOf: node.children.reversed())
+      }
+      return result
+    }
+
+    private func nearest(
+      _ elements: [XCUIElement], to frames: [CGRect]
+    ) -> (element: XCUIElement, frame: CGRect)? {
+      let gaps = elements.flatMap { element -> [(Double, XCUIElement, CGRect)] in
+        guard let frame = try? element.snapshot().frame else { return [] }
+        return frames.map { (hypot($0.midX - frame.midX, $0.midY - frame.midY), element, frame) }
+      }
+      return gaps.min { $0.0 < $1.0 }.map { ($0.1, $0.2) }
     }
 
     private func attach(_ lines: [String], named name: String) {
@@ -1025,8 +1043,8 @@
       return XCTWaiter().wait(for: [expectation], timeout: 10) == .completed
     }
 
-    private func capture(_ name: String, _ app: XCUIApplication) {
-      let attachment = XCTAttachment(screenshot: app.screenshot())
+    private func capture(_ name: String, _ source: any XCUIScreenshotProviding) {
+      let attachment = XCTAttachment(screenshot: source.screenshot())
       attachment.name = name
       attachment.lifetime = .keepAlways
       add(attachment)
