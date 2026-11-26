@@ -30,7 +30,9 @@ pub(super) enum ProgramState {
     Idle,
     Working,
     Done,
-    Blocked(BlockedKind),
+    /// The kind says what the program waits for. The protocol has none for a
+    /// plain acknowledgement, so that wait carries no kind.
+    Blocked(Option<BlockedKind>),
     Error,
     Clear,
 }
@@ -84,7 +86,7 @@ impl ProgramStatusReport {
         if let Some(id) = self.id.as_deref().and_then(valid_record_id) {
             fields.push(format!("id={id}"));
         }
-        if let ProgramState::Blocked(kind) = self.state {
+        if let ProgramState::Blocked(Some(kind)) = self.state {
             fields.push(format!("kind={}", kind.as_str()));
         }
         if matches!(self.state, ProgramState::Working | ProgramState::Blocked(_))
@@ -131,6 +133,20 @@ impl ProgramStatusReport {
         debug_assert!(sequence.len() <= MAX_SEQUENCE_BYTES);
         sequence
     }
+}
+
+/// The root report of a program that cannot continue until the user acts,
+/// with `msg` as the reason. For a program that waits outside the interface,
+/// which reports nothing once it has stopped.
+pub fn blocked_on_user_report(msg: &str) -> String {
+    ProgramStatusReport {
+        id: None,
+        state: ProgramState::Blocked(None),
+        progress: None,
+        title: None,
+        msg: Some(msg.to_owned()),
+    }
+    .encode()
 }
 
 /// Remove control characters, zero-width marks, and bidi overrides while collapsing whitespace
@@ -274,7 +290,7 @@ mod tests {
 
         let blocked = ProgramStatusReport {
             id: sanitize_record_id(&["agent", "thread:1"]),
-            state: ProgramState::Blocked(BlockedKind::Auth),
+            state: ProgramState::Blocked(Some(BlockedKind::Auth)),
             progress: Some(120),
             title: Some("Child agent".into()),
             msg: Some("Sign in required".into()),

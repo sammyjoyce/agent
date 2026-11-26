@@ -11,7 +11,7 @@ use std::{
     collections::{HashMap, VecDeque},
     env,
     fs::OpenOptions,
-    io::IsTerminal,
+    io::{IsTerminal, Write},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     process::{ExitCode, Stdio},
@@ -47,15 +47,16 @@ use agent_cli::{
     },
     scrawl_feedback, service,
     tui::attachments::ComposerInput,
-    tui::{Tui, TuiHandle, TuiInfo, TuiInput, WorkStream},
+    tui::{Tui, TuiHandle, TuiInfo, TuiInput, WorkStream, blocked_on_user_report},
     usage,
 };
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::UnixStream,
     process::{Child, Command},
+    signal::unix::{Signal, SignalKind, signal},
     time::{sleep, timeout},
 };
 
@@ -1860,6 +1861,7 @@ async fn run(mut arguments: Arguments) -> Result<()> {
             agent_id: agent_id.clone(),
             allocation_id: allocation_id.clone(),
         };
+        let mut signals = EndSignals::listen()?;
         let (handle, inputs, guard) = Tui::start(TuiInfo {
             title: "Connecting to task".into(),
             model: Some(model.clone()),
@@ -1867,24 +1869,41 @@ async fn run(mut arguments: Arguments) -> Result<()> {
         })?;
         let mut ui = UiSession::new(handle, inputs);
         ui.initial_replay = Some(ui.handle.begin_history_replay()?);
-        let result = request_with_ui(&arguments, client, command, &mut ui)
-            .await
-            .map(|_| ());
-        let recovery = if result.is_err() {
-            Some(preserve_ui_recovery(&directory, owner, &ui).await)
+        let (result, end) = tokio::select! {
+            result = request_with_ui(&arguments, client, command, &mut ui) => {
+                (result.map(|_| ()), TerminalEnd::Own)
+            }
+            signal = signals.next() => (
+                Err(anyhow::anyhow!("{signal} ended this terminal")),
+                TerminalEnd::Signal,
+            ),
+        };
+        let (kept, end) = if result.is_err() {
+            let (draft, end) =
+                interface_answer(ui.handle.composer_draft(), end, signals.next()).await;
+            (preserve_ui_recovery(&directory, owner, &ui, draft), end)
         } else {
-            None
+            (KeptInput::Nothing, end)
         };
         ui.close_view().await;
         finish_controls(&mut ui.controls).await;
-        let stopped = guard.stop().await;
-        match recovery {
-            Some(Ok(Some(path))) => eprintln!(
-                "Unsent input saved privately to {}. It will not be replayed automatically.",
-                path.display()
-            ),
-            Some(Err(error)) => eprintln!("Could not preserve unsent terminal input: {error}"),
-            _ => {}
+        let (stopped, end) = interface_answer(guard.stop(), end, signals.next()).await;
+        // The runtime would wait for the thread of an interface that never
+        // stops. Nothing is left to show on its terminal.
+        let Some(stopped) = stopped else {
+            std::process::exit(1);
+        };
+        tokio::select! {
+            biased;
+            () = present_kept_input(
+                kept,
+                end,
+                std::io::stderr(),
+                BufReader::new(tokio::io::stdin()),
+            ) => {}
+            // Tokio cannot cancel its read of stdin, and the runtime would
+            // wait for that read before the process exits.
+            _ = signals.next() => std::process::exit(1),
         }
         return result.and(stopped);
     }
@@ -2040,29 +2059,187 @@ struct UiRecovery {
     queued_inputs: Vec<QueuedInput>,
 }
 
-async fn preserve_ui_recovery(
+impl UiRecovery {
+    fn is_empty(&self) -> bool {
+        self.draft.is_empty() && self.queued_inputs.is_empty()
+    }
+    /// Every input the recovery holds, as one text to show when no file took it.
+    fn into_unsent(self) -> ComposerInput {
+        let mut input = ComposerInput::default();
+        for queued in self.queued_inputs {
+            input.append(queued.input);
+        }
+        input.append(self.draft);
+        input
+    }
+}
+
+/// The signals that ask a task terminal to end.
+struct EndSignals {
+    terminate: Signal,
+    hangup: Signal,
+}
+
+impl EndSignals {
+    fn listen() -> Result<Self> {
+        Ok(Self {
+            terminate: signal(SignalKind::terminate())?,
+            hangup: signal(SignalKind::hangup())?,
+        })
+    }
+    async fn next(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.terminate.recv() => "SIGTERM",
+            _ = self.hangup.recv() => "SIGHUP",
+        }
+    }
+}
+
+/// Who ended a task terminal. Rex closes the pane when `run-task` exits, so a
+/// terminal that ended by itself waits for Enter while it shows what it kept.
+/// A signal asks the terminal to end, so it waits only while it shows input
+/// that it could not save.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TerminalEnd {
+    Own,
+    Signal,
+}
+
+struct UnsavedInput {
+    input: ComposerInput,
+    error: anyhow::Error,
+}
+
+/// What a task terminal kept of your unsent input when it ended.
+enum KeptInput {
+    Nothing,
+    /// The recovery files that hold it, at least one.
+    Saved(Vec<PathBuf>),
+    Unsaved(UnsavedInput),
+}
+
+/// How long a task terminal that a signal ended waits for its interface.
+const INTERFACE_ANSWER_WAIT: Duration = Duration::from_secs(1);
+
+/// Waits for the interface of an ending task terminal, and tells who ended
+/// the terminal by then. A terminal that ended by itself is live, so its
+/// interface answers, however slow a draw is. The wait has no limit, because
+/// the composer is lost without the answer. After a signal the terminal may
+/// be gone, and an interface without its terminal never answers. So once
+/// `signal` arrives the wait ends after `INTERFACE_ANSWER_WAIT`, with no
+/// answer, and the end is the signal's.
+async fn interface_answer<T>(
+    answer: impl Future<Output = T>,
+    end: TerminalEnd,
+    signal: impl Future,
+) -> (Option<T>, TerminalEnd) {
+    let mut answer = std::pin::pin!(answer);
+    if end == TerminalEnd::Own {
+        tokio::select! {
+            biased;
+            answer = &mut answer => return (Some(answer), TerminalEnd::Own),
+            _ = signal => {}
+        }
+    }
+    let answer = timeout(INTERFACE_ANSWER_WAIT, answer).await.ok();
+    (answer, TerminalEnd::Signal)
+}
+
+/// Saves what a failed task terminal still holds. `draft` is the interface's
+/// answer for the composer. A missing or failed answer does not stop the save
+/// of the inputs. The terminal shows that failure only when it saved nothing.
+fn preserve_ui_recovery(
     directory: &Path,
     owner: UiRecoveryOwner,
     ui: &UiSession,
-) -> Result<Option<PathBuf>> {
-    let draft = ui.handle.composer_draft().await?;
-    if draft.is_empty() && ui.queued.is_empty() && ui.submitted.is_empty() {
-        return Ok(None);
+    draft: Option<Result<ComposerInput>>,
+) -> KeptInput {
+    let (draft, failure) = match draft.context("The terminal interface did not answer") {
+        Ok(Ok(draft)) => (draft, None),
+        Ok(Err(error)) | Err(error) => (ComposerInput::default(), Some(error)),
+    };
+    let recovery = UiRecovery {
+        owner,
+        draft,
+        queued_inputs: ui
+            .queued
+            .iter()
+            .chain(ui.submitted.iter())
+            .cloned()
+            .collect(),
+    };
+    if recovery.is_empty() {
+        return match failure {
+            None => KeptInput::Nothing,
+            Some(error) => KeptInput::Unsaved(UnsavedInput {
+                input: ComposerInput::default(),
+                error,
+            }),
+        };
     }
-    write_ui_recovery(
-        directory,
-        &UiRecovery {
-            owner,
-            draft,
-            queued_inputs: ui
-                .queued
-                .iter()
-                .chain(ui.submitted.iter())
-                .cloned()
-                .collect(),
-        },
-    )
-    .map(Some)
+    match write_ui_recovery(directory, &recovery) {
+        Ok(path) => KeptInput::Saved(vec![path]),
+        Err(error) => KeptInput::Unsaved(UnsavedInput {
+            input: recovery.into_unsent(),
+            error,
+        }),
+    }
+}
+
+/// Shows what a task terminal kept, then waits for one line or the end of
+/// `keys` while the pane holds something you would lose. A terminal that
+/// ended by itself waits whenever it kept something. After a signal the saved
+/// files keep the input, so the terminal waits only to show input that it
+/// could not save. The stopped interface cleared its program status, so the
+/// wait first reports that the terminal is blocked on you. Rex drops that
+/// report when the process exits. A failed write to `screen` is ignored,
+/// because the terminal may be gone after SIGHUP. A gone terminal also ends
+/// the read of `keys` at once.
+async fn present_kept_input(
+    kept: KeptInput,
+    end: TerminalEnd,
+    mut screen: impl Write,
+    mut keys: impl AsyncBufRead + Unpin,
+) {
+    let blocked_on = match kept {
+        KeptInput::Nothing => return,
+        KeptInput::Saved(paths) => {
+            for path in paths {
+                let _ = writeln!(
+                    screen,
+                    "Unsent input saved privately to {}. It will not be replayed automatically.",
+                    path.display()
+                );
+            }
+            if end == TerminalEnd::Signal {
+                return;
+            }
+            "Unsent input saved. Press Enter to close this terminal."
+        }
+        KeptInput::Unsaved(unsaved) => {
+            let _ = writeln!(
+                screen,
+                "Could not save your unsent input: {:#}",
+                unsaved.error
+            );
+            if unsaved.input.is_empty() {
+                return;
+            }
+            let _ = writeln!(screen, "\n{}\n", unsaved.input.text);
+            let attachments = unsaved.input.attachment_count();
+            if attachments > 0 {
+                let _ = writeln!(
+                    screen,
+                    "It also had {attachments} attachments, which are not shown here."
+                );
+            }
+            let _ = writeln!(screen, "Copy it now.");
+            "Unsent input could not be saved. Copy it, then press Enter."
+        }
+    };
+    let _ = write!(screen, "{}", blocked_on_user_report(blocked_on));
+    let _ = write!(screen, "Press Enter to close this terminal.");
+    let _ = keys.read_line(&mut String::new()).await;
 }
 
 async fn preserve_observed_recovery(directory: &Path, ui: &UiSession) -> Result<Vec<PathBuf>> {
@@ -5299,18 +5476,312 @@ use hang_limit::TEST_HANG_LIMIT;
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use crate::{
-        Action, Arguments, ModelArgs, TEST_HANG_LIMIT, executable_fixture::write_executable,
-        fake_rex, local_service_command,
+        Action, Arguments, INTERFACE_ANSWER_WAIT, KeptInput, ModelArgs, TEST_HANG_LIMIT,
+        TerminalEnd, UnsavedInput, executable_fixture::write_executable, fake_rex,
+        interface_answer, local_service_command, present_kept_input,
     };
     use agent_cli::models::{ModelProvider, ModelSelection, Reasoning};
     use agent_cli::protocol::{ImportPhase, ImportProgress, SearchMode};
     use agent_cli::rex::RexClient;
     use agent_cli::serialized_spawn::SerializedSpawn;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use clap::Parser;
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncWriteExt, BufReader};
 
     fn personal_rex() -> RexClient {
         RexClient::for_process(None).unwrap()
+    }
+
+    enum Keyboard {
+        Untouched,
+        Enter,
+        Closed,
+    }
+
+    struct Presented {
+        screen: String,
+        still_waits: bool,
+    }
+
+    async fn presented(kept: KeptInput, end: TerminalEnd, keyboard: Keyboard) -> Presented {
+        let (mut typist, keys) = tokio::io::duplex(8);
+        let typist = match keyboard {
+            Keyboard::Untouched => Some(typist),
+            Keyboard::Enter => {
+                typist.write_all(b"\n").await.unwrap();
+                Some(typist)
+            }
+            Keyboard::Closed => {
+                drop(typist);
+                None
+            }
+        };
+        let mut screen = Vec::new();
+        let still_waits = tokio::time::timeout(
+            Duration::from_millis(200),
+            present_kept_input(kept, end, &mut screen, BufReader::new(keys)),
+        )
+        .await
+        .is_err();
+        drop(typist);
+        Presented {
+            screen: String::from_utf8(screen).unwrap(),
+            still_waits,
+        }
+    }
+
+    const ASKS_FOR_ENTER: &str = "Press Enter to close this terminal.";
+    const STATUS_REPORT_START: &str = "\x1b]7501;";
+
+    /// What the one program status report on a screen says, and the text after it.
+    struct StatusReport<'a> {
+        state: Option<&'a str>,
+        app: Option<&'a str>,
+        kind: Option<&'a str>,
+        msg: String,
+        then_shown: &'a str,
+    }
+
+    fn the_status_report(screen: &str) -> StatusReport<'_> {
+        let reports: Vec<_> = screen.split(STATUS_REPORT_START).skip(1).collect();
+        let [report] = reports.as_slice() else {
+            panic!(
+                "Expected one program status report, got {}: {screen:?}",
+                reports.len()
+            );
+        };
+        let (body, then_shown) = report.split_once("\x1b\\").expect("A report ends in ST");
+        let value = |key: &str| {
+            body.split(':')
+                .filter_map(|pair| pair.split_once('='))
+                .find_map(|(name, value)| (name == key).then_some(value))
+        };
+        let msg = STANDARD
+            .decode(value("msg").expect("A report says why"))
+            .unwrap();
+        StatusReport {
+            state: value("state"),
+            app: value("app"),
+            kind: value("kind"),
+            msg: String::from_utf8(msg).unwrap(),
+            then_shown,
+        }
+    }
+
+    fn assert_blocked_on_the_user(screen: &str, msg: &str) {
+        let report = the_status_report(screen);
+        assert_eq!(
+            (report.state, report.app, report.kind),
+            (Some("blocked"), Some("beep-boop"), None)
+        );
+        assert_eq!(report.msg, msg);
+        assert_eq!(
+            report.then_shown, ASKS_FOR_ENTER,
+            "The report comes right before the wait"
+        );
+    }
+
+    fn saved() -> KeptInput {
+        KeptInput::Saved(vec![
+            "/state/recovery/tui-draft-1.json".into(),
+            "/state/recovery/tui-draft-2.json".into(),
+        ])
+    }
+
+    fn unsaved(text: &str) -> KeptInput {
+        KeptInput::Unsaved(UnsavedInput {
+            input: text.into(),
+            error: anyhow::anyhow!("The recovery directory is not writable"),
+        })
+    }
+
+    /// Completes with `answer` after `after`, as a slow interface does.
+    async fn answering(after: Duration, answer: &str) -> String {
+        tokio::time::sleep(after).await;
+        answer.to_owned()
+    }
+
+    fn no_signal() -> std::future::Pending<()> {
+        std::future::pending()
+    }
+
+    const SLOWER_THAN_THE_LIMIT: Duration = Duration::from_millis(1500);
+    const SIGNAL_AFTER: Duration = Duration::from_millis(300);
+    const TIMER_SLACK: Duration = Duration::from_millis(400);
+
+    #[tokio::test]
+    async fn a_terminal_that_ended_by_itself_waits_for_a_slow_interface() {
+        assert!(SLOWER_THAN_THE_LIMIT > INTERFACE_ANSWER_WAIT);
+        let (answer, end) = interface_answer(
+            answering(SLOWER_THAN_THE_LIMIT, "An unsent note"),
+            TerminalEnd::Own,
+            no_signal(),
+        )
+        .await;
+        assert_eq!(answer.as_deref(), Some("An unsent note"));
+        assert!(end == TerminalEnd::Own, "No signal arrived");
+    }
+
+    #[tokio::test]
+    async fn after_a_signal_a_terminal_gives_a_slow_interface_only_the_limit() {
+        let started = Instant::now();
+        let (answer, end) = interface_answer(
+            answering(SLOWER_THAN_THE_LIMIT, "An unsent note"),
+            TerminalEnd::Signal,
+            no_signal(),
+        )
+        .await;
+        assert_eq!(answer, None);
+        assert!(end == TerminalEnd::Signal);
+        let waited = started.elapsed();
+        assert!(
+            (INTERFACE_ANSWER_WAIT..INTERFACE_ANSWER_WAIT + TIMER_SLACK).contains(&waited),
+            "{waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signal_during_the_wait_of_an_own_end_gives_the_interface_the_limit_more() {
+        let started = Instant::now();
+        let (answer, end) = interface_answer(
+            std::future::pending::<String>(),
+            TerminalEnd::Own,
+            tokio::time::sleep(SIGNAL_AFTER),
+        )
+        .await;
+        assert_eq!(answer, None);
+        assert!(end == TerminalEnd::Signal, "The terminal must not hold");
+        let waited = started.elapsed();
+        let limit = SIGNAL_AFTER + INTERFACE_ANSWER_WAIT;
+        assert!((limit..limit + TIMER_SLACK).contains(&waited), "{waited:?}");
+
+        let within_the_limit = SIGNAL_AFTER + INTERFACE_ANSWER_WAIT / 2;
+        let (answer, end) = interface_answer(
+            answering(within_the_limit, "An unsent note"),
+            TerminalEnd::Own,
+            tokio::time::sleep(SIGNAL_AFTER),
+        )
+        .await;
+        assert_eq!(answer.as_deref(), Some("An unsent note"));
+        assert!(end == TerminalEnd::Signal, "The terminal must not hold");
+    }
+
+    #[tokio::test]
+    async fn a_terminal_that_kept_nothing_ends_at_once_and_shows_nothing() {
+        let shown = presented(KeptInput::Nothing, TerminalEnd::Own, Keyboard::Untouched).await;
+        assert!(!shown.still_waits);
+        assert_eq!(
+            shown.screen, "",
+            "A terminal that does not wait reports nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_terminal_that_saved_unsent_input_names_each_file_and_waits_for_a_line() {
+        let shown = presented(saved(), TerminalEnd::Own, Keyboard::Untouched).await;
+        assert!(shown.still_waits, "The pane must stay until Enter");
+        assert!(shown.screen.contains("/state/recovery/tui-draft-1.json"));
+        assert!(shown.screen.contains("/state/recovery/tui-draft-2.json"));
+        assert!(shown.screen.ends_with(ASKS_FOR_ENTER), "{}", shown.screen);
+        assert_blocked_on_the_user(
+            &shown.screen,
+            "Unsent input saved. Press Enter to close this terminal.",
+        );
+
+        let shown = presented(saved(), TerminalEnd::Own, Keyboard::Enter).await;
+        assert!(!shown.still_waits, "Enter must close the terminal");
+    }
+
+    #[tokio::test]
+    async fn a_terminal_that_could_not_save_shows_the_input_and_waits_for_a_line() {
+        let note = "An unsent note";
+        let shown = presented(unsaved(note), TerminalEnd::Own, Keyboard::Untouched).await;
+        assert!(shown.still_waits, "The pane must stay until Enter");
+        assert!(
+            shown
+                .screen
+                .contains("The recovery directory is not writable")
+        );
+        assert!(shown.screen.contains(note), "{}", shown.screen);
+        assert!(shown.screen.ends_with(ASKS_FOR_ENTER), "{}", shown.screen);
+        assert_blocked_on_the_user(
+            &shown.screen,
+            "Unsent input could not be saved. Copy it, then press Enter.",
+        );
+
+        let shown = presented(unsaved(note), TerminalEnd::Own, Keyboard::Enter).await;
+        assert!(!shown.still_waits, "Enter must close the terminal");
+
+        let shown = presented(unsaved(""), TerminalEnd::Own, Keyboard::Untouched).await;
+        assert!(
+            !shown.still_waits,
+            "A terminal with no input to show does not wait"
+        );
+        assert!(
+            shown
+                .screen
+                .contains("The recovery directory is not writable")
+        );
+        assert!(
+            !shown.screen.contains(STATUS_REPORT_START),
+            "A terminal that does not wait reports nothing: {}",
+            shown.screen
+        );
+    }
+
+    #[tokio::test]
+    async fn the_end_of_stdin_ends_the_wait_of_a_terminal_that_kept_input() {
+        let shown = presented(saved(), TerminalEnd::Own, Keyboard::Closed).await;
+        assert!(!shown.still_waits);
+        assert!(shown.screen.ends_with(ASKS_FOR_ENTER), "{}", shown.screen);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_that_a_signal_ended_with_saved_or_no_input_does_not_wait() {
+        let shown = presented(saved(), TerminalEnd::Signal, Keyboard::Untouched).await;
+        assert!(!shown.still_waits);
+        assert!(shown.screen.contains("/state/recovery/tui-draft-1.json"));
+        assert!(shown.screen.contains("/state/recovery/tui-draft-2.json"));
+        assert!(!shown.screen.contains(ASKS_FOR_ENTER), "{}", shown.screen);
+        assert!(
+            !shown.screen.contains(STATUS_REPORT_START),
+            "{}",
+            shown.screen
+        );
+
+        let shown = presented(unsaved(""), TerminalEnd::Signal, Keyboard::Untouched).await;
+        assert!(!shown.still_waits);
+        assert!(
+            shown
+                .screen
+                .contains("The recovery directory is not writable")
+        );
+        assert!(
+            !shown.screen.contains(STATUS_REPORT_START),
+            "{}",
+            shown.screen
+        );
+    }
+
+    #[tokio::test]
+    async fn a_terminal_that_a_signal_ended_with_unsaved_input_shows_it_and_waits_for_a_line() {
+        let note = "An unsent note";
+        let shown = presented(unsaved(note), TerminalEnd::Signal, Keyboard::Untouched).await;
+        assert!(shown.still_waits, "The input would leave with the pane");
+        assert!(shown.screen.contains(note), "{}", shown.screen);
+        assert!(shown.screen.ends_with(ASKS_FOR_ENTER), "{}", shown.screen);
+        assert_blocked_on_the_user(
+            &shown.screen,
+            "Unsent input could not be saved. Copy it, then press Enter.",
+        );
+
+        let shown = presented(unsaved(note), TerminalEnd::Signal, Keyboard::Enter).await;
+        assert!(!shown.still_waits, "Enter must close the terminal");
+
+        let shown = presented(unsaved(note), TerminalEnd::Signal, Keyboard::Closed).await;
+        assert!(!shown.still_waits, "A gone terminal must not hold the wait");
     }
 
     #[tokio::test]

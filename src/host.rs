@@ -513,9 +513,7 @@ async fn execute_inner(rex: &RexClient, command: HostCommand) -> Result<HostResu
                     "Subagent must use its task's host"
                 );
                 let native = parent.native;
-                rex.inspect_session(&native.session_id)
-                    .await?
-                    .verify_binding(&native, &identity.host_id)?;
+                rex.verify_recorded_pane(&native, &identity.host_id).await?;
                 Ok((identity, native))
             }
             .await;
@@ -768,11 +766,12 @@ async fn spawn_worker(
         let origin = if let Some(Some(workspace)) = workspace {
             let owned = ExecutionBinding::try_from(workspace)?;
             ensure!(owned.host_id == identity.host_id, "Workspace host changed");
-            let view = client.inspect_session(&owned.native.session_id).await?;
-            if owned.rex_instance_id != Some(identity.instance_id) {
-                // Rex restoration is accepted only with positive proof of the
-                // exact previously owned pane under the current native host.
-                view.verify_binding(&owned.native, &identity.host_id)?;
+            if owned.rex_instance_id == Some(identity.instance_id) {
+                client.inspect_session(&owned.native.session_id).await?;
+            } else {
+                client
+                    .verify_recorded_pane(&owned.native, &identity.host_id)
+                    .await?;
             }
             Some(owned.native.session_id)
         } else {
@@ -1223,6 +1222,242 @@ mod tests {
             count("block.close"),
             usize::from(case == "exited"),
             "Only a pane Rex reports exited is closed"
+        );
+        if case == "exited" {
+            let at = |method: &str| methods.iter().position(|called| called == method);
+            assert!(
+                matches!((at("session.detach_block"), at("block.close")), (Some(detach), Some(close)) if detach < close),
+                "The exited pane leaves view before it is closed: {methods:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_restart_while_the_old_pane_is_out_of_view_puts_it_back_for_the_user() {
+        const TEST: &str =
+            "host::tests::a_restart_while_the_old_pane_is_out_of_view_puts_it_back_for_the_user";
+        if fake_rex::case().is_none() {
+            fake_rex::run(
+                TEST,
+                "restart-after-detach",
+                &[("AGENT_TEST_FAKE_REX_RESTART_AFTER", "session.detach_block")],
+            );
+            return;
+        }
+        let resumed = execute(HostCommand::ResumeWorker {
+            host: fixture_host(),
+            binding: stamped(fixture_origin(), Some(FIXTURE_INSTANCE)),
+            task_id: fixture_task(),
+            allocation_id: "allocation-root".into(),
+        })
+        .await;
+        assert!(
+            matches!(&resumed, HostResult::Spawned { binding } if binding.block_id == ADDED_BLOCK),
+            "{resumed:?}"
+        );
+        let calls = fake_rex::calls();
+        let payloads = |method: &str| -> Vec<serde_json::Value> {
+            calls
+                .iter()
+                .filter(|call| call.method() == method)
+                .map(fake_rex::Call::payload)
+                .collect()
+        };
+        let windows = payloads("session.new_window");
+        let [_, placeholder] = windows.as_slice() else {
+            panic!("Expected a replacement and then a placeholder window: {windows:?}");
+        };
+        assert_eq!(
+            placeholder["window_label"], "Chat",
+            "The pane goes back in a window named as it was"
+        );
+        let block = &placeholder["layout"]["block"];
+        assert_eq!(block["label"], "beep-boop:placeholder");
+        assert_eq!(block["options"]["command"][0], "sleep");
+        assert_eq!(block["options"]["login"], false);
+        assert_eq!(
+            block["options"]["exit"],
+            serde_json::json!({ "on_completion": true, "quick_exit_threshold_ms": 0 }),
+            "The placeholder closes itself when its sleep ends"
+        );
+        assert_eq!(
+            payloads("session.move_block"),
+            [serde_json::json!({
+                "session_id": fake_rex::ORIGIN_SESSION,
+                "block_id": fake_rex::ORIGIN_BLOCK,
+                "anchor_block_id": fake_rex::PLACEHOLDER_BLOCK,
+            })],
+            "The restored shell goes back beside the placeholder"
+        );
+        assert_eq!(
+            payloads("block.close"),
+            Vec::<serde_json::Value>::new(),
+            "Nothing is closed, because after a restart a close could reach a shell in view"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_worker_pane_asks_rex_to_close_it_when_its_program_exits() {
+        const TEST: &str =
+            "host::tests::every_worker_pane_asks_rex_to_close_it_when_its_program_exits";
+        if fake_rex::case().is_none() {
+            fake_rex::run(TEST, "every-create-path", &[]);
+            return;
+        }
+        let workspace = |workspace| HostCommand::SpawnWorkspaceWorker {
+            host: fixture_host(),
+            workspace,
+            task_id: fixture_task(),
+            allocation_id: "allocation-root".into(),
+            title: "Synthetic task".into(),
+        };
+        let resume = |binding| HostCommand::ResumeWorker {
+            host: fixture_host(),
+            binding,
+            task_id: fixture_task(),
+            allocation_id: "allocation-root".into(),
+        };
+        let mut missing = fixture_origin();
+        missing.block_id = "block:ffffffff-ffff-4fff-8fff-ffffffffffff".into();
+        let started = stamped(fixture_origin(), Some(FIXTURE_INSTANCE));
+        let directory = tempfile::tempdir().unwrap();
+        let executor = personal_executor(directory.path());
+        for command in [
+            spawn_root(None),
+            spawn_root(Some(fixture_origin())),
+            workspace(None),
+            workspace(Some(started.clone())),
+            spawn_child(fixture_origin()),
+            resume(missing),
+            resume(started),
+        ] {
+            let result = executor.execute(command).await;
+            assert!(matches!(result, HostResult::Spawned { .. }), "{result:?}");
+        }
+        let policies: Vec<_> = fake_rex::calls()
+            .iter()
+            .filter_map(|call| match call.method() {
+                "session.create" => Some(call.payload()["initial_windows"][0]["layout"].clone()),
+                "session.new_window" => Some(call.payload()["layout"].clone()),
+                _ => None,
+            })
+            .map(|layout| layout["block"]["options"]["exit"].clone())
+            .collect();
+        assert_eq!(
+            policies,
+            vec![serde_json::json!({ "on_completion": true, "quick_exit_threshold_ms": 0 }); 7],
+            "Root, origin window, workspace session, workspace window, subagent, missing pane and resumed pane"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pane_that_closed_with_its_program_still_places_its_session() {
+        const TEST: &str =
+            "host::tests::a_pane_that_closed_with_its_program_still_places_its_session";
+        let Some(case) = fake_rex::case() else {
+            for (case, gone) in [
+                ("root", CREATED_BLOCK),
+                ("subagent", fake_rex::ORIGIN_BLOCK),
+                ("workspace-after-restart", fake_rex::ORIGIN_BLOCK),
+                ("detached-parent", ""),
+            ] {
+                fake_rex::run(TEST, case, &[("AGENT_TEST_FAKE_REX_GONE", gone)]);
+            }
+            return;
+        };
+        let command = match case.as_str() {
+            "root" => spawn_root(None),
+            "workspace-after-restart" => HostCommand::SpawnWorkspaceWorker {
+                host: fixture_host(),
+                workspace: Some(stamped(fixture_origin(), Some(RESTARTED_INSTANCE))),
+                task_id: fixture_task(),
+                allocation_id: "allocation-root".into(),
+                title: "Synthetic task".into(),
+            },
+            _ => spawn_child(fixture_origin()),
+        };
+        if case == "detached-parent" {
+            let root = std::env::var_os("AGENT_TEST_FAKE_REX").unwrap();
+            std::fs::write(std::path::Path::new(&root).join("detached"), "").unwrap();
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let executor = personal_executor(directory.path());
+        let result = executor.execute(command).await;
+        if case == "detached-parent" {
+            assert!(
+                matches!(result, HostResult::NotStarted { .. }),
+                "A pane Rex still has, out of view, proves nothing: {result:?}"
+            );
+            return;
+        }
+        let HostResult::Spawned { binding } = result else {
+            panic!("{case}: expected a confirmed pane, got {result:?}");
+        };
+        if case != "root" {
+            assert_eq!(
+                (binding.session_id.as_str(), binding.block_id.as_str()),
+                (fake_rex::ORIGIN_SESSION, ADDED_BLOCK),
+                "{case}: the new pane opens in the session of the pane that closed"
+            );
+            return;
+        }
+        assert_eq!(
+            (binding.session_id.as_str(), binding.block_id.as_str()),
+            (fake_rex::CREATED_SESSION, CREATED_BLOCK),
+            "A worker that exited before its create was confirmed still binds its task"
+        );
+        let presence = executor
+            .execute(HostCommand::InspectWorker {
+                binding: binding.clone(),
+            })
+            .await;
+        assert!(
+            matches!(
+                presence,
+                HostResult::WorkerPresence {
+                    presence: WorkerPresence::MissingTerminal
+                }
+            ),
+            "{presence:?}"
+        );
+        let resumed = executor
+            .execute(HostCommand::ResumeWorker {
+                host: fixture_host(),
+                binding,
+                task_id: fixture_task(),
+                allocation_id: "allocation-root".into(),
+            })
+            .await;
+        assert!(
+            matches!(&resumed, HostResult::Spawned { binding } if binding.session_id == fake_rex::CREATED_SESSION && binding.block_id == ADDED_BLOCK),
+            "The next presentation opens a new pane in the same session: {resumed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_feedback_origin_rex_does_not_show_opens_no_window() {
+        const TEST: &str = "host::tests::a_feedback_origin_rex_does_not_show_opens_no_window";
+        let Some(case) = fake_rex::case() else {
+            for (case, gone) in [("closed", fake_rex::ORIGIN_BLOCK), ("unknown", "")] {
+                fake_rex::run(TEST, case, &[("AGENT_TEST_FAKE_REX_GONE", gone)]);
+            }
+            return;
+        };
+        let mut origin = fixture_origin();
+        if case == "unknown" {
+            origin.block_id = "block:ffffffff-ffff-4fff-8fff-ffffffffffff".into();
+        }
+        let result = execute(spawn_root(Some(origin))).await;
+        assert!(
+            matches!(result, HostResult::NotStarted { .. }),
+            "{case}: {result:?}"
+        );
+        let methods = fake_rex::methods();
+        assert!(
+            !methods
+                .iter()
+                .any(|method| method == "session.create" || method == "session.new_window"),
+            "{case}: {methods:?}"
         );
     }
 

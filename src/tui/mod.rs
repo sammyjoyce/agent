@@ -12,6 +12,7 @@ mod shell;
 mod transcript;
 mod work;
 
+pub use program_status::blocked_on_user_report;
 pub use work::WorkStream;
 
 use crate::tui::{
@@ -2884,7 +2885,7 @@ impl State {
                 ))
             ) {
             (
-                ProgramState::Blocked(BlockedKind::Auth),
+                ProgramState::Blocked(Some(BlockedKind::Auth)),
                 None,
                 self.last_failure
                     .as_ref()
@@ -2893,7 +2894,7 @@ impl State {
             )
         } else if let Some((kind, reason)) = &self.waiting_on {
             (
-                ProgramState::Blocked(*kind),
+                ProgramState::Blocked(Some(*kind)),
                 goal_progress,
                 Some(reason.clone()),
             )
@@ -6677,7 +6678,7 @@ mod tests {
         let waiting_user = view.program_status_reports();
         assert_eq!(
             waiting_user[0].state,
-            ProgramState::Blocked(BlockedKind::Question)
+            ProgramState::Blocked(Some(BlockedKind::Question))
         );
 
         view.event(RuntimeEventKind::AuthorizationUrl {
@@ -6685,7 +6686,7 @@ mod tests {
         });
         assert_eq!(
             view.program_status_reports()[0].state,
-            ProgramState::Blocked(BlockedKind::Auth)
+            ProgramState::Blocked(Some(BlockedKind::Auth))
         );
 
         view.event(RuntimeEventKind::Failure {
@@ -6694,7 +6695,7 @@ mod tests {
         });
         assert_eq!(
             view.program_status_reports()[0].state,
-            ProgramState::Blocked(BlockedKind::Auth)
+            ProgramState::Blocked(Some(BlockedKind::Auth))
         );
 
         view.event(RuntimeEventKind::Interrupted);
