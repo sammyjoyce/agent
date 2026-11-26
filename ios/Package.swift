@@ -31,9 +31,10 @@ func supports273AppIntentsSDK() -> Bool {
   if let sdkRoot {
     candidates = ["\(sdkRoot)/SDKSettings.json"]
   } else {
-    candidates = developerDir.map {
-      ["\($0)/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk/SDKSettings.json"]
-    } ?? []
+    candidates =
+      developerDir.map {
+        ["\($0)/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk/SDKSettings.json"]
+      } ?? []
   }
   for path in candidates {
     guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
