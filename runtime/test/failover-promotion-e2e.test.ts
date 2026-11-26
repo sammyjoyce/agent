@@ -12,7 +12,7 @@ import { OWNER_FENCED_EXIT } from "../src/generated/owner-fenced-exit.js";
 import { NotificationDeliveries } from "../src/notifications.js";
 import { exists, HOLDERS, ownerRun, replicatedPair, until, World, type EnrolledReceipt, type Host, type PromotedReceipt, type ReleasedReceipt,
   type StatusReceipt } from "./fixtures/failover-hosts.js";
-import { claimStart, commitOutsideTheLog, logEntries, note, openOwner, sessionPath, stage, tables } from "./fixtures/failover-state.js";
+import { claimStart, commitOutsideTheLog, logEntries, note, openOwner, recoverInterruptedTasks, sessionPath, stage, tables } from "./fixtures/failover-state.js";
 import { fixtureModel } from "./model.js";
 
 const [OWNER, STANDBY] = HOLDERS;
@@ -182,6 +182,7 @@ test("promotion moves ownership to a standby only on stop evidence", { timeout: 
     for (const tail of [{ files: 1, batch: false }, { files: 64, batch: true }]) {
       const coordinator = world.coordinator(), owner = await world.host(coordinator, OWNER), standby = await world.host(coordinator, STANDBY);
       await owner.create();
+      await recoverInterruptedTasks(owner.state);
       await owner.receipt<EnrolledReceipt>("enroll");
       const epoch = await ownerRun(owner, async (opened) => {
         for (let index = 0; index < tail.files; index++) {
