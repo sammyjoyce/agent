@@ -7,8 +7,8 @@ import { test } from "node:test";
 import { OWNER_FENCED_EXIT } from "../src/generated/owner-fenced-exit.js";
 import { protocolLines } from "../src/protocol.js";
 import { pidsMatching } from "./fixtures/coordinator-world.js";
-import { exists, HOLDERS, ownerActivity, replicatedPair, until, World, type FollowedReceipt, type JoinedReceipt, type PromotedReceipt,
-  type Running } from "./fixtures/failover-hosts.js";
+import { exists, HOLDERS, ownerActivity, replicatedPair, until, World, type EnrolledReceipt, type FollowedReceipt, type JoinedReceipt,
+  type PromotedReceipt, type Running } from "./fixtures/failover-hosts.js";
 import { tables } from "./fixtures/failover-state.js";
 
 const STANDBY = HOLDERS[1];
@@ -65,11 +65,28 @@ test("a replicated state directory opens only under a claim, whatever the config
 
     assert.equal(served, false, `a coordinator served the standby's state directory, and status printed: ${status.stdout}`);
     assert.notEqual(status.code, 0, status.stdout);
-    assert.match(status.stderr, /Coordinator exited/);
+    assert.match(status.stderr, /The local coordinator exited/);
     assert.match(await readFile(join(standby.state, "coordinator.log"), "utf8"), refusal(applied));
     assert.equal(await exists(socketOf(standby.state)), false, "a start that was refused leaves no socket");
     assert.deepEqual(tables(standby.state), before, "the standby's session database holds no commit that the log lacks");
     assert.equal((await standby.receipt<FollowedReceipt>("follow", "--once")).applied, applied, "the standby still follows the log");
+  });
+
+  await t.test("an owner that only enrolled and a standby that only joined hold the log through position 0 and serve nothing without a [failover] section", async () => {
+    const coordinator = world.coordinator(), owner = await world.host(coordinator, HOLDERS[0]), standby = await world.host(coordinator, STANDBY);
+    await owner.create();
+    await owner.receipt<EnrolledReceipt>("enroll");
+    await standby.receipt<JoinedReceipt>("join", coordinator);
+    for (const host of [owner, standby]) {
+      const before = tables(host.state), started = host.serve({ failover: false });
+      const served = await servesBeforeItEnds(started, host.state);
+      if (served) started.child.kill("SIGINT");
+      const ended = await started.done;
+      assert.equal(served, false, `a coordinator served ${host.state} without a claim`);
+      assert.notEqual(ended.code, 0, ended.stderr);
+      assert.match(ended.stderr, refusal(0));
+      assert.deepEqual(tables(host.state), before, "a start that was refused changes nothing in the session database");
+    }
   });
 
   await t.test("after a start without a [failover] section on a standby, its promotion leaves a log that the old host applies as a standby", async () => {

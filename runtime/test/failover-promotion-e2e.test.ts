@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
@@ -9,15 +10,23 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { createRegistry, defineExtension, defineTool } from "@earendil-works/pi-durable";
 import { OWNER_FENCED_EXIT } from "../src/generated/owner-fenced-exit.js";
 import { NotificationDeliveries } from "../src/notifications.js";
-import { exists, HOLDERS, replicatedPair, until, World, type EnrolledReceipt, type Host, type PromotedReceipt, type ReleasedReceipt,
+import { exists, HOLDERS, ownerRun, replicatedPair, until, World, type EnrolledReceipt, type Host, type PromotedReceipt, type ReleasedReceipt,
   type StatusReceipt } from "./fixtures/failover-hosts.js";
-import { claimStart, commitOutsideTheLog, openOwner, tables } from "./fixtures/failover-state.js";
+import { claimStart, commitOutsideTheLog, logEntries, note, openOwner, sessionPath, stage, tables } from "./fixtures/failover-state.js";
 import { fixtureModel } from "./model.js";
 
 const [OWNER, STANDBY] = HOLDERS;
 const STATEMENT = "Invented: the old host lost power at 09:14, and \"nobody\" can reach it";
 const FEEDBACK = "feedback/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.json";
 const held = (state: string) => exists(join(state, "restore-hold.json"));
+
+function nextPiSequence(state: string, next?: number): number {
+  const database = new DatabaseSync(sessionPath(state));
+  try {
+    if (next !== undefined) database.prepare("UPDATE durable_metadata SET next_seq = ? WHERE singleton = 1").run(next);
+    return Number(database.prepare("SELECT next_seq FROM durable_metadata WHERE singleton = 1").get()?.next_seq);
+  } finally { database.close(); }
+}
 
 /** The owner claims a start, begins a tool call that never returns, and claims a phone notification it never finishes. */
 async function unfinishedEffects(owner: Host): Promise<{ epoch: number; callId: string }> {
@@ -167,6 +176,40 @@ test("promotion moves ownership to a standby only on stop evidence", { timeout: 
     assert.match(refused.stderr, /is at Pi sequence \d+, and the log is at Pi sequence \d+, which its checkpoint records/);
     assert.deepEqual(await owner.authorityState(),
       { kind: "vacant", epoch, candidate: STANDBY, evidence: { kind: "operator_attested", statement: STATEMENT }, head: 0 }, "nobody was activated");
+  });
+
+  await t.test("a standby whose Pi sequence is ahead of or behind the log's is not activated, after a file-only tail and after a batch past the first log page", async () => {
+    for (const tail of [{ files: 1, batch: false }, { files: 64, batch: true }]) {
+      const coordinator = world.coordinator(), owner = await world.host(coordinator, OWNER), standby = await world.host(coordinator, STANDBY);
+      await owner.create();
+      await owner.receipt<EnrolledReceipt>("enroll");
+      const epoch = await ownerRun(owner, async (opened) => {
+        for (let index = 0; index < tail.files; index++) {
+          await opened.log.appendFiles([await stage(owner.state, owner.link, `feedback/item-${index}.txt`, Buffer.from(`Invented item ${index}`))]);
+        }
+        if (tail.batch) await opened.root.submit(note("after a page of files", "request-after-files"), BACKGROUND_CONTEXT);
+      });
+      const { head } = await owner.authorityState();
+      assert.deepEqual((await logEntries(owner.link)).map((entry) => entry.batch !== null), [...Array<boolean>(tail.files).fill(false), ...(tail.batch ? [true] : [])]);
+      const source = tail.batch ? `entry ${head}` : "its checkpoint";
+      await standby.receipt("join", coordinator);
+      await standby.receipt("follow", "--once");
+      const next = nextPiSequence(standby.state);
+
+      for (const delta of [1, -1]) {
+        nextPiSequence(standby.state, next + delta);
+        const refused = await standby.failover("promote", "--replace-epoch", String(epoch), "--old-owner-stopped", STATEMENT);
+        assert.notEqual(refused.code, 0, `the promotion activated a standby whose Pi sequence is off by ${delta} after ${source}`);
+        assert.match(refused.stderr, new RegExp(`is at Pi sequence ${next - 1 + delta}, and the log is at Pi sequence ${next - 1}, which ${source} records`));
+        assert.deepEqual(await owner.authorityState(),
+          { kind: "vacant", epoch, candidate: STANDBY, evidence: { kind: "operator_attested", statement: STATEMENT }, head }, "nobody was activated");
+      }
+
+      nextPiSequence(standby.state, next);
+      const promoted = await standby.receipt<PromotedReceipt>("promote", "--replace-epoch", String(epoch), "--old-owner-stopped", STATEMENT);
+      assert.equal(promoted.holder, STANDBY, `a standby at the log's Pi sequence after ${source} is activated`);
+      assert.deepEqual(await owner.authorityState(), { kind: "active", epoch: epoch + 1, holder: STANDBY, head });
+    }
   });
 
   await t.test("the report a person reads carries the statement word for word and what to do next", async () => {
