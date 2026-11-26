@@ -46,10 +46,13 @@ fn assert_origin_pane(context: FeedbackContext, label: &str) {
     );
 }
 
-/// The terminal's environment names `DECOY` through `REX_SERVER`; only
-/// `origin_server`, a Rex host of its own, holds the pane that `REX_SESSION`
-/// and `REX_BLOCK` name.
-fn cli(directory: &Path, rex_server: Option<&str>, origin_server: &str, args: &[&str]) -> Command {
+fn cli(
+    directory: &Path,
+    rex_server: Option<&str>,
+    origin_server: &str,
+    rex_session: Option<&str>,
+    args: &[&str],
+) -> Command {
     let bin = directory.join("bin");
     fs::create_dir(&bin).unwrap();
     std::os::unix::fs::symlink(
@@ -81,13 +84,16 @@ fn cli(directory: &Path, rex_server: Option<&str>, origin_server: &str, args: &[
         .env("AGENT_TEST_FAKE_REX", &bin)
         .env("AGENT_TEST_FAKE_REX_ORIGIN_SERVER", origin_server)
         .env("REX_SERVER", DECOY)
-        .env("REX_SESSION", fake_rex::ORIGIN_SESSION)
         .env("REX_BLOCK", fake_rex::ORIGIN_BLOCK)
+        .env_remove("REX_SESSION")
         .env_remove("REX_CLIENT")
         .current_dir(directory)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let Some(session) = rex_session {
+        command.env("REX_SESSION", session);
+    }
     command
 }
 
@@ -145,7 +151,14 @@ async fn terminal_feedback_reports_the_pane_from_the_rex_server_that_owns_the_te
         });
         let output = timeout(
             Duration::from_secs(30),
-            cli(directory.path(), rex_server, DECOY, &["chat", DESCRIPTION]).output_serialized(),
+            cli(
+                directory.path(),
+                rex_server,
+                DECOY,
+                Some(fake_rex::ORIGIN_SESSION),
+                &["chat", DESCRIPTION],
+            )
+            .output_serialized(),
         )
         .await
         .unwrap()
@@ -162,8 +175,50 @@ async fn terminal_feedback_reports_the_pane_from_the_rex_server_that_owns_the_te
     }
 }
 
+/// Rex 0.1.0-snapshot.2506 gives a worker's direct-command pane `REX_SESSION`;
+/// 0.1.0-snapshot.2629 gives it only `REX_BLOCK`.
 #[tokio::test]
 async fn worker_feedback_reports_its_pane_on_the_private_rex_server_that_started_it() {
+    for rex_session in [Some(fake_rex::ORIGIN_SESSION), None] {
+        let context = worker_feedback(rex_session).await;
+        assert_origin_pane(
+            context,
+            &format!("run-task with REX_SESSION {rex_session:?}"),
+        );
+    }
+}
+
+#[tokio::test]
+async fn worker_refuses_a_rex_session_that_does_not_hold_its_pane() {
+    let directory = tempfile::tempdir().unwrap();
+    let listener = coordinator(directory.path());
+    let output = timeout(
+        Duration::from_secs(30),
+        cli(
+            directory.path(),
+            Some(PRIVATE),
+            PRIVATE,
+            Some(fake_rex::CREATED_SESSION),
+            &["run-task", TASK, "--allocation-id", "allocation-root"],
+        )
+        .output_serialized(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        !output.status.success(),
+        "run-task bound a pane outside REX_SESSION"
+    );
+    assert!(
+        timeout(Duration::from_millis(200), listener.accept())
+            .await
+            .is_err(),
+        "run-task reached the coordinator without a binding"
+    );
+}
+
+async fn worker_feedback(rex_session: Option<&str>) -> FeedbackContext {
     let directory = tempfile::tempdir().unwrap();
     let listener = coordinator(directory.path());
     let consumer = tokio::spawn(async move {
@@ -213,6 +268,7 @@ async fn worker_feedback_reports_its_pane_on_the_private_rex_server_that_started
         directory.path(),
         Some(PRIVATE),
         PRIVATE,
+        rex_session,
         &["run-task", TASK, "--allocation-id", "allocation-root"],
     )
     .stdin(Stdio::piped())
@@ -244,5 +300,5 @@ async fn worker_feedback_reports_its_pane_on_the_private_rex_server_that_started
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_origin_pane(context, "run-task --rex-server");
+    context
 }
