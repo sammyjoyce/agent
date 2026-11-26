@@ -111,6 +111,7 @@ function refuseScheduledJobSources(sources: readonly SourceRef[]): void {
   if (sources.some((source) => source.provider === "scheduled_jobs")) throw new TaskError("Scheduled job ownership is assigned only by the scheduler");
 }
 const STOPPED_INPUT_WITHDRAWN = "The stopped turn withdrew this input; submit it again to continue.";
+const CLAIM_RECEIPT_WAIT_MS = 10_000;
 function recordedHostId(worker: Exclude<WorkerState, { state: "unassigned" }>): string | null {
   return worker.host.host_id ?? ("binding" in worker ? worker.binding.host_id : null);
 }
@@ -264,6 +265,10 @@ function sameBinding(left: WorkerRef, right: WorkerRef): boolean {
   return left.host_id === right.host_id && left.session_id === right.session_id &&
     left.window_id === right.window_id && left.block_id === right.block_id;
 }
+/** The same pane under the Rex instance that started its process. A worker's claim and its host's create receipt must agree on both. */
+function samePaneAndInstance(left: WorkerRef, right: WorkerRef): boolean {
+  return sameBinding(left, right) && left.rex_instance_id === right.rex_instance_id;
+}
 function paneWithoutWorker(presence: WorkerPresence | undefined): boolean {
   return presence?.state === "missing_terminal" || (presence?.state === "present" && !presence.running);
 }
@@ -284,6 +289,7 @@ export class TaskStore {
   private sidechats: SidechatStore | undefined;
   private attachments: AttachmentStore | undefined;
   private execution: ActorExecution | undefined;
+  private claimReceiptWait = CLAIM_RECEIPT_WAIT_MS;
   private goals: GoalPolicy | undefined;
   private confinement: ActorConfinement = () => undefined;
   constructor(readonly session: Harness, readonly inference = new ConversationModels()) { inference.bind(session); }
@@ -325,6 +331,7 @@ export class TaskStore {
   useHistory(history: HistoryStore): void { this.histories = history; }
   useSidechats(sidechats: SidechatStore): void { this.sidechats = sidechats; }
   useAttachments(attachments: AttachmentStore): void { this.attachments = attachments; }
+  useClaimReceiptWait(milliseconds: number): void { this.claimReceiptWait = milliseconds; }
   useActorExecution(execution: ActorExecution): void { this.execution = execution; }
   useConfinement(rule: ActorConfinement): void { this.confinement = rule; }
   isConfined(task: Pick<TaskRecord, "sources">): boolean { return this.confinement(task) !== undefined; }
@@ -1934,8 +1941,7 @@ export class TaskStore {
         const workspace = await tx.doc(WorkerWorkspace, workspaceKey(host), null);
         const sameHost = workspaceKey(worker.host) === workspaceKey(host) &&
           (host.host_id == null || worker.binding.host_id === host.host_id);
-        const matching = result.type === "spawned" && sameBinding(result.binding, worker.binding) &&
-          result.binding.rex_instance_id === worker.binding.rex_instance_id;
+        const matching = result.type === "spawned" && samePaneAndInstance(result.binding, worker.binding);
         const lost = (result.type === "creation_uncertain" &&
           (result.session_id === null || result.session_id === worker.binding.session_id)) ||
           (result.type === "failed" && result.delivery !== "not_started");
@@ -2044,7 +2050,7 @@ export class TaskStore {
     }, BACKGROUND_CONTEXT);
   }
   private async confirmBinding(input: WorkerInput, call?: ActorExecution["call"]): Promise<{ task: TaskRecord; worker: Extract<WorkerState, { state: "bound" }> }> {
-    const deadline = Date.now() + 10_000;
+    const deadline = Date.now() + this.claimReceiptWait;
     let task = await this.get(input.task_id);
     let actor = this.actor(task, input.agent_id);
     const startingHost = actor.worker.state === "allocating" ? actor.worker.host : undefined;
@@ -2066,8 +2072,13 @@ export class TaskStore {
       if (presence?.state === "present" && presence.running) {
         task = await this.allocation(input.task_id, "reconcile", async (saved, tx) => {
           const current = this.actor(saved, input.agent_id);
+          if (current.worker.state === "bound" && current.worker.allocation_id === created.allocation_id && samePaneAndInstance(current.worker.binding, input.binding)) {
+            return { result: { type: "presence", presence }, reason: "The create receipt already bound this exact terminal" };
+          }
+          // An uncertain receipt can land during the inspection, so its session is compared with the pane that claims, not with the record read before.
+          const recordedSession = current.worker.state === "uncertain" ? current.worker.session_id : null;
           if ((current.worker.state !== "uncertain" && current.worker.state !== "allocating") || current.worker.allocation_id !== created.allocation_id ||
-              ("session_id" in current.worker ? current.worker.session_id : null) !== created.session_id) throw new TaskError("Worker allocation changed; its late claim was ignored");
+              (recordedSession !== null && recordedSession !== input.binding.session_id)) throw new TaskError("Worker allocation changed; its late claim was ignored");
           const workspace = await tx.doc(WorkerWorkspace, workspaceKey(created.host), null);
           if ((workspace.retired ?? []).includes(input.binding.session_id)) throw new TaskError("Worker binding is not confirmed: workspace generation was retired");
           if (input.agent_id === undefined && workspace.binding === null && workspace.owner === input.task_id &&
@@ -2103,16 +2114,23 @@ export class TaskStore {
         }
       }
     }
-    const owningHost = actor.worker.state === "unassigned" ? undefined : actor.worker.host;
-    const retired = owningHost === undefined ? false : await this.session.commit(async tx =>
-      (await tx.doc(WorkerWorkspace, workspaceKey(owningHost), null)).retired?.includes(input.binding.session_id) ?? false,
-      BACKGROUND_CONTEXT);
-    if (retired) throw new TaskError("Worker binding is not confirmed: workspace generation was retired");
-    if (actor.worker.state !== "bound" || actor.worker.allocation_id !== input.allocation_id ||
-        !sameBinding(actor.worker.binding, input.binding)) {
-      throw new TaskError("Worker binding is not confirmed for this task");
-    }
-    return { task, worker: actor.worker };
+    const confirms = (worker: WorkerState): worker is Extract<WorkerState, { state: "bound" }> =>
+      worker.state === "bound" && worker.allocation_id === input.allocation_id && samePaneAndInstance(worker.binding, input.binding);
+    // A create receipt can commit during any await above, so one transaction
+    // decides on the record and its workspace's retirement as they stand together.
+    return this.session.commit(async (tx) => {
+      const saved = await this.taskIn(tx, input.task_id);
+      if (saved === undefined) throw new TaskError("Unknown task");
+      // The saved record is a draft that settles with this commit, so the decision is made on a copy that outlives it.
+      const decided = this.savedTask(JSON.parse(JSON.stringify(saved)) as TaskRecord);
+      const worker = this.actor(decided, input.agent_id).worker;
+      if (worker.state !== "unassigned" &&
+          ((await tx.doc(WorkerWorkspace, workspaceKey(worker.host), null)).retired ?? []).includes(input.binding.session_id)) {
+        throw new TaskError("Worker binding is not confirmed: workspace generation was retired");
+      }
+      if (!confirms(worker)) throw new TaskError("Worker binding is not confirmed for this task");
+      return { task: decided, worker };
+    }, BACKGROUND_CONTEXT);
   }
   private claim(ref: ActorRef, mode: ActorMode, execution: ActorExecution,
     start: { conversation_id: string; call?: ActorExecution["call"]; host?: WorkerHost; terminalLaunch?: NonNullable<TaskActor["terminalLaunch"]>; observer?: ActorObserver }): TaskActor {
@@ -2175,17 +2193,27 @@ export class TaskStore {
     const key = this.actorKey(ref.task_id, ref.agent_id);
     if (observer === undefined && (this.running.get(key)?.phase ?? "closing") !== "closing") throw new TaskError("This task already has an attached worker");
     this.requireSchedulerAdmission(await this.get(input.task_id));
-    const { task, worker } = await this.confirmBinding(input, call);
-    const record = this.actor(task, ref.agent_id);
+    const confirmed = await this.confirmBinding(input, call);
+    let task = confirmed.task, worker: Extract<WorkerState, { state: "bound" | "resuming" }> = confirmed.worker;
     const attached: ActorObserver | undefined = observer === undefined ? undefined
       : { session: observer, interactive: input.interactive === true, held: [] };
     for (;;) {
       let actor = this.running.get(key);
-      if (actor?.phase === "closing") { await actor.exit.catch(() => {}); continue; }
+      if (actor?.phase === "closing") {
+        await actor.exit.catch(() => {});
+        // The binding can move while the old actor closes, so the claim below needs a decision made after the wait.
+        // A resume in flight has not moved it, and its receipt can take longer than a claim waits.
+        task = await this.get(input.task_id);
+        const current = this.actor(task, input.agent_id).worker;
+        if ((current.state !== "bound" && current.state !== "resuming") || current.allocation_id !== input.allocation_id ||
+            !samePaneAndInstance(current.binding, input.binding)) throw new TaskError("Worker binding is not confirmed for this task");
+        worker = current;
+        continue;
+      }
       if (actor === undefined) {
         actor = this.claim(ref, "interactive", { available: () => true, bind, extensions: () => extensions,
           call: call ?? (() => Promise.reject(new TaskError("The task's execution host is unavailable"))), ...(prepare === undefined ? {} : { prepare }) },
-          { conversation_id: record.conversation_id, terminalLaunch: { model: input.model, instructions: input.instructions },
+          { conversation_id: this.actor(task, ref.agent_id).conversation_id, terminalLaunch: { model: input.model, instructions: input.instructions },
             host: { ...worker.host, host_id: recordedHostId(worker) },
             ...(call === undefined ? {} : { call }), ...(attached === undefined ? {} : { observer: attached }) });
       } else if (attached === undefined) throw new TaskError("This task already has an attached worker");

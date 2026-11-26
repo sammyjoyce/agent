@@ -346,9 +346,13 @@ confirms a lost reply by attaching, the binding records the instance that the
 terminal read as it attached. After a restart, Rex restores a saved pane under
 the same session, window and block IDs, but with a fresh shell in place of the
 program. So a process in a recorded pane is the task's terminal only while the
-recorded instance still runs. If Rex restarts between the host's read and the
-create, the recorded instance is stale from the start, and the next
-presentation opens the task's terminal in a second window of the same session.
+recorded instance still runs. A terminal reads its own instance when it
+starts, and its claim must name the instance that its binding records. So
+whenever the host creates a terminal, it reads the instance again after the
+create. That covers a new task, a subagent and a resume's replacement. If the
+instance or the host changed, Rex restarted around the create, and the host
+reports the creation as uncertain for the session. The terminal that started
+then confirms its own allocation by attaching.
 The host reads the instance after it reads the pane's process. A binding with
 no recorded instance proves nothing. An exited pane, and a pane whose process
 is not the task's terminal, get a replacement terminal in the same session.

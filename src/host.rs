@@ -613,7 +613,7 @@ async fn resume_bound_worker(
             )
             .await
         {
-            Ok(restored) if client.confirm_creation(&restored, &identity.host_id).await => {
+            Ok(restored) if client.confirm_creation(&restored, &identity).await => {
                 promote(client, &restored.session_id).await;
                 Ok(HostResult::Spawned {
                     binding: ExecutionBinding {
@@ -844,7 +844,7 @@ async fn created_worker(
 ) -> Result<HostResult> {
     match created {
         Ok(binding) => {
-            if !client.confirm_creation(&binding, &identity.host_id).await {
+            if !client.confirm_creation(&binding, identity).await {
                 return Ok(HostResult::CreationUncertain {
                     session_id: Some(binding.session_id.to_string()),
                 });
@@ -1319,39 +1319,45 @@ mod tests {
     async fn every_created_pane_carries_the_rex_instance_read_before_its_create() {
         const TEST: &str =
             "host::tests::every_created_pane_carries_the_rex_instance_read_before_its_create";
-        let Some(case) = fake_rex::case() else {
-            for path in [
-                "root",
-                "origin-window",
-                "subagent",
-                "missing-terminal",
-                "exited-pane",
-            ] {
-                let (create, block) = if path == "root" {
-                    ("session.create", CREATED_BLOCK)
-                } else {
-                    ("session.new_window", ADDED_BLOCK)
-                };
-                fake_rex::run(TEST, &format!("{path}-steady"), &[]);
-                fake_rex::run(
-                    TEST,
-                    &format!("{path}-restarted"),
-                    &[
-                        ("AGENT_TEST_FAKE_REX_RESTART_AFTER", create),
-                        ("AGENT_TEST_FAKE_REX_RUNNING", block),
-                    ],
-                );
+        let Some(path) = fake_rex::case() else {
+            for path in CREATE_PATHS {
+                fake_rex::run(TEST, path, &[]);
             }
             return;
         };
-        let (path, outcome) = case.rsplit_once('-').unwrap();
+        let result = execute(create_command(&path)).await;
+        let (session, block) = if path == "root" {
+            (fake_rex::CREATED_SESSION, CREATED_BLOCK)
+        } else {
+            (fake_rex::ORIGIN_SESSION, ADDED_BLOCK)
+        };
+        let HostResult::Spawned { binding } = result else {
+            panic!("Expected a confirmed pane, got {result:?}");
+        };
+        assert_eq!(
+            (binding.session_id.as_str(), binding.block_id.as_str()),
+            (session, block)
+        );
+        assert_eq!(binding.rex_instance_id.as_deref(), Some(FIXTURE_INSTANCE));
+    }
+
+    /// Every way the host creates a worker's pane. The last two are a resume's replacement.
+    const CREATE_PATHS: [&str; 5] = [
+        "root",
+        "origin-window",
+        "subagent",
+        "missing-terminal",
+        "exited-pane",
+    ];
+
+    fn create_command(path: &str) -> HostCommand {
         let resume = |binding| HostCommand::ResumeWorker {
             host: fixture_host(),
             binding,
             task_id: fixture_task(),
             allocation_id: "allocation-root".into(),
         };
-        let command = match path {
+        match path {
             "root" => spawn_root(None),
             "origin-window" => spawn_root(Some(fixture_origin())),
             "subagent" => spawn_child(fixture_origin()),
@@ -1361,35 +1367,51 @@ mod tests {
                 resume(missing)
             }
             _ => resume(fixture_origin()),
-        };
-        let directory = tempfile::tempdir().unwrap();
-        let executor = personal_executor(directory.path());
-        let result = executor.execute(command).await;
-        let (session, block) = if path == "root" {
-            (fake_rex::CREATED_SESSION, CREATED_BLOCK)
-        } else {
-            (fake_rex::ORIGIN_SESSION, ADDED_BLOCK)
-        };
-        let HostResult::Spawned { binding } = result else {
-            panic!("Expected a confirmed pane, got {result:?}");
-        };
-        assert_eq!(binding.session_id, session);
-        assert_eq!(binding.rex_instance_id.as_deref(), Some(FIXTURE_INSTANCE));
-        if outcome == "restarted" {
-            assert_eq!(binding.block_id, block);
-            let presence = executor
-                .execute(HostCommand::InspectWorker { binding })
-                .await;
-            assert!(
-                matches!(
-                    presence,
-                    HostResult::WorkerPresence {
-                        presence: WorkerPresence::Present { running: false }
-                    }
-                ),
-                "The shell in a pane Rex restarted around is not the worker, so the next presentation replaces it: {presence:?}"
-            );
         }
+    }
+
+    #[tokio::test]
+    async fn a_rex_restart_around_a_create_leaves_its_creation_uncertain() {
+        const TEST: &str =
+            "host::tests::a_rex_restart_around_a_create_leaves_its_creation_uncertain";
+        let Some(case) = fake_rex::case() else {
+            for path in CREATE_PATHS {
+                let create = if path == "root" {
+                    "session.create"
+                } else {
+                    "session.new_window"
+                };
+                for (moment, method) in [("before", "whoami"), ("after", create)] {
+                    fake_rex::run(
+                        TEST,
+                        &format!("{path}-{moment}"),
+                        &[("AGENT_TEST_FAKE_REX_RESTART_AFTER", method)],
+                    );
+                }
+            }
+            return;
+        };
+        let (path, _) = case.rsplit_once('-').unwrap();
+        let (session, create) = if path == "root" {
+            (fake_rex::CREATED_SESSION, "session.create")
+        } else {
+            (fake_rex::ORIGIN_SESSION, "session.new_window")
+        };
+        let result = execute(create_command(path)).await;
+        assert!(
+            matches!(&result, HostResult::CreationUncertain { session_id: Some(id) } if id == session),
+            "{case}: the worker reads its own Rex instance, so a receipt must not name another: {result:?}"
+        );
+        let methods = fake_rex::methods();
+        assert_eq!(
+            methods.iter().filter(|method| *method == create).count(),
+            1,
+            "{case}: {methods:?}"
+        );
+        assert!(
+            !methods.iter().any(|method| method == "block.close"),
+            "{case}: a pane that Rex restarted around may hold a restored shell: {methods:?}"
+        );
     }
 
     #[test]
