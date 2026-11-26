@@ -175,7 +175,52 @@ pub struct BlockView {
     pub flavor: Option<String>,
     pub label: Option<String>,
 }
+/// The Rex pane this process runs in, as Rex names it to a pane's program.
+/// Rex 0.1.0-snapshot.2629 sets `REX_BLOCK` but no `REX_SESSION` for a
+/// direct-command pane.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RexPane {
+    block: BlockId,
+    session: Option<SessionId>,
+}
+
+impl RexPane {
+    pub fn from_env() -> Result<Option<Self>, RexError> {
+        Self::parse(
+            std::env::var("REX_BLOCK").ok().as_deref(),
+            std::env::var("REX_SESSION").ok().as_deref(),
+        )
+    }
+
+    fn parse(block: Option<&str>, session: Option<&str>) -> Result<Option<Self>, RexError> {
+        let Some(block) = block else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            block: BlockId::parse(block)?,
+            session: session.map(SessionId::parse).transpose()?,
+        }))
+    }
+
+    pub fn block(&self) -> &BlockId {
+        &self.block
+    }
+}
+
 impl SessionView {
+    fn window_holding(&self, block: &BlockId) -> Option<&WindowId> {
+        self.windows
+            .iter()
+            .find(|window| {
+                window
+                    .layers
+                    .iter()
+                    .flat_map(|layer| &layer.blocks)
+                    .any(|candidate| candidate.block_id.as_ref() == Some(block))
+            })
+            .and_then(|window| window.window_id.as_ref())
+    }
+
     pub fn verify_binding(&self, binding: &WorkerBinding, host: &HostId) -> Result<(), RexError> {
         if self.session_id != binding.session_id {
             return Err(RexError::BindingMismatch);
@@ -878,6 +923,48 @@ impl RexClient {
         Ok(())
     }
 
+    /// The session and window that hold `pane`, or `None` when the pane is
+    /// gone or its `REX_SESSION` does not hold it.
+    pub async fn locate_pane(
+        &self,
+        pane: &RexPane,
+    ) -> Result<Option<(SessionId, WindowId)>, RexError> {
+        let session = match &pane.session {
+            Some(session) => session.clone(),
+            None => match self.block_session(&pane.block).await? {
+                Some(session) => session,
+                None => return Ok(None),
+            },
+        };
+        let view = self.inspect_session(&session).await?;
+        Ok(view
+            .window_holding(&pane.block)
+            .map(|window| (session, window.clone())))
+    }
+
+    /// Without a context, target.resolve searches every session for a full
+    /// block ID.
+    async fn block_session(&self, block: &BlockId) -> Result<Option<SessionId>, RexError> {
+        let output = self
+            .api(
+                "target.resolve",
+                &ResolveRequest {
+                    kinds: ["block"],
+                    queries: [block],
+                },
+            )
+            .await
+            .map_err(read_failure)?;
+        let reply: ResolveReply = decode(&output)?;
+        Ok(reply
+            .results
+            .into_iter()
+            .filter(|result| result.status == "resolved")
+            .filter_map(|result| result.target)
+            .find(|target| target.block_id == *block)
+            .map(|target| target.session_id))
+    }
+
     pub async fn inspect_session(&self, session: &SessionId) -> Result<SessionView, RexError> {
         let output = self
             .api(
@@ -1305,6 +1392,27 @@ struct SessionRequest {
 }
 
 #[derive(Serialize)]
+struct ResolveRequest<'a> {
+    kinds: [&'static str; 1],
+    queries: [&'a BlockId; 1],
+}
+#[derive(Deserialize)]
+struct ResolveReply {
+    #[serde(default, deserialize_with = "nullable_vec")]
+    results: Vec<Resolution>,
+}
+#[derive(Deserialize)]
+struct Resolution {
+    status: String,
+    target: Option<ResolvedBlock>,
+}
+#[derive(Deserialize)]
+struct ResolvedBlock {
+    session_id: SessionId,
+    block_id: BlockId,
+}
+
+#[derive(Serialize)]
 struct ProcessRequest {
     session_id: SessionId,
     block_id: BlockId,
@@ -1639,6 +1747,35 @@ mod tests {
             endpoint: None,
             tailscale: None,
         }
+    }
+
+    #[test]
+    fn rex_pane_needs_a_block_and_takes_a_session_when_rex_sets_one() {
+        let block = BlockId::parse(BLOCK).unwrap();
+        let session = SessionId::parse(SESSION).unwrap();
+        assert_eq!(RexPane::parse(None, Some(SESSION)), Ok(None));
+        assert_eq!(
+            RexPane::parse(Some(BLOCK), None),
+            Ok(Some(RexPane {
+                block: block.clone(),
+                session: None
+            }))
+        );
+        assert_eq!(
+            RexPane::parse(Some(BLOCK), Some(SESSION)),
+            Ok(Some(RexPane {
+                block,
+                session: Some(session)
+            }))
+        );
+        assert_eq!(
+            RexPane::parse(Some(BLOCK), Some("unrelated-session")),
+            Err(RexError::InvalidId)
+        );
+        assert_eq!(
+            RexPane::parse(Some(SESSION), None),
+            Err(RexError::InvalidId)
+        );
     }
 
     #[tokio::test]

@@ -40,7 +40,7 @@ use agent_cli::{
         SidechatNotificationPreference, SidechatSummary, TaskId, TranscriptAnnotation,
         TranscriptClassification, WorkerLaunch, WorkerRef,
     },
-    rex::{BlockId, RexClient, SessionId},
+    rex::{BlockId, RexClient, RexPane, SessionId},
     runtime::{
         FrameReader, OwnerClaim, OwnerFenced, Wire, decode_coordinator_event,
         lifecycle::RequestLifecycle,
@@ -1351,7 +1351,12 @@ async fn run(mut arguments: Arguments) -> Result<()> {
             task_id,
             agent_id,
             allocation_id,
-            binding: local_worker_binding(&rex, &terminal).await?,
+            binding: local_worker_binding(
+                &rex,
+                &terminal,
+                &RexPane::from_env()?.context("Task worker has no assigned Rex pane")?,
+            )
+            .await?,
             instructions: instructions::project(&cwd)?,
             model: selection.resolve(&environment(client).await?.model)?,
             cwd: cwd.to_string_lossy().into_owned(),
@@ -3136,10 +3141,9 @@ async fn feedback_context(
     target: Option<(TaskId, Option<String>)>,
 ) -> Result<FeedbackContext> {
     let origin_host_id = rex.whoami().await?.host_id.to_string();
-    let binding = if env::var_os("REX_SESSION").is_some() && env::var_os("REX_BLOCK").is_some() {
-        Some(local_worker_binding(rex, terminal).await?)
-    } else {
-        None
+    let binding = match RexPane::from_env()? {
+        Some(pane) => Some(local_worker_binding(rex, terminal, &pane).await?),
+        None => None,
     };
     let (task_id, agent_id) = target.map_or((None, None), |(task, agent)| (Some(task), agent));
     Ok(FeedbackContext {
@@ -3657,7 +3661,6 @@ struct ClientContext<'a> {
     script: &'a Path,
     directory: &'a Path,
     rex: &'a RexClient,
-    /// Reaches the Rex server that owns this process's REX_SESSION.
     terminal: &'a RexClient,
 }
 
@@ -4751,31 +4754,21 @@ fn worker_launch(
     })
 }
 
-async fn local_worker_binding(rex: &RexClient, terminal: &RexClient) -> Result<WorkerRef> {
-    let session = SessionId::parse(
-        &env::var("REX_SESSION").context("Task workers must run in their assigned Rex session")?,
-    )?;
-    let block =
-        BlockId::parse(&env::var("REX_BLOCK").context("Task worker has no assigned Rex pane")?)?;
+async fn local_worker_binding(
+    rex: &RexClient,
+    terminal: &RexClient,
+    pane: &RexPane,
+) -> Result<WorkerRef> {
     let identity = rex.whoami().await?;
-    let view = terminal.inspect_session(&session).await?;
-    let window = view
-        .windows
-        .iter()
-        .find(|window| {
-            window
-                .layers
-                .iter()
-                .flat_map(|layer| &layer.blocks)
-                .any(|candidate| candidate.block_id.as_ref() == Some(&block))
-        })
-        .and_then(|window| window.window_id.as_ref())
+    let (session, window) = terminal
+        .locate_pane(pane)
+        .await?
         .context("Assigned worker pane is no longer present")?;
     Ok(WorkerRef {
         host_id: identity.host_id.to_string(),
         session_id: session.to_string(),
         window_id: window.to_string(),
-        block_id: block.to_string(),
+        block_id: pane.block().to_string(),
         rex_instance_id: Some(identity.instance_id.to_string()),
     })
 }
