@@ -621,7 +621,7 @@ async fn resume_bound_worker(
                         native: restored,
                         rex_instance_id: Some(identity.instance_id),
                     }
-                    .into(),
+                    .worker_ref(),
                 })
             }
             Ok(_) => Ok(HostResult::CreationUncertain {
@@ -692,14 +692,16 @@ impl TryFrom<&WorkerRef> for ExecutionBinding {
     }
 }
 
-impl From<ExecutionBinding> for WorkerRef {
-    fn from(binding: ExecutionBinding) -> Self {
-        Self {
-            host_id: binding.host_id.to_string(),
-            session_id: binding.native.session_id.to_string(),
-            window_id: binding.native.window_id.to_string(),
-            block_id: binding.native.block_id.to_string(),
-            rex_instance_id: binding.rex_instance_id.map(|id| id.to_string()),
+impl ExecutionBinding {
+    /// The protocol's record of this binding. The protocol type stays plain
+    /// data; only the host knows how its validated form maps onto it.
+    fn worker_ref(self) -> WorkerRef {
+        WorkerRef {
+            host_id: self.host_id.to_string(),
+            session_id: self.native.session_id.to_string(),
+            window_id: self.native.window_id.to_string(),
+            block_id: self.native.block_id.to_string(),
+            rex_instance_id: self.rex_instance_id.map(|id| id.to_string()),
         }
     }
 }
@@ -854,7 +856,7 @@ async fn created_worker(
                     native: binding,
                     rex_instance_id: Some(identity.instance_id),
                 }
-                .into(),
+                .worker_ref(),
             })
         }
         Err(RexError::CreationUncertain { session_id }) => Ok(HostResult::CreationUncertain {
@@ -902,7 +904,7 @@ async fn resume_worker(
                 native: replacement,
                 rex_instance_id: Some(identity.instance_id),
             }
-            .into(),
+            .worker_ref(),
         }),
         Err(RexError::CreationUncertain { session_id }) => Ok(HostResult::CreationUncertain {
             session_id: session_id.map(|id| id.to_string()),
@@ -1418,7 +1420,10 @@ mod tests {
         ));
         let started = stamped(valid.clone(), Some(FIXTURE_INSTANCE));
         assert_eq!(
-            WorkerRef::from(ExecutionBinding::try_from(&started).unwrap()).rex_instance_id,
+            ExecutionBinding::try_from(&started)
+                .unwrap()
+                .worker_ref()
+                .rex_instance_id,
             started.rex_instance_id
         );
         let mut nil_host = valid;
