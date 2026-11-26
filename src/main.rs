@@ -644,7 +644,7 @@ fn json_error(error: &anyhow::Error) -> (agent_cli::protocol::ErrorCode, String)
     if let Some(failure) = error.downcast_ref::<CoordinatorFailure>() {
         return (failure.code.clone(), failure.message.clone());
     }
-    if error.downcast_ref::<OwnerFenced>().is_some() || chat_view::ViewError::is_transport(error) {
+    if error.downcast_ref::<OwnerFenced>().is_some() || ViewError::is_transport(error) {
         return (ErrorCode::CoordinatorUnavailable, format!("{error:#}"));
     }
     if let Some(rex_error) = error.downcast_ref::<agent_cli::rex::RexError>() {
@@ -2431,14 +2431,14 @@ fn selected_input(
         let client = ClientContext { config: &config, coordinator: coordinator.as_deref(), script: &script, directory: &directory, rex: &rex, terminal: &terminal };
         loop {
         let mut attachment = None;
-        let result: std::result::Result<(), chat_view::ViewError> = async {
+        let result: std::result::Result<(), ViewError> = async {
             if ready.wait_for(|ready| matches!(ready.state(), agent_cli::tui::ObservationState::Connected | agent_cli::tui::ObservationState::Disconnected)).await.is_err()
                 || chat_view::observation(&ready) != agent_cli::tui::ObservationState::Connected
             {
                 if admission.stage()? == chat_admission::Stage::Canceled {
                     return Ok(());
                 }
-                return Err(chat_view::ViewError::Coordinator(anyhow::anyhow!("The conversation view did not attach; this input remains unsent.")));
+                return Err(ViewError::Coordinator(anyhow::anyhow!("The conversation view did not attach; this input remains unsent.")));
             }
             attachment = ready.borrow().attachment();
             let attached = attachment.context("The conversation view has no active attachment")?;
@@ -2500,7 +2500,7 @@ fn selected_input(
             .await
         }
         .await;
-        if matches!(result, Err(chat_view::ViewError::Coordinator(_))) && ready.has_changed().is_ok() {
+        if matches!(result, Err(ViewError::Coordinator(_))) && ready.has_changed().is_ok() {
             let _ = ready.borrow_and_update();
             if let Some(attachment) = attachment {
                 let _ = retry.send(attachment).await;
@@ -3005,7 +3005,7 @@ async fn native_conversation_usage(
             Some(failure) => NativeUsageFailure::Coordinator {
                 code: failure.code.clone(),
             },
-            None if chat_view::ViewError::is_transport(&error) => NativeUsageFailure::Transport,
+            None if ViewError::is_transport(&error) => NativeUsageFailure::Transport,
             None => NativeUsageFailure::InvalidResponse,
         },
     };
@@ -3720,6 +3720,59 @@ async fn read_tool_details_in(
         .context("The coordinator returned no tool details.")
 }
 
+/// How a coordinator exchange failed: the connection (retry or reattach) or
+/// the request itself. `exchange` and the view's observer and control loops
+/// produce it; `json_error`, native usage and history replay classify it.
+#[derive(Debug)]
+pub(crate) enum ViewError {
+    Coordinator(anyhow::Error),
+    Internal(anyhow::Error),
+}
+impl From<anyhow::Error> for ViewError {
+    fn from(error: anyhow::Error) -> Self {
+        match error.downcast::<Self>() {
+            Ok(error) => error,
+            Err(error) => Self::Internal(error),
+        }
+    }
+}
+impl std::fmt::Display for ViewError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Coordinator(error) | Self::Internal(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+impl std::error::Error for ViewError {}
+impl ViewError {
+    pub(crate) fn transport(error: anyhow::Error) -> anyhow::Error {
+        Self::Coordinator(error).into()
+    }
+    pub(crate) fn is_transport(error: &anyhow::Error) -> bool {
+        matches!(error.downcast_ref::<Self>(), Some(Self::Coordinator(_)))
+    }
+    pub(crate) fn read(error: anyhow::Error) -> Self {
+        if error.is::<std::io::Error>() {
+            Self::Coordinator(error)
+        } else {
+            Self::Internal(error)
+        }
+    }
+    pub(crate) fn event(self, conversation_id: &str) -> RuntimeEventKind {
+        use agent_cli::protocol::ErrorCode;
+        let (code, message) = match self {
+            Self::Coordinator(error) => (
+                ErrorCode::CoordinatorUnavailable,
+                format!(
+                    "{error}\n\nReconnect with `/resume {conversation_id}`. Saved work may still be running; pending inputs will be reconciled."
+                ),
+            ),
+            Self::Internal(error) => (ErrorCode::Internal, error.to_string()),
+        };
+        RuntimeEventKind::Failure { code, message }
+    }
+}
+
 #[derive(Debug)]
 struct CoordinatorFailure {
     code: agent_cli::protocol::ErrorCode,
@@ -3740,20 +3793,18 @@ async fn exchange(
     let feedback = matches!(&command, RuntimeCommand::Feedback { .. });
     let mut wire = connection(client, false)
         .await
-        .map_err(chat_view::ViewError::transport)?;
+        .map_err(ViewError::transport)?;
     write_command(&mut *wire.writer, &command)
         .await
-        .map_err(chat_view::ViewError::read)?;
+        .map_err(ViewError::read)?;
     let mut reader = FrameReader::new(BufReader::new(wire.reader));
     let mut events = Vec::new();
     loop {
         let frame = reader
             .next_frame()
             .await
-            .map_err(chat_view::ViewError::read)?
-            .ok_or_else(|| {
-                chat_view::ViewError::transport(anyhow::anyhow!("Coordinator disconnected"))
-            })?;
+            .map_err(ViewError::read)?
+            .ok_or_else(|| ViewError::transport(anyhow::anyhow!("Coordinator disconnected")))?;
         let event = decode_coordinator_event(&frame)?;
         acknowledge_feedback_event(directory, &command, &event)?;
         match event {
@@ -4450,13 +4501,13 @@ async fn request_presented(
     let mut progress_key = None;
     loop {
         let frame = tokio::select! {
-            frame = reader.next_frame() => match frame.map_err(chat_view::ViewError::read)? {
+            frame = reader.next_frame() => match frame.map_err(ViewError::read)? {
                 Some(frame) => frame,
                 None => {
                     if let Some(failure) = failure.take() {
                         return Err(failure.into());
                     }
-                    return Err(chat_view::ViewError::transport(anyhow::anyhow!(
+                    return Err(ViewError::transport(anyhow::anyhow!(
                         "Coordinator disconnected; saved work is retained"
                     )));
                 }

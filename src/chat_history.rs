@@ -60,7 +60,7 @@ impl Job {
                     .await
                     {
                         Ok(events) => events,
-                        Err(error) if crate::chat_view::ViewError::is_transport(&error) => {
+                        Err(error) if crate::ViewError::is_transport(&error) => {
                             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                             continue;
                         }
