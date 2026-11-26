@@ -7,6 +7,7 @@ use std::{
     io,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -15,7 +16,7 @@ use crate::{
     broker::Broker,
     host::effects::{Admission, Capacity, HostEffects},
     native::{NativeEvent, NativeRequest},
-    protocol::{CoordinatorBootstrap, RuntimeCommand, RuntimeEventKind},
+    protocol::{AgentNode, CoordinatorBootstrap, RuntimeCommand, RuntimeEventKind, WorkerLaunch},
     runtime::lifecycle::{RequestLifecycle, View},
 };
 use anyhow::{Context, Result, ensure};
@@ -62,6 +63,26 @@ pub async fn relay(stream: UnixStream) -> Result<()> {
     Ok(())
 }
 
+/// How a start learns its own node. It only reads Rex and Tailscale, so the
+/// start runs it while Pi loads instead of before. `launch` names the config
+/// Pi starts with meanwhile.
+pub struct NodeDiscovery {
+    launch: WorkerLaunch,
+    node: Pin<Box<dyn Future<Output = Result<Option<AgentNode>>> + Send>>,
+}
+
+impl NodeDiscovery {
+    pub fn new(
+        launch: WorkerLaunch,
+        node: impl Future<Output = Result<Option<AgentNode>>> + Send + 'static,
+    ) -> Self {
+        Self {
+            launch,
+            node: Box::pin(node),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_configured(
     script: &Path,
@@ -71,6 +92,7 @@ pub async fn serve_configured(
     daemon: crate::tailnet::Daemon,
     rex: crate::rex::RexClient,
     bootstrap: CoordinatorBootstrap,
+    discovery: NodeDiscovery,
     dreams: Option<crate::dreams::DreamsPolicy>,
     dreams_source: crate::dreams::DreamsPolicySource,
 ) -> Result<()> {
@@ -82,6 +104,7 @@ pub async fn serve_configured(
         daemon,
         rex,
         Some(bootstrap),
+        Some(discovery),
         dreams,
         dreams_source,
         shutdown_signal(),
@@ -121,6 +144,7 @@ async fn serve_until(
         crate::rex::RexClient::for_process(None)?,
         None,
         None,
+        None,
         crate::dreams::DreamsPolicySource::Unconfigured,
         shutdown,
     )
@@ -137,6 +161,7 @@ async fn serve_with_transport(
     daemon: crate::tailnet::Daemon,
     rex: crate::rex::RexClient,
     bootstrap: Option<CoordinatorBootstrap>,
+    discovery: Option<NodeDiscovery>,
     dreams: Option<crate::dreams::DreamsPolicy>,
     dreams_source: crate::dreams::DreamsPolicySource,
     shutdown: impl Future<Output = Result<ShutdownReason>>,
@@ -151,6 +176,7 @@ async fn serve_with_transport(
         daemon,
         rex,
         bootstrap,
+        discovery,
         dreams,
         dreams_source,
         shutdown,
@@ -194,6 +220,7 @@ async fn serve_owner(
     daemon: crate::tailnet::Daemon,
     rex: crate::rex::RexClient,
     bootstrap: Option<CoordinatorBootstrap>,
+    discovery: Option<NodeDiscovery>,
     dreams: Option<crate::dreams::DreamsPolicy>,
     dreams_source: crate::dreams::DreamsPolicySource,
     shutdown: impl Future<Output = Result<ShutdownReason>>,
@@ -203,10 +230,16 @@ async fn serve_owner(
     let background = bootstrap
         .as_ref()
         .and_then(|value| value.background.clone());
-    let config = bootstrap
+    let config = discovery
         .as_ref()
-        .and_then(|value| value.node.as_ref())
-        .and_then(|node| node.launch.config.as_deref())
+        .map(|discovery| &discovery.launch)
+        .or_else(|| {
+            bootstrap
+                .as_ref()
+                .and_then(|value| value.node.as_ref())
+                .map(|node| &node.launch)
+        })
+        .and_then(|launch| launch.config.as_deref())
         .map(|path| crate::config::load(Some(Path::new(path))))
         .transpose()?;
     let owner = Runtime::start_with_notifications(
@@ -222,37 +255,38 @@ async fn serve_owner(
     } else {
         background
     };
-    let broker = match Broker::with_tailscale_and_dreams(
-        bootstrap.as_ref(),
-        state,
-        daemon.clone(),
-        rex,
-        dreams,
-        dreams_source,
-    ) {
+    let broker = |bootstrap: Option<&CoordinatorBootstrap>| {
+        Broker::with_tailscale_and_dreams(
+            bootstrap,
+            state,
+            daemon.clone(),
+            rex,
+            dreams,
+            dreams_source,
+        )
+    };
+    let prepared = tokio::select! {
+        biased;
+        result = &mut shutdown => {
+            if let Ok(ShutdownReason::Signal(signal)) = &result {
+                owner.record_shutdown(*signal);
+            }
+            owner.close().await?;
+            return result.map(|_| ());
+        }
+        result = prepare(&owner, bootstrap, discovery, broker) => result,
+    };
+    let broker = match prepared {
         Ok(broker) => Arc::new(broker),
         Err(error) => {
             owner.close().await?;
             return Err(error);
         }
     };
-    if let Some(bootstrap) = bootstrap {
-        let initialized = tokio::select! {
-            biased;
-            result = &mut shutdown => {
-                if let Ok(ShutdownReason::Signal(signal)) = &result {
-                    owner.record_shutdown(*signal);
-                }
-                owner.close().await?;
-                return result.map(|_| ());
-            }
-            result = crate::broker::initialize(&owner, bootstrap) => result,
-        };
-        if let Err(error) = initialized {
-            owner.close().await?;
-            return Err(error);
-        }
-    }
+    // Clients connect only to a recovered coordinator: the socket is bound
+    // after Pi has opened storage, recovered and taken its settings, so a
+    // start that fails recovery never accepts a request, and a client reads
+    // settings only after they apply.
     let (listener, socket) = match SocketOwner::bind(state.join(SOCKET_NAME)) {
         Ok(bound) => bound,
         Err(error) => {
@@ -348,6 +382,30 @@ async fn serve_owner(
     drop(socket);
     closed?;
     result
+}
+
+/// Learns this node while Pi loads, then recovers Pi's state with it.
+/// Discovery only reads Rex and Tailscale, so it has no effect to order
+/// against Pi's startup, and Pi reads the node only from the bootstrap that
+/// `initialize` sends. Every client still waits for that recovery, because
+/// the socket is bound after this returns.
+async fn prepare(
+    owner: &Runtime,
+    mut bootstrap: Option<CoordinatorBootstrap>,
+    discovery: Option<NodeDiscovery>,
+    broker: impl FnOnce(Option<&CoordinatorBootstrap>) -> Result<Broker>,
+) -> Result<Broker> {
+    if let Some(discovery) = discovery {
+        let node = discovery.node.await?;
+        if let Some(bootstrap) = &mut bootstrap {
+            bootstrap.node = node;
+        }
+    }
+    let broker = broker(bootstrap.as_ref())?;
+    if let Some(bootstrap) = bootstrap {
+        crate::broker::initialize(owner, bootstrap).await?;
+    }
+    Ok(broker)
 }
 
 pub(crate) async fn write_frame<W: AsyncWrite + Unpin + ?Sized, T: Serialize>(
@@ -2373,6 +2431,7 @@ mod tests {
                     crate::tailnet::PeerPolicy::new(&[], &[]).unwrap(),
                     crate::tailnet::Daemon::default(),
                     crate::rex::RexClient::for_process(None).unwrap(),
+                    None,
                     None,
                     policy,
                     dreams_source,

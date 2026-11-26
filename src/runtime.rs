@@ -66,6 +66,9 @@ pub struct RuntimeNotice {
     pub event: RuntimeEventKind,
 }
 
+/// Longer than any client holds a free writer lock to see whether it is held.
+const LOCK_PROBE_GRACE: Duration = Duration::from_millis(250);
+
 pub struct WriterLock(File);
 
 impl WriterLock {
@@ -78,9 +81,24 @@ impl WriterLock {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(state.join("writer.lock"))?;
-        fs2::FileExt::try_lock_exclusive(&file)
-            .context("Another agent process owns this state directory")?;
-        Ok(Self(file))
+        // A client checks whether a coordinator start is in progress by
+        // taking a free lock for an instant (`local_start`). Retry briefly,
+        // so that check never fails a start or a backup.
+        let deadline = std::time::Instant::now() + LOCK_PROBE_GRACE;
+        loop {
+            match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => return Ok(Self(file)),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => {
+                    return Err(error).context("Another agent process owns this state directory");
+                }
+            }
+        }
     }
 
     /// Lets the child of `command` keep this lock after exec. The state

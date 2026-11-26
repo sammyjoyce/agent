@@ -2,6 +2,7 @@ mod chat_admission;
 mod chat_history;
 mod chat_view;
 mod dreams_cli;
+mod local_start;
 mod mail;
 mod state;
 
@@ -10,7 +11,7 @@ use std::{
     collections::{HashMap, VecDeque},
     env,
     fs::OpenOptions,
-    io::{ErrorKind, IsTerminal},
+    io::IsTerminal,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     process::{ExitCode, Stdio},
@@ -55,7 +56,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::UnixStream,
     process::{Child, Command},
-    time::{Instant, sleep, timeout},
+    time::{sleep, timeout},
 };
 
 #[derive(Parser)]
@@ -1046,30 +1047,30 @@ async fn run(mut arguments: Arguments) -> Result<()> {
             .instructions
             .clone()
             .unwrap_or(instructions::default_path()?);
-        let node = match discovery::local_node(
-            &rex,
-            None,
-            config
-                .launch
-                .clone()
-                .context("Missing local launch metadata")?,
-            config.node_name.as_deref(),
-            &daemon,
-        )
-        .await
-        {
-            Ok(node) => Some(node),
-            // Exit so the service manager restarts us once the private Rex is up.
-            Err(error) if rex.is_private() => {
-                return Err(
-                    error.context("The private Rex server for this coordinator is unavailable")
-                );
-            }
-            Err(_) => {
-                eprintln!(
-                    "Local Rex is unavailable; this coordinator has no local worker until restarted."
-                );
-                None
+        let launch = config
+            .launch
+            .clone()
+            .context("Missing local launch metadata")?;
+        // Discovery queries Rex and Tailscale, which can take seconds on a
+        // loaded host. It only reads, so it runs while Pi loads.
+        let node = {
+            let (rex, daemon, launch) = (rex.clone(), daemon.clone(), launch.clone());
+            let name = config.node_name.clone();
+            async move {
+                match discovery::local_node(&rex, None, launch, name.as_deref(), &daemon).await {
+                    Ok(node) => Ok(Some(node)),
+                    // Exit so the service manager restarts us once the private Rex is up.
+                    Err(error) if rex.is_private() => {
+                        Err(error
+                            .context("The private Rex server for this coordinator is unavailable"))
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "Local Rex is unavailable; this coordinator has no local worker until restarted."
+                        );
+                        Ok(None)
+                    }
+                }
             }
         };
         let bootstrap = CoordinatorBootstrap {
@@ -1079,7 +1080,7 @@ async fn run(mut arguments: Arguments) -> Result<()> {
                 context_repositories: contexts.repositories().to_vec(),
                 sources: config.sources.clone(),
             },
-            node,
+            node: None,
             background: Some(BackgroundSettings {
                 poll_interval_seconds: u32::try_from(config.poll_interval_seconds)?,
                 sources: !no_sources,
@@ -1095,6 +1096,7 @@ async fn run(mut arguments: Arguments) -> Result<()> {
             daemon,
             rex,
             bootstrap,
+            service::NodeDiscovery::new(launch, node),
             dreams,
             agent_cli::dreams::DreamsPolicySource::Config(arguments.config.clone()),
         )
@@ -4211,56 +4213,16 @@ async fn local_connection(
     directory: &Path,
     config_path: Option<&Path>,
 ) -> Result<UnixStream> {
-    match service::connect(directory).await {
-        Ok(stream) => return Ok(stream),
-        Err(error)
-            if matches!(
-                error.kind(),
-                ErrorKind::NotFound | ErrorKind::ConnectionRefused
-            ) => {}
-        Err(error) => return Err(error).context("Could not connect to the local coordinator"),
-    }
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(directory.join("coordinator.log"))?;
-    let mut command =
-        local_service_command(rex, &config::program()?, script, directory, config_path);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log));
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = command
-        .spawn_serialized()
-        .context("Could not start the local coordinator")?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Ok(stream) = service::connect(directory).await {
-            return Ok(stream);
-        }
-        if let Some(status) = child.try_wait()? {
-            // A simultaneous client may have won the writer lock.
-            if let Ok(stream) = service::connect(directory).await {
-                return Ok(stream);
-            }
-            bail!("Coordinator exited with {status}; see its private coordinator.log");
-        }
-        ensure!(
-            Instant::now() < deadline,
-            "Coordinator startup timed out; inspect its private log before retrying"
-        );
-        sleep(Duration::from_millis(25)).await;
-    }
+    local_start::connect(directory, local_start::START_LIMIT, || {
+        Ok(local_service_command(
+            rex,
+            &config::program()?,
+            script,
+            directory,
+            config_path,
+        ))
+    })
+    .await
 }
 
 fn local_service_command(
