@@ -610,6 +610,10 @@ for (const [flow, directory] of [["current release", defaultExtensionDirectory],
       assert.deepEqual(during.filter(page => before.some(item => item.targetId === page.targetId)), before);
       const added = during.filter(page => !before.some(item => item.targetId === page.targetId));
       assert.deepEqual(added.map(page => page.url), ["about:blank"]);
+      // The survivor is Beep Boop's own page, not 0.6's claimed blank, which
+      // keeps the extension origin.
+      const survivor = added[0]; assert.ok(survivor);
+      assert.notEqual(await f.client.evaluate(survivor.targetId, "origin"), `chrome-extension://${extensionId}`);
       assert.equal(during.some(page => page.url.startsWith(`chrome-extension://${extensionId}/connect.html`)), false);
       const tab = opened.tabs[0]; assert.ok(tab);
       const closed = (await f.host.execute(request({ type: "close_tab", tab_id: tab.id }))).response;
@@ -638,7 +642,8 @@ test("public runBeforeUnload close acknowledges before the final controlled page
     await within(disconnected, 10_000, "Final controlled page must disconnect its extension relay");
     assert.ok(order.indexOf("close-command-ack") < order.indexOf("browser-disconnected"), JSON.stringify(order));
   } else {
-    // The relay stays up, so Beep Boop's own close of its final tab must end the connection.
+    // The relay stays up after an external close. The handoff regression test
+    // checks that Beep Boop's own close of its final tab ends the connection.
     await setTimeout(2000);
     assert.equal(native.browser.isConnected(), true, `Extension ${f.extensionVersion} keeps the relay after its final tab closes`);
     assert.deepEqual(order, ["close-command-ack", "page-close"]);
