@@ -2528,8 +2528,19 @@ impl State {
         {
             // Growing the viewport must reveal the whole draft when it fits.
             let (top, _) = self.editor.scroll_offset();
-            self.editor
-                .scroll((-i16::try_from(top).unwrap_or(i16::MAX), 0));
+            if top > 0 {
+                // ratatui-textarea 0.9.4's `scroll` also clamps the cursor to
+                // the viewport's last column. A cursor after a row that fills
+                // the width sits one column past it and would move back one
+                // character.
+                let DataCursor(line, column) = self.editor.cursor();
+                self.editor
+                    .scroll((-i16::try_from(top).unwrap_or(i16::MAX), 0));
+                self.editor.move_cursor(ratatui_textarea::CursorMove::Jump(
+                    u16::try_from(line).unwrap_or(u16::MAX),
+                    u16::try_from(column).unwrap_or(u16::MAX),
+                ));
+            }
             row + 3
         } else {
             maximum + 2
@@ -5572,6 +5583,41 @@ mod tests {
         assert_eq!(text.matches("read_source finished").count(), 1);
         assert!(text.find("• Tool read_source").unwrap() < text.find("NEW_REQUEST").unwrap());
         assert!(!text.contains("✓ read_source"));
+    }
+    fn press_and_read_draft(view: &mut State, code: KeyCode, width: u16, height: u16) -> String {
+        view.input(key(code, KeyModifiers::NONE));
+        rendered(view, width, height);
+        view.editor.lines().join("\n")
+    }
+    #[test]
+    fn composer_keeps_every_typed_key_across_the_soft_wrap() {
+        let words = (100..130)
+            .map(|token| format!("m{token} "))
+            .collect::<String>();
+        let texts = (0..5)
+            .map(|pad| format!("{}{words}", "x".repeat(pad)))
+            .chain(["0123456789".repeat(12), "é界".repeat(60)]);
+        for text in texts {
+            for (width, height) in [(16, 8), (40, 8), (41, 15), (80, 24)] {
+                let mut view = state();
+                let mut draft = String::new();
+                for c in text.chars() {
+                    draft.push(c);
+                    assert_eq!(
+                        press_and_read_draft(&mut view, KeyCode::Char(c), width, height),
+                        draft,
+                        "{width}x{height} after typing {c:?}"
+                    );
+                }
+                while draft.pop().is_some() {
+                    assert_eq!(
+                        press_and_read_draft(&mut view, KeyCode::Backspace, width, height),
+                        draft,
+                        "{width}x{height} after backspace"
+                    );
+                }
+            }
+        }
     }
     #[test]
     fn composer_expands_for_explicit_newlines_and_native_word_wrapping_on_small_terminals() {
