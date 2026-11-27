@@ -106,7 +106,7 @@ case "$method" in
       exit 3
     fi
     origin=
-    if [ ! -e "$root/closed" ] && [ ! -e "$root/detached" ]; then origin=$(block "$origin_window" "$origin_block"); fi
+    if [ ! -e "$root/closed" ] && [ ! -e "$root/detached" ] && [ "$session" = "$origin_session" ]; then origin=$(block "$origin_window" "$origin_block"); fi
     windows=$(joined "$origin" "$(block "$created_window" "$created_block")" "$(block "$added_window" "$added_block")")
     printf '{"session_id":"%s","revision":2,"windows":[%s]}\n' "$session" "$windows" ;;
   session.list_blocks)
@@ -131,6 +131,14 @@ case "$method" in
     esac
     case "$payload" in *"$origin_block"*) rm -f "$root/detached" ;; esac
     printf '{"revision":4}\n' ;;
+  target.resolve)
+    query=$(printf '%s' "$payload" | sed -n 's/.*"queries":\["\([^"]*\)"\].*/\1/p')
+    if [ "$query" = "$origin_block" ] && [ ! -e "$root/closed" ] &&
+      [ "$server" = "${AGENT_TEST_FAKE_REX_ORIGIN_SERVER:-$server}" ]; then
+      printf '{"results":[{"query":"%s","status":"resolved","target":{"kind":"block","session_id":"%s","window_id":"%s","block_id":"%s","label":"Chat","where":"window 1"}}]}\n' "$query" "$origin_session" "$origin_window" "$origin_block"
+    else
+      printf '{"results":[{"query":"%s","status":"not_found"}]}\n' "$query"
+    fi ;;
   session.list)
     printf '{"sessions":[{"session_id":"session:99999999-9999-4999-8999-999999999999","label":"Unrelated"}]}\n' ;;
   session.move) printf '{}\n' ;;
