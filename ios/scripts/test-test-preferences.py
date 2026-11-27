@@ -15,7 +15,7 @@ class TestPreferencesBoundary(unittest.TestCase):
                 ["python3", str(CHECK), directory], capture_output=True, text=True
             )
 
-    def test_orion_uuid_suite_escape_is_rejected(self):
+    def test_uuid_suite_escape_is_rejected(self):
         result = self.check_source('let defaults = UserDefaults(suiteName: "feed-\\(UUID())")')
         self.assertEqual(result.returncode, 1)
         self.assertIn("TestPreferences()", result.stderr)
