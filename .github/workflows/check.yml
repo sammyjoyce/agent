@@ -54,6 +54,7 @@ jobs:
           if [ -n "${GITHUB_ENV:-}" ]; then
             grep -q '^AGENT_TEST_CHROME=' "$GITHUB_ENV"
             grep -q '^AGENT_TEST_PLAYWRIGHT_EXTENSION_DIR=' "$GITHUB_ENV"
+            grep -q '^AGENT_TEST_PLAYWRIGHT_LEGACY_EXTENSION_DIR=' "$GITHUB_ENV"
           fi
       - name: Check Rust and runtime
         run: nix develop .#ci --command make check-prepared

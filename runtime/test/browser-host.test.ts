@@ -26,9 +26,11 @@ function object(value: unknown): value is Record<string, unknown> {
 
 // Explicit test binaries support normal extension loading. Never start personal Chrome by discovery.
 const chrome = process.env.AGENT_TEST_CHROME;
-const extensionDirectory = process.env.AGENT_TEST_PLAYWRIGHT_EXTENSION_DIR;
+const defaultExtensionDirectory = process.env.AGENT_TEST_PLAYWRIGHT_EXTENSION_DIR;
+// The previous official release, whose connect page stays attached to the client.
+const legacyExtensionDirectory = process.env.AGENT_TEST_PLAYWRIGHT_LEGACY_EXTENSION_DIR;
 const extensionId = "mmlmfjhmonkocbjadbfplnigmagldckm";
-const skipChrome = (chrome === undefined || extensionDirectory === undefined) && process.env.CI !== "true";
+const skipChrome = (chrome === undefined || defaultExtensionDirectory === undefined) && process.env.CI !== "true";
 const nativeOperationTimeout = 45_000;
 
 async function within<T>(operation: Promise<T>, milliseconds: number, message: string): Promise<T> {
@@ -227,11 +229,17 @@ async function closeChrome(browser: ChildProcess, exited: Promise<void>, client:
   if (!await stopped()) throw new Error("Disposable Chrome process group or stdio did not stop during fixture cleanup", { cause: protocolError });
 }
 
-async function fixture(t: TestContext, options: { slowSubmit?: boolean; slowPopup?: boolean; foreignFrame?: boolean } = {}) {
+async function fixture(t: TestContext, options: { slowSubmit?: boolean; slowPopup?: boolean; foreignFrame?: boolean; extension?: string } = {}) {
   assert.ok(chrome && existsSync(chrome), "AGENT_TEST_CHROME must name a disposable-test-capable Chrome binary");
+  const extensionDirectory = options.extension ?? defaultExtensionDirectory;
   assert.ok(extensionDirectory && existsSync(extensionDirectory), "AGENT_TEST_PLAYWRIGHT_EXTENSION_DIR must name the extracted official extension");
+  // 0.6.0 replaced the status page with a manage page; both show the same pairing token.
+  const tokenPage = existsSync(join(extensionDirectory, "status.html")) ? "status.html" : "manage.html";
   const manifest: unknown = JSON.parse(await readFile(join(extensionDirectory, "manifest.json"), "utf8"));
-  assert.ok(object(manifest) && typeof manifest.key === "string");
+  assert.ok(object(manifest) && typeof manifest.key === "string" && typeof manifest.version === "string");
+  const extensionVersion = manifest.version;
+  // Since 0.6 a client's session outlives its tabs; only the relay socket ends it.
+  const finalPageDisconnects = /^0\.[0-5]\./.test(extensionVersion);
   const manifestId = [...createHash("sha256").update(Buffer.from(manifest.key, "base64")).digest("hex").slice(0, 32)]
     .map(digit => String.fromCharCode(97 + Number.parseInt(digit, 16))).join("");
   assert.equal(manifestId, extensionId, "The fixture must use the official extension identity");
@@ -401,7 +409,7 @@ socket.once('data', data => { socket.destroy(); process.exit(data === 'ok\\n' ? 
     }
   });
   async function startBrowser(): Promise<Running> {
-    assert.ok(chrome && extensionDirectory);
+    assert.ok(chrome);
     await unlink(join(directory, "DevToolsActivePort")).catch(() => {});
     const args = ["--headless=new", "--remote-debugging-port=0", `--user-data-dir=${directory}`,
       `--disable-extensions-except=${extensions.join(",")}`, `--load-extension=${extensions.join(",")}`, "--use-mock-keychain", "--password-store=basic",
@@ -431,7 +439,7 @@ socket.once('data', data => { socket.destroy(); process.exit(data === 'ok\\n' ? 
     assert.notEqual(endpoint, "", "Disposable Chrome must start within ten seconds");
     browser.stderr?.off("data", captureStartup); browser.stderr?.resume();
     const client = new ChromeFixtureClient(endpoint); tracked.client = client;
-    const status = await client.call("Target.createTarget", { url: `chrome-extension://${extensionId}/status.html`, background: true });
+    const status = await client.call("Target.createTarget", { url: `chrome-extension://${extensionId}/${tokenPage}`, background: true });
     assert.ok(typeof status.targetId === "string"); statusTarget = status.targetId;
     return { browser, exited, client };
   }
@@ -464,7 +472,7 @@ socket.once('data', data => { socket.destroy(); process.exit(data === 'ok\\n' ? 
     hosts.push(host); return host;
   };
   return {
-    origin, pairingToken: token, get browser() { return current().browser; }, get client() { return current().client; }, submitted, host: newHost(), newHost,
+    origin, pairingToken: token, extensionVersion, finalPageDisconnects, get browser() { return current().browser; }, get client() { return current().client; }, submitted, host: newHost(), newHost,
     popupHeld, finishPopup,
     finishValidation() { validationFinished = true; validation?.end("valid"); validation = undefined; },
     nativeInputHeld,
@@ -583,6 +591,37 @@ function elementRef(output: string, role: string, name: string): string {
   const result = find(value.snapshot); assert.ok(result, `Snapshot must contain ${role} ${name}`); return result;
 }
 
+for (const [flow, directory] of [["current release", defaultExtensionDirectory], ["legacy connector", legacyExtensionDirectory]] as const) {
+  test(`${flow} extension handoff adopts only its own new tab and leaves no stray tabs`,
+    { skip: skipChrome || directory === undefined, timeout: 90_000 }, async t => {
+      assert.ok(directory);
+      const f = await fixture(t, { extension: directory }), request = requests();
+      const manifest: unknown = JSON.parse(await readFile(join(directory, "manifest.json"), "utf8"));
+      assert.ok(object(manifest) && typeof manifest.version === "string");
+      const sorted = (pages: { targetId: string; url: string }[]) => [...pages].sort((left, right) => left.targetId.localeCompare(right.targetId));
+      const before = sorted(await f.client.pages());
+      const opened = (await f.host.execute(request({ type: "open", url: "about:blank" }))).response;
+      assert.ok(opened.type === "ready", JSON.stringify(opened));
+      assert.deepEqual(opened.tabs.map(tab => tab.url), ["about:blank"]);
+      f.assertNoBootstrapDetails(opened);
+      const during = sorted(await f.client.pages());
+      // User tabs are untouched, and the extension's handed tab (connect page
+      // or claimed blank) is gone; only the adopted page was added.
+      assert.deepEqual(during.filter(page => before.some(item => item.targetId === page.targetId)), before);
+      const added = during.filter(page => !before.some(item => item.targetId === page.targetId));
+      assert.deepEqual(added.map(page => page.url), ["about:blank"]);
+      assert.equal(during.some(page => page.url.startsWith(`chrome-extension://${extensionId}/connect.html`)), false);
+      const tab = opened.tabs[0]; assert.ok(tab);
+      const closed = (await f.host.execute(request({ type: "close_tab", tab_id: tab.id }))).response;
+      assert.ok(closed.type === "closed", JSON.stringify(closed)); assert.equal(closed.tabs.length, 0);
+      assert.deepEqual(sorted(await f.client.pages()), before, "Closing the final owned tab leaves exactly the user's original tabs");
+      assert.equal((await f.host.execute(request({ type: "status" }))).response.type, "disconnected",
+        "Closing the final owned tab ends the connection even when the extension keeps its session");
+      await f.assertUnrelatedGroup();
+      t.diagnostic(JSON.stringify({ extension: manifest.version, before: before.length, added: added.length }));
+    });
+}
+
 test("public runBeforeUnload close acknowledges before the final controlled page disconnects", { skip: skipChrome, timeout: 90_000 }, async t => {
   const f = await fixture(t), request = requests();
   const operation = request({ type: "open", url: `${f.origin}/form` });
@@ -595,8 +634,15 @@ test("public runBeforeUnload close acknowledges before the final controlled page
   await within(native.page.close({ runBeforeUnload: true }), 10_000, "Public beforeunload close did not acknowledge");
   order.push("close-command-ack");
   await within(pageClosed, 10_000, "The acknowledged final page did not close");
-  await within(disconnected, 10_000, "Final controlled page must disconnect its extension relay");
-  assert.ok(order.indexOf("close-command-ack") < order.indexOf("browser-disconnected"), JSON.stringify(order));
+  if (f.finalPageDisconnects) {
+    await within(disconnected, 10_000, "Final controlled page must disconnect its extension relay");
+    assert.ok(order.indexOf("close-command-ack") < order.indexOf("browser-disconnected"), JSON.stringify(order));
+  } else {
+    // The relay stays up, so Beep Boop's own close of its final tab must end the connection.
+    await setTimeout(2000);
+    assert.equal(native.browser.isConnected(), true, `Extension ${f.extensionVersion} keeps the relay after its final tab closes`);
+    assert.deepEqual(order, ["close-command-ack", "page-close"]);
+  }
   assert.equal((await f.client.pages()).some(page => page.url === `${f.origin}/form`), false);
   await f.assertUnrelatedGroup();
   assert.equal(f.browser.exitCode, null);

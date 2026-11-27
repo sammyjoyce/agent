@@ -24,6 +24,7 @@ import { MAX_SCREENSHOT_BYTES } from "./generated/screenshot-limits.js";
 const OUTPUT_LIMIT = 64 * 1024;
 const ACTION_TIMEOUT = 30_000;
 const EXTENSION_ID = "mmlmfjhmonkocbjadbfplnigmagldckm";
+const EXTENSION_ORIGIN = `chrome-extension://${EXTENSION_ID}`;
 const MAX_PASSWORD_VALUES = 128;
 const MAX_PASSWORD_CHARS = 8192;
 const MAX_PASSWORD_BYTES = 64 * 1024;
@@ -42,9 +43,18 @@ type ConnectionStage = "pairing" | "mcp_transport" | "extension_attach" | "endpo
   | "browser_attach" | "profile_context" | "connector_identity" | "page_creation" | "connector_cleanup";
 type ControlLoss = "mcp_closed" | "browser_disconnected" | "owned_page_closed";
 
+/** What the extension handed this connection, observed before any page is adopted. */
+type HandoffObservation = "no_tab" | "several_tabs" | "unrecognized_tab";
+
 /** Only fixed diagnostic labels can cross the secret-bearing bootstrap boundary. */
 class ConnectionFailure extends Error {
-  constructor(readonly stage: ConnectionStage) { super(`Chrome connection failed at ${stage}`); }
+  constructor(readonly stage: ConnectionStage, readonly observed?: HandoffObservation) {
+    super(`Chrome connection failed at ${stage}`);
+  }
+}
+
+class HandoffUnconfirmed extends Error {
+  constructor(readonly observed: HandoffObservation) { super("Browser connector identity was not confirmed"); }
 }
 
 class TabClaimConflict extends Error {}
@@ -227,9 +237,60 @@ function mutates(action: BrowserAction): boolean {
   return action.type !== "status" && action.type !== "snapshot" && action.type !== "screenshot" && action.type !== "wait_for" && action.type !== "retain_tab";
 }
 
-function connector(page: Page, name: string): boolean {
+/**
+ * The tab the extension handed this connection. With the pairing token the
+ * extension skips its tab picker. Extension 0.5 and earlier keep the connect
+ * page itself attached. 0.6 navigates that same tab to about:blank and claims
+ * it for this client; its relay then exposes only tabs claimed for this
+ * client. A claimed tab that was created blank, rather than navigated from the
+ * connect page, is not this handoff.
+ */
+type Handoff = { flow: "connector" | "claimed_tab"; page: Page };
+
+async function handoff(context: BrowserContext, name: string): Promise<Handoff> {
+  const pages = context.pages();
+  const connectors = pages.filter(page => connector(page.url(), name));
+  if (connectors.length === 1 && connectors[0] !== undefined) return { flow: "connector", page: connectors[0] };
+  if (connectors.length > 1) throw new HandoffUnconfirmed("several_tabs");
+  if (pages.length === 0) throw new HandoffUnconfirmed("no_tab");
+  if (pages.length > 1) throw new HandoffUnconfirmed("several_tabs");
+  const page = pages[0];
+  if (page === undefined || page.url() !== "about:blank" || await blankOrigin(page) !== EXTENSION_ORIGIN) {
+    throw new HandoffUnconfirmed("unrecognized_tab");
+  }
+  return { flow: "claimed_tab", page };
+}
+
+/**
+ * An about:blank document inherits the origin of whoever navigated it. Only
+ * this extension's own navigation of its connect tab yields its origin here.
+ * The relay refuses page-level CDP sessions, so read it from the document.
+ */
+async function blankOrigin(page: Page): Promise<string | undefined> {
+  const timer = new AbortController();
   try {
-    const url = new URL(page.url());
+    const origin: unknown = await Promise.race([page.evaluate(() => Reflect.get(globalThis, "origin")),
+      delay(5000, undefined, { signal: timer.signal, ref: false })]);
+    return typeof origin === "string" ? origin : undefined;
+  } catch { return undefined; } finally { timer.abort(); }
+}
+
+async function closeWithin(page: Page, milliseconds: number): Promise<void> {
+  const timer = new AbortController();
+  try {
+    await Promise.race([page.close().catch(() => {}), delay(milliseconds, undefined, { signal: timer.signal, ref: false })]);
+  } catch { /* An aborted timer means the close settled first. */ } finally { timer.abort(); }
+}
+
+const HANDOFF_DETAIL: Record<HandoffObservation, string> = {
+  no_tab: "the extension handed this connection no tab",
+  several_tabs: "the extension handed this connection more than one tab",
+  unrecognized_tab: "the extension handed this connection a tab that is neither its connect page nor the blank tab it navigated from that page",
+};
+
+function connector(href: string, name: string): boolean {
+  try {
+    const url = new URL(href);
     if (url.protocol !== "chrome-extension:" || url.hostname !== EXTENSION_ID || url.pathname !== "/connect.html") return false;
     const client: unknown = JSON.parse(url.searchParams.get("client") ?? "null");
     return object(client) && client.name === name;
@@ -423,7 +484,8 @@ export class BrowserHost {
   }
 
   private failureDetail(error?: unknown): string {
-    if (error instanceof ConnectionFailure) return `Connection stage: ${error.stage}.`;
+    if (error instanceof ConnectionFailure) return error.observed === undefined ? `Connection stage: ${error.stage}.`
+      : `Connection stage: ${error.stage}; ${HANDOFF_DETAIL[error.observed]}.`;
     return this.controlLoss === undefined ? "Failure stage: browser_operation." : `Control lost: ${this.controlLoss}.`;
   }
 
@@ -464,6 +526,7 @@ export class BrowserHost {
     this.client = client;
     client.onClose(() => this.lost("mcp_closed"));
     let stage: ConnectionStage = "mcp_transport";
+    const handedPages: Page[] = [];
     try {
       await client.connect(transport);
       stage = "extension_attach";
@@ -490,19 +553,25 @@ export class BrowserHost {
       if (context === undefined || browser.contexts().length !== 1) throw new Error("Browser profile context was not confirmed");
       this.trackCreatedPages(context);
       stage = "connector_identity";
-      const connectors = context.pages().filter(page => connector(page, name));
-      if (connectors.length !== 1) throw new Error("Browser connector identity was not confirmed");
-      // The final attached page disconnects the extension when closed. Create
-      // a positively owned page before removing its private connector.
+      const handed = await handoff(context, name);
+      handedPages.push(handed.page);
+      // Neither handed tab becomes a task page. The connector holds the relay
+      // URL, and 0.6's claimed blank keeps the extension origin even after
+      // navigating, so password capture cannot cover it. The final attached
+      // page disconnects the extension when closed: create a positively owned
+      // page before removing the handed tab.
       stage = "page_creation";
       const page = await context.newPage();
-      this.adopt(page);
+      handedPages.push(page);
       stage = "connector_cleanup";
-      await connectors[0]?.close();
+      await handed.page.close();
       return page;
-    } catch {
+    } catch (error) {
+      // Close only pages positively tied to this connection: its confirmed
+      // handoff and any page it created. Unconfirmed pages are left alone.
+      await Promise.all(handedPages.map(page => closeWithin(page, 5000)));
       await this.close().catch(() => {});
-      throw new ConnectionFailure(stage);
+      throw new ConnectionFailure(stage, error instanceof HandoffUnconfirmed ? error.observed : undefined);
     }
   }
 
@@ -847,9 +916,11 @@ export class BrowserHost {
         return { type: "uncertain", session_id,
           message: `${this.failureDetail(error)} Playwright code failed: ${this.redact(detail).slice(0, 8192)}. Earlier effects were not replayed. Inspect the page before running it again; native tab cleanup was not verified.` };
       }
-      const recovery = this.config.debugging_port === undefined || this.config.debugging_port === null
-        ? "Confirm the Playwright extension is installed in the configured profile and its pairing token is available to Beep Boop."
-        : "Confirm the configured Chrome is running with its native debugging port enabled.";
+      const recovery = this.config.debugging_port !== undefined && this.config.debugging_port !== null
+        ? "Confirm the configured Chrome is running with its native debugging port enabled."
+        : error instanceof ConnectionFailure && error.stage === "connector_identity"
+        ? "The Playwright extension paired, but its tab handoff did not match a supported flow (the 0.5 connect page or the 0.6 claimed blank tab). Its connect flow may have changed in a newer extension release; nothing was adopted."
+        : "Confirm the Playwright extension is installed in the configured profile and its pairing token is available to Beep Boop.";
       return { type: mutates(action) ? "uncertain" : "disconnected", session_id,
         message: `${this.failureDetail(error)} Chrome did not confirm this operation. Native tabs may still be open and cleanup was not verified. Inspect its outcome before repeating it. ${recovery} Old handles are invalid after disconnection.` };
     }
