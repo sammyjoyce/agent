@@ -20,6 +20,9 @@ use serde::{Deserialize, Serialize};
 #[path = "fixtures/coordinator.rs"]
 mod coordinator_fixture;
 use coordinator_fixture::{Coordinator, Server};
+#[path = "fixtures/drained_output.rs"]
+mod drained_output;
+use drained_output::wait_with_output_until;
 #[path = "fixtures/executable.rs"]
 mod executable_fixture;
 use executable_fixture::write_executable;
@@ -115,25 +118,19 @@ impl Fixture {
     }
 
     fn cli_format(&self, args: &[&str], json: bool) -> Output {
-        let mut child = self
+        let child = self
             .command_format(args, json)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn_serialized()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while child.try_wait().unwrap().is_none() {
-            if Instant::now() >= deadline {
-                child.kill().unwrap();
-                let output = child.wait_with_output().unwrap();
-                panic!(
-                    "Fixture command {args:?} timed out: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        child.wait_with_output().unwrap()
+        let (output, exited) = wait_with_output_until(child, Duration::from_secs(15));
+        assert!(
+            exited,
+            "Fixture command {args:?} timed out: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
     }
 
     fn events(&self, args: &[&str]) -> Vec<RuntimeEventKind> {

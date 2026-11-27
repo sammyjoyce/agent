@@ -22,6 +22,9 @@ use sha2::{Digest, Sha256};
 mod coordinator_fixture;
 use coordinator_fixture::Coordinator;
 pub use coordinator_fixture::Server;
+#[path = "drained_output.rs"]
+mod drained_output;
+use drained_output::wait_with_output_until;
 #[path = "executable.rs"]
 mod executable_fixture;
 use executable_fixture::write_executable;
@@ -314,25 +317,19 @@ impl Fixture {
     }
 
     pub fn cli(&self, args: &[&str], json: bool) -> Output {
-        let mut child = self
+        let child = self
             .command(args, json)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn_serialized()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while child.try_wait().unwrap().is_none() {
-            if Instant::now() >= deadline {
-                child.kill().unwrap();
-                let output = child.wait_with_output().unwrap();
-                panic!(
-                    "Fixture command {args:?} timed out: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        child.wait_with_output().unwrap()
+        let (output, exited) = wait_with_output_until(child, Duration::from_secs(30));
+        assert!(
+            exited,
+            "Fixture command {args:?} timed out: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
     }
 
     pub fn ok(&self, args: &[&str], json: bool) -> String {

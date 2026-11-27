@@ -7,7 +7,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "fixtures/drained_output.rs"]
+mod drained_output;
 use agent_cli::serialized_spawn::SerializedSpawn;
+use drained_output::wait_with_output_until;
 use serde_json::{Value, json};
 
 const COORDINATOR: &str = "11111111-1111-4111-8111-111111111111";
@@ -250,20 +253,14 @@ struct Supervisor(Option<Child>);
 
 impl Supervisor {
     fn finish(mut self) -> Output {
-        let mut child = self.0.take().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while child.try_wait().unwrap().is_none() {
-            if Instant::now() > deadline {
-                let _ = child.kill();
-                let output = child.wait_with_output().unwrap();
-                panic!(
-                    "The coordinator did not exit: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        child.wait_with_output().unwrap()
+        let child = self.0.take().unwrap();
+        let (output, exited) = wait_with_output_until(child, Duration::from_secs(30));
+        assert!(
+            exited,
+            "The coordinator did not exit: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
     }
 
     /// Ends the supervisor as a host that loses power does, with no cleanup.
