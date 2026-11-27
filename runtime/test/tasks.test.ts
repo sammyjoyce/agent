@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { test } from "node:test";
+import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteDatabase } from "@earendil-works/chord/sqlite/node";
@@ -968,6 +969,172 @@ test("a lost create's claim is refused unless its allocation, host, session and 
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
+const RECEIPT_ORDERS = ["before the claim", "during the claim's inspection", "during a slow inspection that finds no running worker",
+  "right before the claim's last decision"] as const;
+type ReceiptOrder = typeof RECEIPT_ORDERS[number];
+const CLAIM_RECEIPT_WAIT_MS = 50;
+async function raceCreateReceipt(child: boolean, order: ReceiptOrder, claimOf: (receipt: WorkerRef, allocation: string) => { binding: WorkerRef; allocation: string },
+  landing: (receipt: WorkerRef) => HostResult = receipt => ({ type: "spawned", binding: receipt })) {
+  const directory = await mkdtemp(join(tmpdir(), "agent-create-receipt-race-")); const app = await open(directory);
+  app.tasks.useClaimReceiptWait(CLAIM_RECEIPT_WAIT_MS);
+  let releaseCreate = () => {}; let dispatch: Promise<unknown> | undefined;
+  try {
+    const task = await app.tasks.create({ title: "Race the create receipt", outcome: "Admit the worker Rex started", model: fixtureModel });
+    const receipt = { ...binding, rex_instance_id: "66666666-6666-4666-8666-666666666666",
+      ...(child ? { window_id: "window:55555555-5555-4555-8555-555555555555", block_id: "block:66666666-6666-4666-8666-666666666666" } : {}) };
+    let entered = () => {}; const creating = new Promise<void>(resolve => { entered = resolve; });
+    const createGate = new Promise<void>(resolve => { releaseCreate = resolve; });
+    const create = async (): Promise<HostResult> => { entered(); await createGate; return landing(receipt); };
+    if (child) {
+      await app.tasks.dispatch(task.id, ownedHost, async () => ({ type: "spawned", binding }));
+      await app.tasks.createAgent(task.id, { id: "review", title: "Review", outcome: "Review the change", input: "Inspect the evidence.", inputId: "queued-input" });
+      dispatch = app.tasks.dispatchAgent(task.id, "review", create);
+    } else {
+      await app.tasks.enqueue(task.id, "Run the queued check", "queued-input");
+      dispatch = app.tasks.dispatch(task.id, ownedHost, create);
+    }
+    void dispatch.catch(() => {}); await creating;
+    const actorOf = async () => { const saved = await app.tasks.get(task.id); return child ? saved.agents[0] : saved; };
+    const allocating = (await actorOf())?.worker; assert.ok(allocating?.state === "allocating");
+    if (order === "before the claim") { releaseCreate(); await dispatch; }
+    const claim = claimOf(receipt, allocating.allocation_id);
+    const commit = app.session.commit.bind(app.session), receiptLands = dispatch;
+    let landBeforeNextCommit = false;
+    app.session.commit = ((...args: Parameters<typeof commit>) => {
+      if (!landBeforeNextCommit) return commit(...args);
+      landBeforeNextCommit = false; releaseCreate();
+      return receiptLands.then(() => commit(...args));
+    }) as typeof commit;
+    app.faux.setResponses([fauxAssistantMessage("The queued input ran")]);
+    const outcome = await app.tasks.run({ type: "run_task", task_id: task.id, ...(child ? { agent_id: "review" } : {}), allocation_id: claim.allocation,
+      binding: claim.binding, instructions: "", cwd: host.cwd, model: fixtureModel }, () => () => {}, [], async (command) => {
+      if (command.type === "resume_worker") return { type: "written" };
+      if (command.type !== "on_node" || command.command.type !== "inspect_worker") throw new Error(`Unexpected ${command.type}`);
+      if (order === "before the claim") return { type: "worker_presence", presence: { state: "present", running: true } };
+      if (order !== "right before the claim's last decision") { releaseCreate(); await dispatch; }
+      if (order === "during the claim's inspection") return { type: "worker_presence", presence: { state: "present", running: true } };
+      await sleep(CLAIM_RECEIPT_WAIT_MS * 4);
+      landBeforeNextCommit = order === "right before the claim's last decision";
+      return { type: "worker_presence", presence: { state: "present", running: false } };
+    }).then(answer => answer.text, (error: Error) => error);
+    return { outcome, receipt, allocation: allocating.allocation_id, worker: (await actorOf())?.worker, modelCalls: app.faux.state.callCount };
+  } finally { releaseCreate(); await dispatch?.catch(() => {}); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+}
+
+for (const child of [false, true]) for (const order of RECEIPT_ORDERS) {
+  test(`a ${child ? "child" : "task"} worker is admitted when its own create receipt lands ${order}`, async () => {
+    const race = await raceCreateReceipt(child, order, (receipt, allocation) => ({ binding: receipt, allocation }));
+    assert.equal(race.outcome, "The queued input ran"); assert.equal(race.modelCalls, 1);
+    assert.deepEqual(race.worker, { state: "bound", allocation_id: race.allocation, host: ownedHost, binding: race.receipt });
+  });
+  test(`a ${child ? "child" : "task"} claim that differs from the create receipt landing ${order} is refused`, async () => {
+    for (const differ of [
+      (receipt: WorkerRef, allocation: string) => ({ binding: receipt, allocation: allocation + "-other" }),
+      (receipt: WorkerRef, allocation: string) => ({ binding: { ...receipt, host_id: "99999999-9999-4999-8999-999999999999" }, allocation }),
+      (receipt: WorkerRef, allocation: string) => ({ binding: { ...receipt, block_id: "block:77777777-7777-4777-8777-777777777777" }, allocation }),
+      (receipt: WorkerRef, allocation: string) => ({ binding: { ...receipt, rex_instance_id: "77777777-7777-4777-8777-777777777777" }, allocation }),
+    ]) {
+      const race = await raceCreateReceipt(child, order, differ);
+      assert.ok(race.outcome instanceof Error, `refused: ${String(race.outcome)}`); assert.equal(race.modelCalls, 0);
+      assert.deepEqual(race.worker, { state: "bound", allocation_id: race.allocation, host: ownedHost, binding: race.receipt });
+    }
+  });
+}
+
+for (const child of [false, true]) {
+  const kind = child ? "child" : "task", inspection = "during the claim's inspection";
+  const uncertain = (receipt: WorkerRef): HostResult => ({ type: "creation_uncertain", session_id: receipt.session_id });
+  test(`a ${kind} worker that saw no receipt is admitted when an uncertain receipt naming its session lands ${inspection}`, async () => {
+    const race = await raceCreateReceipt(child, inspection, (receipt, allocation) => ({ binding: receipt, allocation }), uncertain);
+    assert.equal(race.outcome, "The queued input ran"); assert.equal(race.modelCalls, 1);
+    assert.deepEqual(race.worker, { state: "bound", allocation_id: race.allocation, host: ownedHost, binding: race.receipt });
+  });
+  test(`a ${kind} claim is refused when an uncertain receipt naming another session than its own lands ${inspection}`, async () => {
+    const race = await raceCreateReceipt(child, inspection, (receipt, allocation) =>
+      ({ binding: { ...receipt, session_id: "session:77777777-7777-4777-8777-777777777777" }, allocation }), uncertain);
+    assert.ok(race.outcome instanceof Error, `refused: ${String(race.outcome)}`); assert.equal(race.modelCalls, 0);
+    assert.deepEqual(race.worker, { state: "uncertain", allocation_id: race.allocation, host: ownedHost, session_id: race.receipt.session_id });
+  });
+}
+
+for (const during of ["the task moved to another pane", "a resume of the same pane was in flight"] as const) {
+  const moves = during === "the task moved to another pane";
+  test(`a claim that waited for a closing actor is ${moves ? "refused" : "admitted"} when ${during} during the wait`, { timeout: 20_000 }, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-claim-after-close-")); const app = await open(directory);
+    const gates: (() => void)[] = [];
+    const gate = () => new Promise<void>(resolve => { gates.push(resolve); });
+    let presented: Promise<unknown> | undefined;
+    try {
+      const task = await app.tasks.create({ title: "Move during the close", outcome: "Run only in the pane the task is bound to", model: fixtureModel });
+      await app.tasks.enqueue(task.id, "Run the first check", "first-input");
+      const bound = await app.tasks.dispatch(task.id, ownedHost, async () => ({ type: "spawned", binding }));
+      assert.ok(bound.worker.state === "bound");
+      const command: Extract<RuntimeCommand, { type: "run_task" }> = { type: "run_task", task_id: task.id, allocation_id: bound.worker.allocation_id,
+        binding, instructions: "", cwd: host.cwd, model: fixtureModel };
+      const claim = () => app.tasks.run(command, () => () => {}, []);
+      let thinking = () => {}; const turnStarted = new Promise<void>(resolve => { thinking = resolve; });
+      const firstTurn = gate();
+      app.faux.setResponses([async () => { thinking(); await firstTurn; return fauxAssistantMessage("The first check ran"); },
+        fauxAssistantMessage(moves ? "The second check ran in a pane the task had left" : "The second check ran")]);
+      const first = claim();
+      await turnStarted;
+
+      const commit = app.session.commit.bind(app.session);
+      let holdNext: Promise<void> | undefined, commits = 0;
+      app.session.commit = ((...args: Parameters<typeof commit>) => {
+        const held = holdNext; holdNext = undefined;
+        return (held === undefined ? commit(...args) : held.then(() => commit(...args))).finally(() => { commits += 1; });
+      }) as typeof commit;
+      // An admission that has not committed holds the first actor in its close.
+      const admission = gate(); holdNext = admission;
+      const second = app.tasks.enqueue(task.id, "Run the second check", "second-input");
+      await until(() => holdNext === undefined, "The second input must reach its commit");
+      const moved = { ...binding, window_id: "window:55555555-5555-4555-8555-555555555555", block_id: "block:66666666-6666-4666-8666-666666666666" };
+      const resume = gate(); holdNext = resume;
+      const reply = moves ? Promise.resolve() : gate();
+      presented = app.tasks.dispatch(task.id, ownedHost, async (hostCommand) => {
+        assert.equal(hostCommand.type, "resume_worker"); await reply;
+        return moves ? { type: "spawned", binding: moved } : { type: "written" };
+      });
+      await until(() => holdNext === undefined, "The resume must reach its first commit");
+      gates[0]!();
+
+      let waiting: ReturnType<typeof claim> | undefined, before = 0;
+      await until(async () => {
+        before = commits;
+        const attempt = claim();
+        const refused = await Promise.race([attempt.then(() => undefined, (error: Error) => error), sleep(20)]);
+        if (refused === undefined) { waiting = attempt; return true; }
+        assert.match(refused.message, /already has an attached worker/); return false;
+      }, "The second claim must find the first actor closing");
+      await until(() => commits > before, "The second claim must confirm its binding before it waits");
+      assert.ok(waiting !== undefined);
+      if (moves) {
+        gates[2]!(); await presented;
+        const rebound = await app.tasks.get(task.id);
+        assert.ok(rebound.worker.state === "bound"); assert.deepEqual(rebound.worker.binding, moved);
+        gates[1]!(); await second; await first;
+        await assert.rejects(waiting, /Worker binding is not confirmed for this task/);
+        assert.equal(app.faux.state.callCount, 1, "The pane the task left must not run its next input");
+        assert.deepEqual((await app.tasks.get(task.id)).pending.map(input => input.id), ["second-input"]);
+      } else {
+        gates[2]!();
+        await until(async () => (await app.tasks.get(task.id)).worker.state === "resuming", "The resume must be in flight");
+        gates[1]!(); await second; await first;
+        assert.equal((await waiting).text, "The second check ran");
+        assert.equal((await app.tasks.get(task.id)).worker.state, "resuming", "The claim must not wait for the resume's receipt");
+        gates[3]!(); await presented;
+        const kept = await app.tasks.get(task.id);
+        assert.deepEqual(kept.worker, { state: "bound", allocation_id: bound.worker.allocation_id, host: ownedHost, binding });
+        assert.deepEqual(kept.pending, []); assert.equal(app.faux.state.callCount, 2);
+      }
+    } finally {
+      for (const open of gates) open();
+      await presented?.catch(() => {}); await app.tasks.detachActors(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true });
+    }
+  });
+}
+
 test("a lost resume receipt is confirmed by its replacement while the old pane stays without its worker", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-resume-restored-")); const app = await open(directory);
   try {
@@ -1042,6 +1209,36 @@ for (const child of [false, true]) for (const [label, recorded] of [["an idle", 
     } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
   });
 }
+
+test("a resume that Rex restarted around is uncertain for its session, and the replacement worker that claims under the newer instance is admitted", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-resume-restart-")); const app = await open(directory);
+  try {
+    const recorded = { ...binding, rex_instance_id: "66666666-6666-4666-8666-666666666666" };
+    const replacement = { ...binding, window_id: "window:55555555-5555-4555-8555-555555555555", block_id: "block:66666666-6666-4666-8666-666666666666",
+      rex_instance_id: "88888888-8888-4888-8888-888888888888" };
+    const task = await app.tasks.create({ title: "Resume around a Rex restart", outcome: "Run the queued input", model: fixtureModel });
+    await app.tasks.enqueue(task.id, "Run the queued check", "queued-input");
+    const bound = await app.tasks.dispatch(task.id, ownedHost, async () => ({ type: "spawned", binding: recorded }));
+    assert.ok(bound.worker.state === "bound");
+    const sent: string[] = [];
+    await assert.rejects(app.tasks.dispatch(task.id, ownedHost, async (command) => {
+      sent.push(command.type); return { type: "creation_uncertain", session_id: binding.session_id };
+    }), /needs reconciliation/);
+    assert.deepEqual(sent, ["resume_worker"]);
+    assert.equal((await app.tasks.get(task.id)).worker.state, "resume_uncertain");
+    app.faux.setResponses([fauxAssistantMessage("The queued input ran")]);
+    const answer = await app.tasks.run({ type: "run_task", task_id: task.id, allocation_id: bound.worker.allocation_id, binding: replacement,
+      instructions: "", cwd: host.cwd, model: fixtureModel }, () => () => {}, [], async (command) => {
+      if (command.type !== "on_node" || command.command.type !== "inspect_worker") throw new Error(`Unexpected ${command.type}`);
+      // Rex restored a shell in the recorded pane. Only the replacement runs the worker.
+      return { type: "worker_presence", presence: { state: "present", running: command.command.binding.block_id === replacement.block_id } };
+    });
+    assert.equal(answer.text, "The queued input ran");
+    const saved = await app.tasks.get(task.id);
+    assert.deepEqual(saved.worker, { ...bound.worker, binding: replacement });
+    assert.equal(saved.pending.length, 0);
+  } finally { await app.tasks.detachActors(); await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
 
 test("host replies are correlated to their request and release resources when a request ends", async () => {
   const emitted: { request: number; call: string; command: HostCommand }[] = [];
