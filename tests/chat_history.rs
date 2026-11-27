@@ -952,7 +952,18 @@ async fn observer_recovery(case: RecoveryCase) {
         );
     }
     drop(observed);
-    read_terminal_until(&mut output, &mut bytes, "A retained draft").await;
+    // The draft was already on screen, so wait for the recovered view to
+    // replace the live reconnect status before reading what it saved.
+    read_terminal_observation(
+        &mut output,
+        &mut bytes,
+        "the recovered view with the retained draft",
+        |bytes| {
+            let visible = terminal_text(bytes);
+            visible.contains("A retained draft") && !visible.contains("Reconnecting")
+        },
+    )
+    .await;
     let recovered = terminal_history_text(&bytes);
     assert!(
         !recovered.contains("Reconnecting"),
@@ -983,6 +994,13 @@ async fn observer_recovery(case: RecoveryCase) {
         inputs.lock().await.len(),
         4,
         "Closing the client cannot replay uncertain or accepted input"
+    );
+    // The session is drained to its end, so a row committed after the check
+    // above is in this history too.
+    let saved = terminal_history_text(&bytes);
+    assert!(
+        !saved.contains("Reconnecting"),
+        "Recovery progress must never become a saved transcript row: {saved}"
     );
     server.abort();
     assert!(server.await.unwrap_err().is_cancelled());
@@ -1370,10 +1388,21 @@ async fn chief_startup(mode: ChiefStartup) {
             gate.add_permits(1);
         }
     }
-    let exited = timeout(Duration::from_secs(3), child.wait_with_output())
-        .await
-        .unwrap()
-        .unwrap();
+    // Drain the terminal while the client exits, as a terminal emulator would.
+    // Its stdout was taken above, so `wait_with_output` cannot read it.
+    let exited = timeout(Duration::from_secs(3), async {
+        let (exited, drained) =
+            tokio::join!(child.wait_with_output(), output.read_to_end(&mut bytes));
+        drained.unwrap();
+        exited.unwrap()
+    })
+    .await
+    .unwrap_or_else(|error| {
+        panic!(
+            "Chief startup did not exit: {error}: {}",
+            terminal_text(&bytes)
+        )
+    });
     assert_eq!(
         exited.status.success(),
         !matches!(mode, ChiefStartup::Failure),

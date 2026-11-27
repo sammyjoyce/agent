@@ -53,22 +53,30 @@ fn main() -> Result<ExitCode> {
     std::thread::spawn(move || {
         let _ = io::copy(&mut io::stdin().lock(), &mut input);
     });
-    let mut bytes = [0; 8192];
-    loop {
-        match output.read(&mut bytes) {
-            Ok(0) => break,
-            Ok(length) => {
-                if let Some(cursor) = &mut cursor {
-                    cursor.observe(&bytes[..length], &mut replies)?;
-                }
-                io::stdout().write_all(&bytes[..length])?;
-                io::stdout().flush()?;
-            }
-            Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error.into()),
+    // A terminal emulator always drains its PTY, whenever its user looks. The
+    // test reads this fixture's stdout only while it waits for a frame, and
+    // a pipe can hold as little as 512 bytes on a loaded macOS host. Forward
+    // from a queue, so a test that is not reading never blocks the CLI's
+    // writes, its cursor replies or, with them, its key reads. The queue has
+    // no bound, because any bound would stall the CLI again. Each test ends
+    // the fixture within seconds, which also limits a runaway renderer.
+    let (frames, queued) = std::sync::mpsc::channel::<Vec<u8>>();
+    let forwarder = std::thread::spawn(move || -> io::Result<()> {
+        let mut stdout = io::stdout().lock();
+        for frame in queued {
+            stdout.write_all(&frame)?;
+            stdout.flush()?;
         }
-    }
+        Ok(())
+    });
+    let relayed = relay(&mut output, &mut cursor, &mut replies, &frames);
+    // Whatever ended the relay, forward what it already read before failing.
+    drop(frames);
+    let forwarded = forwarder
+        .join()
+        .map_err(|_| anyhow::anyhow!("The terminal output forwarder panicked"))?;
+    relayed?;
+    forwarded?;
     let mut status = 0;
     // The only child is retained until this exact PID is reaped.
     while unsafe { libc::waitpid(child, &mut status, 0) } < 0 {
@@ -83,6 +91,37 @@ fn main() -> Result<ExitCode> {
         128 + libc::WTERMSIG(status)
     };
     Ok(ExitCode::from(u8::try_from(code)?))
+}
+
+/// Reads the PTY until the CLI hangs up, answers cursor queries at once and
+/// queues every read for stdout. Ends early when the forwarder has stopped.
+fn relay(
+    output: &mut File,
+    cursor: &mut Option<CursorReport>,
+    replies: &mut InputWriter,
+    frames: &std::sync::mpsc::Sender<Vec<u8>>,
+) -> Result<()> {
+    let mut bytes = [0; 8192];
+    loop {
+        match output.read(&mut bytes) {
+            Ok(0) => return Ok(()),
+            Ok(length) => {
+                // Queued first, so a failed cursor reply cannot drop this read.
+                // The forwarder drops the queue only when stdout failed, and
+                // its join reports that failure.
+                let forwarding = frames.send(bytes[..length].to_vec()).is_ok();
+                if let Some(cursor) = cursor {
+                    cursor.observe(&bytes[..length], replies)?;
+                }
+                if !forwarding {
+                    return Ok(());
+                }
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 /// Keyboard chunks and cursor reports share one byte stream. Keep complete
