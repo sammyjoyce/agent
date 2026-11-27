@@ -163,9 +163,7 @@ func twoCoordinatorFeedRoutesOnlyToAddressedCoordinators() async throws {
   ]
 
   // The single-address build kept its address in defaults and its queue under sha256("host:port").
-  let suite = "two-coordinator-e2e-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   defaults.set(workAddress.host, forKey: "coordinatorAddress")
   let key = SHA256.hash(data: Data("\(workAddress.host):\(workAddress.port)".utf8)).map {
     String(format: "%02x", $0)

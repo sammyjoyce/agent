@@ -1084,10 +1084,8 @@
       @MainActor @Test(.timeLimit(.minutes(1)))
       func aQuietCoordinatorShownAloneGetsNoBannerWhileAnotherPairs() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-        let suite = "one-scope-pairing-\(UUID())"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = TestPreferences()
         defer {
-          defaults.removePersistentDomain(forName: suite)
           try? FileManager.default.removeItem(at: root)
         }
         let workPeer = FixtureCoordinator()
@@ -1186,10 +1184,8 @@
       @MainActor @Test(.timeLimit(.minutes(1)))
       func aColdLaunchTapIsSeen() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-        let suite = "cold-alert-\(UUID())"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = TestPreferences()
         defer {
-          defaults.removePersistentDomain(forName: suite)
           try? FileManager.default.removeItem(at: root)
         }
         let workPeer = FixtureCoordinator()
@@ -1323,12 +1319,10 @@
           let directory = ProfileDirectory(profile.id, applicationSupport: root, caches: root)
           model.attach(Lane(id: profile.id, session: nil))
         }
-        // The ink check reads dark text, whatever appearance an earlier test left the app in.
-        let defaults = UserDefaults.standard
-        let appearance = defaults.object(forKey: AppAppearance.preferenceKey)
+        let defaults = TestPreferences()
         defaults.set(AppAppearance.light.rawValue, forKey: AppAppearance.preferenceKey)
-        defer { defaults.set(appearance, forKey: AppAppearance.preferenceKey) }
-        let host = UIHostingController(rootView: MainChatView(model: model, dictation: dictation))
+        let host = UIHostingController(
+          rootView: MainChatView(model: model, dictation: dictation).defaultAppStorage(defaults))
         if let size { host.traitOverrides.preferredContentSizeCategory = size }
         let scene = try #require(
           UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)

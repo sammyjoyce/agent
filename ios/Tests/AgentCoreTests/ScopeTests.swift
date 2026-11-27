@@ -477,9 +477,7 @@ private func imageProvider(in root: URL) throws -> NSItemProvider {
   /// A scope switch shows another feed with fresh rows and is remembered for the device. It never
   /// changes who the draft goes to. A draft to both reads where it would go until it is narrowed.
   @MainActor @Test func showingACoordinatorRebuildsTheFeedAndNeverReaddressesTheDraft() throws {
-    let suite = "scope-\(UUID())"
-    let defaults = try #require(UserDefaults(suiteName: suite))
-    defer { defaults.removePersistentDomain(forName: suite) }
+    let defaults = TestPreferences()
     let root = try temporaryRoot()
     defer { try? FileManager.default.removeItem(at: root) }
     let chat = ChatModel(scope: ScopePreference(defaults: defaults))
@@ -886,9 +884,7 @@ private func imageProvider(in root: URL) throws -> NSItemProvider {
     defer { listener.cancel() }
     let root = try temporaryRoot()
     defer { try? FileManager.default.removeItem(at: root) }
-    let suite = "scope-\(UUID())"
-    let defaults = try #require(UserDefaults(suiteName: suite))
-    defer { defaults.removePersistentDomain(forName: suite) }
+    let defaults = TestPreferences()
     var work = CoordinatorProfile(
       name: try TagName("Work"), address: try CoordinatorAddress(host: "100.64.1.2", port: 4001))
     work.pin = workFixture.id

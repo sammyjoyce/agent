@@ -9,8 +9,7 @@ import Testing
 /// What the single-address build left on disk, with invented data.
 private struct LegacyInstall {
   let root: URL
-  let suite: String
-  let defaults: UserDefaults
+  let defaults: TestPreferences
   let address: CoordinatorAddress
   /// The build's one alert installation ID, which its coordinator may still hold.
   let installation: String
@@ -36,8 +35,7 @@ private struct LegacyInstall {
   init(host: String = "100.64.1.2", port: String? = nil, alerts: Bool = false) async throws {
     let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
     let support = root.appending(path: "Support")
-    let suite = "legacy-install-\(UUID())"
-    let defaults = try #require(UserDefaults(suiteName: suite))
+    let defaults = TestPreferences()
     defaults.set(host, forKey: "coordinatorAddress")
     if let port { defaults.set(port, forKey: "coordinatorPort") }
     let installation = UUID().uuidString
@@ -67,7 +65,6 @@ private struct LegacyInstall {
     try files.createDirectory(at: previews, withIntermediateDirectories: true)
     try Data("preview".utf8).write(to: previews.appending(path: "Preview.png"))
     self.root = root
-    self.suite = suite
     self.defaults = defaults
     self.address = address
     self.installation = installation
@@ -79,7 +76,6 @@ private struct LegacyInstall {
   }
 
   func remove() {
-    defaults.removePersistentDomain(forName: suite)
     try? FileManager.default.removeItem(at: root)
   }
 
@@ -303,10 +299,8 @@ func aSecondMigrationNamesItsCoordinatorSoEachTagAddressesOne(_ first: String, _
   throws
 {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-  let suite = "if16-names-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
+  let defaults = TestPreferences()
   defer {
-    defaults.removePersistentDomain(forName: suite)
     try? FileManager.default.removeItem(at: root)
   }
   defaults.set(first, forKey: "coordinatorAddress")
@@ -342,9 +336,7 @@ func aSecondMigrationNamesItsCoordinatorSoEachTagAddressesOne(_ first: String, _
 func aDuplicateNameAnEarlierBuildSavedGetsTheFirstFreeOne(coordinator2Saved: Bool) async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "if17-names-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   func queue(_ text: String, in folder: URL) throws {
     try writePrivately(
       JSONEncoder().encode([
@@ -556,9 +548,7 @@ func aDuplicateNameAnEarlierBuildSavedGetsTheFirstFreeOne(coordinator2Saved: Boo
 func removingTheCoordinatorWhoseHeldMessagesCannotBeReadRemovesTheWarning() async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "two-holds-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   var work = CoordinatorProfile(
     name: try TagName("Work"), address: try CoordinatorAddress(host: "100.64.1.2", port: 4001))
   work.pin = CoordinatorID(UUID())
@@ -919,9 +909,7 @@ func anOldCoordinatorLeavesTheProfileUnpairedUntilItAnswers() async throws {
   defer { listener.cancel() }
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "work-added-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let coordinators = Coordinators(
     registration: nil, defaults: defaults, applicationSupport: root, caches: root,
     transport: loopback(port))
@@ -1029,9 +1017,7 @@ func anAddressEditIsProbedAgainstThePinBeforeAnythingIsSaved() async throws {
   let routes: [UInt16: NWEndpoint] = [4001: rightPort, 4002: wrongPort, 4003: rightPort]
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "edit-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let coordinators = Coordinators(
     registration: nil, defaults: defaults, applicationSupport: root, caches: root,
     transport: CoordinatorTransport { address in
@@ -1090,9 +1076,7 @@ func aRefusedAddressEditKeepsTheQueueAndNeverSendsTheUserToRemove(_ typo: String
   let routes: [UInt16: NWEndpoint] = [4001: workPort, 4002: personalPort, 4005: strangerPort]
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "edit-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let coordinators = Coordinators(
     registration: nil, defaults: defaults, applicationSupport: root, caches: root,
     transport: CoordinatorTransport { address in
@@ -1193,9 +1177,7 @@ func aLaneWhoseAddressAnswersAsAnotherSavedCoordinatorNamesItAndNeverSendsTheUse
   let routes = Routes([4001: workPort, 4002: personalPort])
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "swap-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let coordinators = Coordinators(
     registration: nil, defaults: defaults, applicationSupport: root, caches: root,
     transport: CoordinatorTransport { address in
@@ -1332,9 +1314,7 @@ func twoEditsToOneNameRunInTurnAndOnlyTheFirstSaves() async throws {
   let gate = ProbeGate()
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "edit-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let coordinators = Coordinators(
     registration: nil, defaults: defaults, applicationSupport: root, caches: root,
     transport: CoordinatorTransport { address in
@@ -1545,9 +1525,7 @@ func launchDeletesTheFilesOfEveryProfileThatIsNoLongerSavedAndKeepsEveryHeldFold
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
   let caches = root.appending(path: "Caches")
-  let suite = "launch-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let saved = CoordinatorProfile(
     name: try TagName("Work"), address: try CoordinatorAddress(host: "100.64.1.2"))
   let recorded = HeldQueue(address: saved.address, installation: nil)
@@ -1608,9 +1586,7 @@ func aReinstalledCoordinatorsBannerCountsWhatRemoveDeletes(queued: Bool) async t
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
   let support = root.appending(path: "Support")
-  let suite = "reinstalled-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   defaults.set("100.64.1.2", forKey: "coordinatorAddress")
   defaults.set("4001", forKey: "coordinatorPort")
   let old = LegacyInstall.outbox(support, "100.64.1.2", 4001)
@@ -1690,9 +1666,7 @@ func removeNeverCallsAnUnreadableQueueEmpty() async throws {
   defer { listener.cancel() }
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "remove-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   // A queue the single-address build left for the address Work is added at, so it is Work's.
   let queue = HeldQueue(address: try CoordinatorAddress(host: "100.64.1.2"), installation: nil)
   try queue.record(in: queue.folder(applicationSupport: root))
@@ -2087,9 +2061,7 @@ func theBuildsAlertInstallationIsWithdrawnWhenItsCoordinatorIsAddedFirst(_ alert
 func anInstallationThePreviousBuildSavedOnTheMigratedProfileIsStillWithdrawn() async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "previous-build-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let installation = UUID().uuidString
   let file = root.appending(path: "Agent/profiles.json")
   try FileManager.default.createDirectory(
@@ -2355,9 +2327,7 @@ func aPreviousBuildsFileWithTheBuildsCoordinatorPairedAtItsAddressBindsWhatItLef
 {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "if15-b1-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   defaults.set(false, forKey: "notificationsEnabled")
   let old = UUID().uuidString
   let used = FixtureCoordinator()
@@ -2425,9 +2395,7 @@ func aPreviousBuildsFileWithTheBuildsCoordinatorPairedAtItsAddressBindsWhatItLef
 func heldMessagesWithNoRecordedAddressAskWithoutClaimingNothingIsPairedThere() async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "if15-b2-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let used = FixtureCoordinator()
   let (listener, port) = try await listen(used)
   defer { listener.cancel() }
@@ -2509,9 +2477,7 @@ func restoresNoteSaysNobodyIsPairedAtTheAddressOnlyWhenNobodyIs(
 ) async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "r21r-note-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let personal = FixtureCoordinator()
   let (listener, port) = try await listen(personal)
   defer { listener.cancel() }
@@ -2587,9 +2553,7 @@ func restoresNoteSaysNobodyIsPairedAtTheAddressOnlyWhenNobodyIs(
 func restoresQuestionEndsOnceTheHeldMessageGainsAnOwner(_ path: String) async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "r22d-asking-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let work = FixtureCoordinator()
   let personal = FixtureCoordinator()
   let (workListener, workPort) = try await listen(work)
@@ -2668,9 +2632,7 @@ func restoresQuestionEndsOnceTheHeldMessageGainsAnOwner(_ path: String) async th
 func aChoiceMadeBeforeTheHeldMessageGainedAnOwnerRestoresNothing() async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "r22f-stale-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let work = FixtureCoordinator()
   let personal = FixtureCoordinator()
   let (workListener, workPort) = try await listen(work)
@@ -2754,9 +2716,7 @@ func renamingOneOfTwoCoordinatorsAtAHeldMessagesAddressLeavesItUnowned(_ renamed
 {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "r22f-rename-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let personal = FixtureCoordinator()
   let (listener, port) = try await listen(personal)
   defer { listener.cancel() }
@@ -2920,9 +2880,7 @@ func aSecondMigrationAddressesEachHeldMessageToTheCoordinatorAtItsOwnAddress(_ w
 func aPreviousBuildsOriginStaysWithTheMessagesItHeld(_ state: String) async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "if15-origin-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let work = FixtureCoordinator()
   let (listener, port) = try await listen(work)
   defer { listener.cancel() }
@@ -3103,7 +3061,7 @@ private enum ShippedBuild {
   /// file lists at that address with `notificationInstallationID` unless it lists that ID already,
   /// and a profile is saved there. A queue no coordinator took goes to the only profile pinned at its
   /// address. Then every unlisted folder is deleted.
-  static func launch(defaults: UserDefaults, support: URL, caches: URL) throws -> [URL] {
+  static func launch(defaults: TestPreferences, support: URL, caches: URL) throws -> [URL] {
     var saved = Saved(profiles: [], withdrawals: [], held: [])
     if let data = try? Data(contentsOf: file(support)) {
       saved = try JSONDecoder().decode(Saved.self, from: data)
@@ -3653,7 +3611,7 @@ func aBindingTheShippedBuildMadeAfterALaunchStoppedOutlivesThatLaunchsRecord(
 
 /// A launch of this build on a disk too full to save `profiles.json`, where a folder can still be
 /// made: each held folder moves into `Agent/HeldQueues`, and the save after the moves fails.
-@MainActor private func launchWhoseSaveFails(defaults: UserDefaults, root: URL) throws {
+@MainActor private func launchWhoseSaveFails(defaults: TestPreferences, root: URL) throws {
   let agent = root.appending(path: "Agent")
   try FileManager.default.createDirectory(
     at: agent.appending(path: "HeldQueues"), withIntermediateDirectories: true)
@@ -3708,9 +3666,7 @@ func aBindingTheShippedBuildMadeAfterALaunchStoppedOutlivesThatLaunchsRecord(
 func aBindingTheShippedBuildListedStaysWithTheNoteItWasForAfterAFailedSave() async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "r21r-chain-l-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let work = FixtureCoordinator()
   let personal = FixtureCoordinator()
   let (workListener, workPort) = try await listen(work)
@@ -3802,9 +3758,7 @@ func theOldInstallationIsWithdrawnAfterTheShippedBuildBoundALaterFolderAndASaveF
 {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "r21r-chain-c-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let work = FixtureCoordinator()
   let (workListener, workPort) = try await listen(work)
   defer { workListener.cancel() }
@@ -3924,7 +3878,7 @@ private struct RestoredAndSent {
 }
 
 @MainActor private func restoreAndSend(
-  root: URL, defaults: UserDefaults, work: FixtureCoordinator, workPort: NWEndpoint,
+  root: URL, defaults: TestPreferences, work: FixtureCoordinator, workPort: NWEndpoint,
   personal: FixtureCoordinator, personalPort: NWEndpoint
 ) async throws -> RestoredAndSent {
   let routes = Routes([4002: workPort, 43187: personalPort])
@@ -3982,9 +3936,7 @@ private struct RestoredAndSent {
 func aLegacyFolderKeepsWhatOriginSaidOnceALaunchStoppedAfterSavingWithoutIt() async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "r20t-record-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let work = FixtureCoordinator()
   let personal = FixtureCoordinator()
   let (workListener, workPort) = try await listen(work)
@@ -4033,9 +3985,7 @@ func aLegacyFolderKeepsWhatOriginSaidOnceALaunchStoppedAfterSavingWithoutIt() as
 func theOriginNinePairedAfterAFailedSaveOutlivesThatLaunchsRecord() async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "r20t-origin-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let work = FixtureCoordinator()
   let personal = FixtureCoordinator()
   let (workListener, workPort) = try await listen(work)
@@ -4166,9 +4116,7 @@ func removeDeletesOnlyTheHeldQueuesItsConfirmationCounted(_ removing: String) as
 func aPreviousBuildsOriginGoesOnlyToTheFolderItDescribes() async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "if16-origin-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let work = FixtureCoordinator()
   let personal = FixtureCoordinator()
   let (workListener, workPort) = try await listen(work)
@@ -4243,9 +4191,7 @@ func aPreviousBuildsOriginGoesOnlyToTheFolderItDescribes() async throws {
 func aRecordOfAQueueAlreadyHeldGivesNothingToALaterLegacyFolder() async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "if17-chain-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let work = FixtureCoordinator()
   let personal = FixtureCoordinator()
   let (workListener, workPort) = try await listen(work)
@@ -4327,9 +4273,7 @@ func aRecordOfAQueueAlreadyHeldGivesNothingToALaterLegacyFolder() async throws {
 func anOutboxAnEarlierBuildLeftIsHeldAtTheAddressItWasQueuedFor(_ host: String) async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "if16-outbox-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let migrated = ProfileID()
   let installation = UUID().uuidString
   try writePrivately(
@@ -4378,9 +4322,7 @@ func twoQueuesAtOneAddressBindOnOnePairing() async throws {
   let root = files.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? files.removeItem(at: root) }
   let support = root.appending(path: "Support")
-  let suite = "if16-two-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let used = FixtureCoordinator()
   let installations = [UUID().uuidString, UUID().uuidString]
   for installation in installations {
@@ -4440,9 +4382,7 @@ func twoQueuesAtOneAddressBindOnOnePairing() async throws {
 func eachCoordinatorHoldingTheOldInstallationGetsItsOwnWithdrawal() async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "if18-r4-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let work = FixtureCoordinator()
   let personal = FixtureCoordinator()
   let installation = UUID().uuidString
@@ -4533,9 +4473,7 @@ func eachCoordinatorHoldingTheOldInstallationGetsItsOwnWithdrawal() async throws
 func aQueueRemoveDeletedGivesNothingToALaterLegacyFolder() async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "if18-r2-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let work = FixtureCoordinator()
   let personal = FixtureCoordinator()
   let (workListener, workPort) = try await listen(work)
@@ -4632,9 +4570,7 @@ func theShippedBuildMovesNoOutboxIntoAQueueAStoppedMigrationNamed(
 ) async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "if18-r3-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   var installations = [UUID().uuidString]
   func singleAddressBuild(_ text: String, at address: CoordinatorAddress) throws {
     defaults.set(address.host, forKey: "coordinatorAddress")
@@ -4699,9 +4635,7 @@ func anAlertInstallationAStoppedMigrationKeptOutlivesTheShippedBuild(
 ) async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "if18-s2-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   @MainActor func launch() -> Coordinators {
     Coordinators(
       registration: nil, defaults: defaults, applicationSupport: root, caches: root,

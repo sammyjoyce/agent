@@ -640,9 +640,7 @@ enum SpoiledOutbox: CaseIterable, Sendable {
   defer { personalListener.cancel() }
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "launch-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let launch = {
     Coordinators(
       registration: nil, defaults: defaults, applicationSupport: root, caches: root,

@@ -471,9 +471,7 @@ actor WorkRoute {
   defer { secondListener.cancel() }
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "feed-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let coordinators = Coordinators(
     registration: registration, defaults: defaults, applicationSupport: root, caches: root,
     transport: CoordinatorTransport { address in
@@ -1399,9 +1397,7 @@ func aMessageToBothStagedOnlyAtWorkBeforeAKillReadsUnknownAtPersonal() async thr
   defer { personalListener.cancel() }
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "kill-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   @MainActor func launch() -> Coordinators {
     Coordinators(
       registration: nil, defaults: defaults, applicationSupport: root, caches: root,
@@ -1461,9 +1457,7 @@ func aMessageToBothReadsUnknownAtACoordinatorWhoseLedgerCouldNotBeRead() async t
   defer { personalListener.cancel() }
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "unreadable-ledger-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   @MainActor func launch() -> Coordinators {
     Coordinators(
       registration: nil, defaults: defaults, applicationSupport: root, caches: root,
@@ -1721,9 +1715,7 @@ func aMessageToBothReadsUnknownAtACoordinatorWhoseOutboxCouldNotBeRead() async t
   defer { personalListener.cancel() }
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "unreadable-outbox-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   @MainActor func launch() -> Coordinators {
     Coordinators(
       registration: nil, defaults: defaults, applicationSupport: root, caches: root,
@@ -3219,9 +3211,7 @@ func aHeldMessageRestoredWithOneCoordinatorStaysItsOnceAnotherIsAdded() async th
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
   let support = root.appending(path: "Support")
-  let suite = "unpaired-held-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   defaults.set("100.64.1.2", forKey: "coordinatorAddress")
   defaults.set("4001", forKey: "coordinatorPort")
   let key = SHA256.hash(data: Data("100.64.1.2:4001".utf8)).map { String(format: "%02x", $0) }

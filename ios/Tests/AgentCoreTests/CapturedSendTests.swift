@@ -12,7 +12,7 @@ private struct Lab {
   let workFixture: FixtureCoordinator
   let personalFixture: FixtureCoordinator
   let root: URL
-  let defaults: UserDefaults
+  let defaults: TestPreferences
   let inbox: SharedDraftInbox
   let transport: CoordinatorTransport
 
@@ -47,9 +47,7 @@ private struct Lab {
   defer { personalListener.cancel() }
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "captured-send-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let lab = Lab(
     workFixture: workFixture, personalFixture: personalFixture, root: root, defaults: defaults,
     inbox: SharedDraftInbox(containerURL: root),

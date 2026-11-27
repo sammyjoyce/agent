@@ -37,10 +37,8 @@ struct SiriOnscreenEntityTests {
 
   @Test func anOnscreenIdentifierIsTheOneTheQueryReturns() throws {
     let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-    let suite = "siri-onscreen-\(UUID())"
-    let defaults = try #require(UserDefaults(suiteName: suite))
+    let defaults = TestPreferences()
     defer {
-      defaults.removePersistentDomain(forName: suite)
       try? FileManager.default.removeItem(at: root)
     }
     let work = try profile("Work", 0)
