@@ -245,7 +245,8 @@ then serves concurrent siblings and lazy re-presentation of existing work.
 Transport errors do not authorize retirement. A newer confirmed worker or
 workspace revision invalidates stale absence observations. After a Rex restart,
 an existing session can be reused only after positive verification of its exact
-recorded pane and host under the current native identity; no label adoption.
+recorded pane and host under the current native identity, or proof that the
+pane closed with its program. Labels are never adopted.
 
 They return results to their parent; the parent returns the outcome to the
 main chat. The same task cannot acquire a second active execution. Recent task
@@ -340,6 +341,35 @@ The recipient retains its owning outcome while using relevant new context.
 Resuming an existing terminal retains its complete binding through failures and
 coordinator restarts. An uncertain resume cannot discard a known folder.
 
+A task's pane lives as long as its program. The host asks Rex to close each
+pane it creates when its program exits, with a quick-exit threshold of zero, so
+a quick failure closes its pane too. When you quit a task's terminal, or its
+`run-task` is killed, Rex closes the pane, and the next presentation opens the
+task's terminal in a new window of the same session. A session whose last pane
+closed stays in Rex, empty, until then.
+
+A pane that closes takes its screen with it, so `run-task` does not exit while
+it still shows you where your unsent input went. When `run-task` fails, for
+example because it lost its coordinator, it saves the unsent input to a private
+recovery file. It then prints the file's path and waits for Enter before it
+exits. If the save fails, it prints the input and waits in the same way. While
+it waits, it reports to Rex that it is blocked, so the pane's tab and the
+session picker show that it needs you. A `run-task` that kept nothing exits at
+once, so a failure at startup leaves no pane. SIGTERM and SIGHUP ask `run-task`
+to end. It saves the unsent input, prints the path and exits without waiting.
+If that save fails, it prints the input and waits for Enter as above, because
+the input would leave with the pane. A second signal or a closed terminal ends
+that wait. When you quit the terminal yourself, it saves nothing.
+
+A recorded pane that closed with its program still proves its session, because
+Rex keeps the session and no longer has the block. So a create whose program
+exits before the host confirms it stays confirmed, and a subagent's window
+still opens in its task's session after the task's pane closed. A block that
+Rex still has but does not show in its window on this host proves nothing.
+Only panes that Beep Boop recorded get this allowance. A feedback origin names
+a pane that the caller chose, so the feedback terminal opens in that pane's
+session only while Rex shows the pane in its window on this host.
+
 A binding records a Rex server instance ID. When the host creates a terminal,
 it records the instance it read just before the create. When a terminal
 confirms a lost reply by attaching, the binding records the instance that the
@@ -357,14 +387,39 @@ The host reads the instance after it reads the pane's process. A binding with
 no recorded instance proves nothing. An exited pane, and a pane whose process
 is not the task's terminal, get a replacement terminal in the same session.
 
-The host closes the old pane only after Rex reports that its process exited,
-and it leaves a restored shell open, because you may have used it. That rule
-has two costs. Each Rex restart that a presentation follows leaves one more
-restored shell window in the task's session, each with its own shell process,
-and nothing removes them. Rex also has no call that closes a pane only if its
-process has exited. If Rex restarts between the host's exit check and its
-`block.close`, the close reaches the restored shell and ends any command you
-started there.
+Once the replacement runs, the host closes the old pane only if it holds the
+task's own exit, under the instance that started the terminal. The host never
+closes a shell that anyone could see, because you may have typed in it. A
+restored shell, a pane the host cannot read, and a pane whose binding records
+no instance stay where you can see them. An exit under another instance stays
+too, because it may be a restored shell that you left.
+
+Rex has no call that closes a pane only if its process has exited, so the host
+guards the close. It records the instance, detaches the pane from its window so
+that nobody can type in it, and reads the pane again. It closes the pane only
+if it shows the same exit under the same instance. Rex's answer that the pane
+is gone counts as closed. Anything else goes back into view in a window of its
+own, named as the pane was. Rex places a detached pane only beside a placed
+one, so the host opens that window with a placeholder labelled
+`beep-boop:placeholder` and moves the pane beside it. The placeholder runs
+`sleep` and closes itself when the sleep ends. It sleeps for 24 seconds, three
+times the host's timeout for one Rex call, so it outlives the call that creates
+it and the move. The host never closes it, because a close sent after a Rex
+restart would reach the shell that Rex restored in its place, in view. A failed
+move proves nothing. Rex's answer that a block is gone may mean the
+placeholder, and any other error may hide a move that landed. So after any
+failed move the host lists the session's blocks. The pane counts as closed only
+when Rex no longer lists it, and as back in view when Rex lists it as placed.
+If Rex lists it as still detached, the host moves it beside one fresh
+placeholder. If that move fails too and the pane is still detached, the host
+reports that the pane may be detached from every window. It reports the same if
+the listing fails. The host opens at most two placeholders for one pane.
+
+The guarded close has two costs. Each Rex restart that a presentation follows
+leaves one more restored shell window in the task's session, each with its own
+shell process, and nothing removes them. A restart between the second read and
+the close still lets the close reach a shell. Rex restored it a moment before in
+the detached pane, which no client shows, so nobody could have typed in it.
 
 A terminal's own attachment is the receipt for a lost reply. A `run-task`
 terminal presents its allocation ID, which only its launch command carries. If
@@ -378,10 +433,10 @@ not start, and the binding stays ready for the next attempt.
 
 When a resume stays unconfirmed and the recorded pane no longer runs the task's
 terminal, the next presentation resumes once under a fresh allocation ID. That
-ID refuses a late terminal from the unconfirmed attempt, which can leave one
-exited pane in the session. A failed inspection changes nothing and leaves the
-input queued. The create of a new session is never repeated while its outcome
-is unknown.
+ID refuses a late terminal from the unconfirmed attempt. The refused terminal's
+program exits, and Rex closes its pane. A failed inspection changes nothing and
+leaves the input queued. The create of a new session is never repeated while
+its outcome is unknown.
 
 This reconciliation runs when a task is next presented: when input arrives with
 no terminal attached, or when you open the task. Nothing sweeps tasks after a
@@ -949,9 +1004,11 @@ microphone audio sent to Scrawl. Pi's existing inference interfaces remain the
 model boundary.
 
 After a Rex server restart, a task's pane holds a restored shell until the task
-is next presented. A sweep that replaces restored panes without a presentation
-is not built. A `run-task` terminal does not reconnect when its coordinator
-connection drops. It exits, and the next presentation replaces it.
+is next presented. The presentation opens a new pane, and the restored shell
+stays yours. A sweep that closes restored panes is not built. A `run-task`
+terminal does not reconnect when its coordinator connection drops. It exits,
+after it waits for Enter if it saved unsent input. Rex then closes its pane,
+and the next presentation opens a new one.
 
 ## Validation
 

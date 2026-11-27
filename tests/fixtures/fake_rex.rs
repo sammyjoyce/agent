@@ -10,6 +10,7 @@ pub const ORIGIN_SESSION: &str = "session:11111111-1111-4111-8111-111111111111";
 pub const ORIGIN_WINDOW: &str = "window:22222222-2222-4222-8222-222222222222";
 pub const ORIGIN_BLOCK: &str = "block:33333333-3333-4333-8333-333333333333";
 pub const CREATED_SESSION: &str = "session:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+pub const PLACEHOLDER_BLOCK: &str = "block:f1f1f1f1-f1f1-41f1-81f1-f1f1f1f1f1f1";
 /// The missing socket from the live dead-socket probe, so the fixture's
 /// stderr matches what Rex printed byte for byte.
 pub const DEAD_ENDPOINT: &str = "unix:///run/user/1000/rex-probe-dead/missing.sock";

@@ -8,8 +8,9 @@
  */
 import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { parseArgs } from "node:util";
 import { execFileAsync, isRecord, now, PrivateCoordinator, SecretScanner, waitFor } from "./chrome-lab.js";
 
@@ -29,6 +30,10 @@ mkdirSync(evidence, { recursive: true });
 const tag = "rexlab-" + randomBytes(4).toString("hex");
 const nonce = randomBytes(6).toString("hex");
 const MARKER = "REXLAB_MARKER_" + nonce;
+const PRESENTED = "REXLAB_PRESENTED_" + nonce;
+const HELD = "REXLAB_HELD_" + nonce;
+const TERM_DRAFT = "REXLAB_TERM_DRAFT_" + nonce, KILL_DRAFT = "REXLAB_KILL_DRAFT_" + nonce;
+const UNSAVED = "REXLAB_UNSAVED_" + nonce, UNSAVED_DRAFT = "REXLAB_UNSAVED_DRAFT_" + nonce;
 const key = (phase: Phase) => tag + ":" + phase;
 const seen: Seen[] = [];
 const finals = new Map<Phase, string>();
@@ -245,7 +250,7 @@ async function rex(args: string[]): Promise<string> {
   return stdout;
 }
 type Binding = { session_id: string; block_id: string; host_id: string; rex_instance_id?: string };
-type TaskView = { title: string; state: { state: string }; worker: { state: string; binding?: Binding } };
+type TaskView = { id: string; title: string; state: { state: string }; worker: { state: string; binding?: Binding } };
 async function labTask(): Promise<TaskView | undefined> {
   for (const line of (await coordinator.cli(["--json", "tasks", "list"], 60_000)).split("\n")) {
     let event: unknown;
@@ -253,6 +258,181 @@ async function labTask(): Promise<TaskView | undefined> {
     if (isRecord(event) && event.type === "tasks" && Array.isArray(event.tasks)) return (event.tasks as TaskView[]).find((task) => task.title === "Rex lab " + tag);
   }
   return undefined;
+}
+
+type Listed = { block_id: string; placement: string };
+type Held = { child?: { pid: number; path?: string } | null; foreground?: { pid: number } | null; last_exit?: { exit_code: number } | null };
+async function listed(session: string): Promise<Listed[]> {
+  return (JSON.parse(await rex(["api", "call", "session.list_blocks", JSON.stringify({ session_id: session })])) as { blocks: Listed[] | null }).blocks ?? [];
+}
+async function held(session: string, block: string): Promise<Held | "gone"> {
+  try {
+    return JSON.parse(await rex(["api", "call", "com.superlogical.terminal.process", JSON.stringify({ session_id: session, block_id: block, args: {} })])) as Held;
+  } catch (error) {
+    if (isRecord(error) && String(error.stderr).includes("code=not_found")) return "gone";
+    throw error;
+  }
+}
+type StatusRecord = { id?: string | null; state?: string; app?: string | null; msg?: string | null };
+/** The program status records Rex holds for a block. The root record has no id. */
+async function programStatus(session: string, block: string): Promise<StatusRecord[]> {
+  return (JSON.parse(await rex(["api", "call", "com.superlogical.terminal.program_status",
+    JSON.stringify({ session_id: session, block_id: block, args: {} })])) as { records: StatusRecord[] | null }).records ?? [];
+}
+const runs = (seen: Held | "gone") => seen !== "gone" && (seen.child ?? seen.foreground ?? null) !== null;
+async function stoppedAt(session: string, block: string, timeoutMs: number): Promise<number | undefined> {
+  return waitFor("the program in " + block + " to stop", timeoutMs, async () => runs(await held(session, block)) ? undefined : Date.now(), 100)
+    .catch(() => undefined);
+}
+async function leftRex(session: string, block: string, stopped: number): Promise<{ left_ms: number } | { remained: unknown }> {
+  for (;;) {
+    const entry = (await listed(session)).find((item) => item.block_id === block);
+    if (entry === undefined) return { left_ms: Date.now() - stopped };
+    if (Date.now() - stopped > 2_000) return { remained: { entry, process: await held(session, block) } };
+    await delay(100);
+  }
+}
+
+const capture = (session: string, block: string) => rex(["capture", "-s", session, "-b", block, "--trim"]);
+async function typeDraft(session: string, block: string, draft: string): Promise<boolean> {
+  await rex(["send", "-s", session, "-b", block, draft]);
+  return waitFor("the draft on the worker's screen", 15_000, async () => (await capture(session, block)).includes(draft) ? true : undefined, 500)
+    .catch(() => false);
+}
+/** The recovery files that hold `draft`, among those the lab's run-task processes wrote. */
+function recoveriesOf(draft: string): string[] {
+  const directory = join(coordinator.dir, "state", "recovery");
+  let names: string[];
+  try { names = readdirSync(directory); } catch { return []; }
+  return names.filter((name) => name.startsWith("tui-draft-")).map((name) => join(directory, name))
+    .filter((path) => (JSON.parse(readFileSync(path, "utf8")) as { draft?: { text?: string } }).draft?.text === draft);
+}
+
+function labRunTaskPid(target: Held | "gone"): number | undefined {
+  return target !== "gone" && target.child?.path?.startsWith(realpathSync(beepBoop) + "/") === true ? target.child.pid : undefined;
+}
+
+const CTRL_C_PRESSES_TO_QUIT_A_WORKING_TUI = 2;
+async function paneLifecycle(taskId: string, session: string): Promise<Record<string, unknown>> {
+  const before = await Promise.all((await listed(session)).map(async (entry) => ({ ...entry, process: await held(session, entry.block_id) })));
+  const quitBlock = (await labTask())?.worker.binding?.block_id ?? "";
+  const running = before.some((entry) => entry.block_id === quitBlock && runs(entry.process));
+  check("P2a: the resolved task's worker still runs in its bound pane", running, { quit_block: quitBlock, before });
+  let presses = 0, quit: number | undefined;
+  while (running && quit === undefined && presses < CTRL_C_PRESSES_TO_QUIT_A_WORKING_TUI) {
+    await rex(["send-key", "-s", session, "-b", quitBlock, "ctrl+c"]);
+    presses += 1;
+    quit = await stoppedAt(session, quitBlock, 15_000);
+  }
+  check("P2a: Ctrl+C in the worker's TUI ends its run-task", quit !== undefined, { presses, process: await held(session, quitBlock) });
+  const quitLeft = quit === undefined ? undefined : await leftRex(session, quitBlock, quit);
+  check("P2a: the quit worker's block leaves session.list_blocks within 2 s", quitLeft !== undefined && "left_ms" in quitLeft, quitLeft);
+
+  const sent = await coordinator.send(taskId, PRESENTED + " Present the task again.");
+  const presented = await waitFor("the task's new worker pane", 120_000, async () => {
+    const binding = (await labTask())?.worker.binding;
+    return binding !== undefined && binding.block_id !== quitBlock ? binding : undefined;
+  }, 1000).catch(() => undefined);
+  const block = presented?.block_id ?? "";
+  const placed = presented === undefined ? undefined : (await listed(session)).find((item) => item.block_id === block);
+  check("P2c: presenting the task again opens a new worker pane in its session", presented?.session_id === session && placed?.placement === "placed",
+    { sent, presented, placed });
+  const screen = presented === undefined ? undefined : await waitFor("the new pane to show the presented input", 60_000, async () => {
+    const captured = await rex(["capture", "-s", session, "-b", block, "--trim"]);
+    return captured.includes(PRESENTED) ? captured : undefined;
+  }, 1000).catch(() => undefined);
+  const target = presented === undefined ? "gone" : await held(session, block);
+  check("P2c: the new worker pane attaches and shows the task's conversation", screen !== undefined && runs(target),
+    { screen: screen?.slice(-800), process: target });
+
+  const typed = screen !== undefined && await typeDraft(session, block, TERM_DRAFT);
+  const pid = labRunTaskPid(target);
+  if (pid !== undefined) process.kill(pid, "SIGTERM");
+  const killed = pid === undefined ? undefined : await stoppedAt(session, block, 10_000);
+  const killedLeft = killed === undefined ? undefined : await leftRex(session, block, killed);
+  check("P2b: after SIGTERM to the worker's run-task, its block leaves session.list_blocks within 2 s",
+    killedLeft !== undefined && "left_ms" in killedLeft, { pid, killed: killed !== undefined, left: killedLeft });
+  const termSaved = recoveriesOf(TERM_DRAFT);
+  check("P2d: SIGTERM to a worker's run-task that holds a draft leaves the draft in one recovery file",
+    typed && killed !== undefined && termSaved.length === 1, { typed, pid, saved: termSaved });
+  return { before, presses, quit_block: quitBlock, quit_left: quitLeft, presented, killed_pid: pid, killed_left: killedLeft, term_saved: termSaved };
+}
+
+const ASKS_FOR_ENTER = "Press Enter to close this terminal.";
+/** SIGTERM while the save fails. A file takes the recovery directory's place, so the save cannot make it. */
+async function unsavedDraft(taskId: string, session: string): Promise<Record<string, unknown>> {
+  const previous = (await labTask())?.worker.binding?.block_id;
+  const sent = await coordinator.send(taskId, UNSAVED + " Present the task again.");
+  const presented = await waitFor("the task's next worker pane", 120_000, async () => {
+    const binding = (await labTask())?.worker.binding;
+    return binding !== undefined && binding.block_id !== previous ? binding : undefined;
+  }, 1000).catch(() => undefined);
+  const block = presented?.block_id ?? "";
+  const attached = presented !== undefined && await waitFor("the next pane to show the input", 60_000,
+    async () => (await capture(session, block)).includes(UNSAVED) ? true : undefined, 1000).catch(() => false);
+  const typed = attached && await typeDraft(session, block, UNSAVED_DRAFT);
+  const recovery = join(coordinator.dir, "state", "recovery"), aside = recovery + ".aside";
+  if (existsSync(recovery)) renameSync(recovery, aside);
+  writeFileSync(recovery, "");
+  try {
+    const pid = labRunTaskPid(await held(session, block));
+    if (typed && pid !== undefined) process.kill(pid, "SIGTERM");
+    const shown = typed && pid !== undefined ? await waitFor("the pane to show the unsaved draft", 15_000, async () => {
+      const screen = await capture(session, block);
+      return screen.includes(ASKS_FOR_ENTER) ? screen : undefined;
+    }, 250).catch(() => "") : "";
+    await delay(3_000);
+    const stays = (await listed(session)).some((item) => item.block_id === block);
+    const status = !stays ? [] : await programStatus(session, block)
+      .catch((error: unknown): StatusRecord[] => [{ state: "unreadable: " + String(error).slice(0, 300) }]);
+    const blocked = status.some((record) => (record.id ?? null) === null && record.state === "blocked" && record.app === "beep-boop");
+    if (stays) await rex(["send-key", "-s", session, "-b", block, "enter"]);
+    const left = stays ? await leftRex(session, block, Date.now()) : undefined;
+    check("P2f: after SIGTERM while the save fails, the pane stays, shows the draft and reports blocked until Enter, then leaves",
+      typed && stays && shown.includes(UNSAVED_DRAFT) && blocked && left !== undefined && "left_ms" in left,
+      { sent, presented, attached, typed, pid, stays, screen: shown.slice(-800), status, left });
+    return { sent, presented, pid, stays, screen: shown.slice(-800), status, left };
+  } finally {
+    rmSync(recovery, { force: true });
+    if (existsSync(aside)) renameSync(aside, recovery);
+  }
+}
+
+const SAVED_NOTICE = "Unsent input saved privately to";
+/** Kills the lab's coordinator, so it runs last. */
+async function heldDraft(taskId: string, session: string): Promise<Record<string, unknown>> {
+  const previous = (await labTask())?.worker.binding?.block_id;
+  const sent = await coordinator.send(taskId, HELD + " Present the task once more.");
+  const presented = await waitFor("the task's next worker pane", 120_000, async () => {
+    const binding = (await labTask())?.worker.binding;
+    return binding !== undefined && binding.block_id !== previous ? binding : undefined;
+  }, 1000).catch(() => undefined);
+  const block = presented?.block_id ?? "";
+  const attached = presented !== undefined && await waitFor("the next pane to show the input", 60_000,
+    async () => (await capture(session, block)).includes(HELD) ? true : undefined, 1000).catch(() => false);
+  const typed = attached && await typeDraft(session, block, KILL_DRAFT);
+  if (typed) await coordinator.kill();
+  const listedStill = async () => (await listed(session)).some((item) => item.block_id === block);
+  const noticed = typed && await waitFor("the pane to name its recovery file or to leave", 30_000, async () =>
+    !(await listedStill()) || (await capture(session, block)).includes(SAVED_NOTICE) ? true : undefined, 250).catch(() => false);
+  await delay(3_000);
+  const stays = await listedStill();
+  const shown = stays ? await capture(session, block) : "";
+  check("P2e: a worker pane that holds a draft stays in Rex after its coordinator is killed", typed && stays,
+    { sent, presented, attached, typed, noticed, process: stays ? await held(session, block) : "gone" });
+  const saved = recoveriesOf(KILL_DRAFT);
+  const [path] = saved;
+  // Rex wraps a long path at the pane's width.
+  check("P2e: the pane shows the path of the one recovery file that holds the draft", saved.length === 1 && path !== undefined
+    && shown.replace(/\s+/g, "").includes(path), { saved, screen: shown.slice(-800) });
+  const status = !stays ? [] : await programStatus(session, block)
+    .catch((error: unknown): StatusRecord[] => [{ state: "unreadable: " + String(error).slice(0, 300) }]);
+  check("P2e: the held pane tells Rex that Beep Boop is blocked on you", status.some((record) =>
+    (record.id ?? null) === null && record.state === "blocked" && record.app === "beep-boop"), status);
+  if (stays) await rex(["send-key", "-s", session, "-b", block, "enter"]);
+  const left = stays ? await leftRex(session, block, Date.now()) : undefined;
+  check("P2e: after Enter the pane leaves session.list_blocks within 2 s", left !== undefined && "left_ms" in left, left);
+  return { sent, presented, saved, screen: shown.slice(-800), status, left };
 }
 
 const checks: { name: string; pass: boolean; observed: unknown }[] = [];
@@ -352,6 +532,9 @@ try {
     { binding, status: { instance_id: status.instance_id, host_id: status.host_id } });
   const resolved = await labTask();
   check("the task resolved", resolved?.state.state === "resolved", resolved?.state);
+  report.panes = await paneLifecycle(bound.id, binding.session_id);
+  report.unsaved = await unsavedDraft(bound.id, binding.session_id);
+  report.held = await heldDraft(bound.id, binding.session_id);
 } catch (error) {
   check("lab ran to completion", false, error instanceof Error ? error.stack : String(error));
 } finally {

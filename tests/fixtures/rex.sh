@@ -25,6 +25,11 @@ if [ "${AGENT_TEST_FAKE_REX_FAIL_AT-}" = "$method" ]; then
   printf 'Error: stream response "control-1" failed: connection reset\n' >&2
   exit 4
 fi
+if [ "${AGENT_TEST_FAKE_REX_FAIL_ONCE_AT-}" = "$method" ] && [ ! -e "$root/failed-once" ]; then
+  : > "$root/failed-once"
+  printf 'Error: stream response "control-1" failed: connection reset\n' >&2
+  exit 4
+fi
 if [ "${AGENT_TEST_FAKE_REX_DOWN_AT-}" = "$method" ]; then
   : > "$root/dead"
 fi
@@ -47,11 +52,29 @@ created_window=window:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
 created_block=block:cccccccc-cccc-4ccc-8ccc-cccccccccccc
 added_window=window:dddddddd-dddd-4ddd-8ddd-dddddddddddd
 added_block=block:eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee
+placeholder_window=window:f0f0f0f0-f0f0-40f0-80f0-f0f0f0f0f0f0
+placeholder_block=block:f1f1f1f1-f1f1-41f1-81f1-f1f1f1f1f1f1
+closed_blocks=" ${AGENT_TEST_FAKE_REX_GONE-} "
+shown() {
+  case "$closed_blocks" in *" $1 "*) return 1 ;; esac
+}
+# A closed block takes its window with it.
 block() {
-  printf '{"window_id":"%s","layers":[{"blocks":[{"block_id":"%s","host_id":"%s","flavor":"com.superlogical.terminal.shell"}]}]}' "$1" "$2" "$host"
+  if shown "$2"; then
+    printf '{"window_id":"%s","layers":[{"blocks":[{"block_id":"%s","host_id":"%s","flavor":"com.superlogical.terminal.shell"}]}]}' "$1" "$2" "$host"
+  fi
+}
+listed() {
+  if shown "$1"; then printf '{"block_id":"%s","label":"Chat","placement":"%s"}' "$1" "$2"; fi
+}
+joined() {
+  out=
+  for item do out="$out${out:+${item:+,}}$item"; done
+  printf '%s' "$out"
 }
 instance=66666666-6666-4666-8666-666666666666
-if [ -e "$root/restarted" ]; then instance=88888888-8888-4888-8888-888888888888; fi
+restored=
+if [ -e "$root/restarted" ]; then instance=88888888-8888-4888-8888-888888888888; restored=1; fi
 if [ "${AGENT_TEST_FAKE_REX_RESTART_AFTER-}" = "$method" ]; then
   : > "$root/restarted"
 fi
@@ -71,7 +94,10 @@ case "$method" in
   session.create)
     printf '{"session_id":"%s","initial_windows":[{"window_id":"%s","block_ids":["%s"],"revision":1}]}\n' "$created" "$created_window" "$created_block" ;;
   session.new_window)
-    printf '{"window_id":"%s","block_ids":["%s"],"revision":2}\n' "$added_window" "$added_block" ;;
+    case "$payload" in
+      *'"label":"beep-boop:placeholder"'*) printf '{"window_id":"%s","block_ids":["%s"],"revision":3}\n' "$placeholder_window" "$placeholder_block" ;;
+      *) printf '{"window_id":"%s","block_ids":["%s"],"revision":2}\n' "$added_window" "$added_block" ;;
+    esac ;;
   session.view)
     session=$(printf '%s' "$payload" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')
     if [ "$session" = "${AGENT_TEST_FAKE_REX_MISSING-}" ] ||
@@ -79,19 +105,50 @@ case "$method" in
       printf 'Error: stream response "control-1" failed: session %s not found (status=404 code=session_not_found)\n' "$session" >&2
       exit 3
     fi
-    windows="$(block "$created_window" "$created_block"),$(block "$added_window" "$added_block")"
-    if [ ! -e "$root/closed" ]; then windows="$(block "$origin_window" "$origin_block"),$windows"; fi
+    origin=
+    if [ ! -e "$root/closed" ] && [ ! -e "$root/detached" ]; then origin=$(block "$origin_window" "$origin_block"); fi
+    windows=$(joined "$origin" "$(block "$created_window" "$created_block")" "$(block "$added_window" "$added_block")")
     printf '{"session_id":"%s","revision":2,"windows":[%s]}\n' "$session" "$windows" ;;
+  session.list_blocks)
+    placement=placed
+    if [ -e "$root/detached" ]; then placement=detached; fi
+    origin=
+    if [ ! -e "$root/closed" ]; then origin=$(listed "$origin_block" "$placement"); fi
+    blocks=$(joined "$origin" "$(listed "$created_block" placed)" "$(listed "$added_block" placed)")
+    printf '{"blocks":[%s]}\n' "$blocks" ;;
+  session.detach_block)
+    case "$payload" in *"$origin_block"*) : > "$root/detached" ;; esac
+    printf '{"revision":3}\n' ;;
+  session.move_block)
+    case "${AGENT_TEST_FAKE_REX_MOVE_MISSING-}:$(ls "$root")" in
+      anchor-once:*move-refused*) ;;
+      pane:* | anchor:* | anchor-once:*)
+        missing=$placeholder_block
+        : > "$root/move-refused"
+        if [ "$AGENT_TEST_FAKE_REX_MOVE_MISSING" = pane ]; then missing=$origin_block; : > "$root/closed"; fi
+        printf 'Error: stream response "control-1" failed: block not found: %s (status=404 code=not_found)\n' "$missing" >&2
+        exit 3 ;;
+    esac
+    case "$payload" in *"$origin_block"*) rm -f "$root/detached" ;; esac
+    printf '{"revision":4}\n' ;;
   session.list)
     printf '{"sessions":[{"session_id":"session:99999999-9999-4999-8999-999999999999","label":"Unrelated"}]}\n' ;;
   session.move) printf '{}\n' ;;
   com.superlogical.terminal.process)
-    case "$payload" in
-      *"${AGENT_TEST_FAKE_REX_RUNNING:-<none>}"*) printf '{"child":{"pid":4242},"foreground":null,"last_exit":null}\n' ;;
+    block_id=$(printf '%s' "$payload" | sed -n 's/.*"block_id":"\([^"]*\)".*/\1/p')
+    if ! shown "$block_id"; then
+      printf 'Error: stream response "control-1" failed: block not found: %s (status=404 code=not_found)\n' "$block_id" >&2
+      exit 3
+    fi
+    # Rex restores every pane with a fresh shell.
+    case "$restored:$payload" in
+      1:* | *"${AGENT_TEST_FAKE_REX_RUNNING:-<none>}"*) printf '{"child":{"pid":4242},"foreground":null,"last_exit":null}\n' ;;
       *) printf '{"child":null,"foreground":null,"last_exit":{"exit_code":0}}\n' ;;
     esac ;;
   com.superlogical.terminal.format)
     printf '{"content":"<pre>Current task view 🦀</pre>\\n","eof":true}\n' ;;
-  block.close) : > "$root/closed"; printf '{}\n' ;;
+  block.close)
+    case "$payload" in *"$origin_block"*) : > "$root/closed" ;; esac
+    printf '{}\n' ;;
   *) printf 'Unexpected fixture method %s\n' "$method" >&2; exit 1 ;;
 esac

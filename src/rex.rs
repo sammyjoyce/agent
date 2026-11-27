@@ -406,19 +406,8 @@ impl RexClient {
         binding: &WorkerBinding,
         started_by: Option<Uuid>,
     ) -> Result<PaneHolds, RexError> {
-        let process: TerminalProcess = decode(
-            &self
-                .api(
-                    "com.superlogical.terminal.process",
-                    &ProcessRequest {
-                        session_id: binding.session_id.clone(),
-                        block_id: binding.block_id.clone(),
-                        args: Empty {},
-                    },
-                )
-                .await
-                .map_err(read_failure)?,
-        )?;
+        let process: TerminalProcess =
+            decode(&self.terminal_process(binding).await.map_err(read_failure)?)?;
         Ok(match (process.state(), started_by) {
             (TerminalState::Exited, _) => PaneHolds::Exited,
             (TerminalState::Pending, _) => PaneHolds::Pending,
@@ -433,18 +422,76 @@ impl RexClient {
         })
     }
 
-    /// A create is confirmed when Rex shows its pane in the session, and Rex
-    /// is still the host and instance that `identity` read before the create.
-    /// The worker reads its own Rex instance when it starts, and its claim
-    /// must match the receipt. A restart around the create leaves the earlier
-    /// read naming another instance.
+    async fn terminal_process(&self, pane: &WorkerBinding) -> Result<Vec<u8>, CallFailure> {
+        self.api(
+            "com.superlogical.terminal.process",
+            &ProcessRequest {
+                session_id: pane.session_id.clone(),
+                block_id: pane.block_id.clone(),
+                args: Empty {},
+            },
+        )
+        .await
+    }
+
+    async fn read_pane(&self, pane: &WorkerBinding) -> Result<PaneRead, RexError> {
+        let process: TerminalProcess = match self.terminal_process(pane).await {
+            Ok(output) => decode(&output)?,
+            Err(failure) if failure.is_missing() => return Ok(PaneRead::Gone),
+            Err(failure) => return Err(read_failure(failure)),
+        };
+        Ok(PaneRead::Holds {
+            process: process.state(),
+            instance: self.whoami().await?.instance_id,
+        })
+    }
+
+    async fn listed_block(&self, pane: &WorkerBinding) -> Result<Option<ListedBlock>, RexError> {
+        let request = SessionRequest {
+            session_id: pane.session_id.clone(),
+        };
+        let listed: BlockList = match self.api("session.list_blocks", &request).await {
+            Ok(output) => decode(&output)?,
+            Err(failure) if failure.is_missing() => return Ok(None),
+            Err(failure) => return Err(read_failure(failure)),
+        };
+        Ok(listed
+            .blocks
+            .into_iter()
+            .find(|block| block.block_id.as_deref() == Some(pane.block_id.as_str())))
+    }
+
+    /// A create is confirmed when its pane verifies, and Rex is still the
+    /// host and instance that `identity` read before the create. The worker
+    /// reads its own Rex instance when it starts, and its claim must match
+    /// the receipt. A restart around the create leaves the earlier read
+    /// naming another instance.
     pub async fn confirm_creation(&self, binding: &WorkerBinding, identity: &RexIdentity) -> bool {
-        self.inspect_session(&binding.session_id)
+        self.verify_recorded_pane(binding, &identity.host_id)
             .await
-            .is_ok_and(|view| view.verify_binding(binding, &identity.host_id).is_ok())
+            .is_ok()
             && self.whoami().await.is_ok_and(|after| {
                 after.instance_id == identity.instance_id && after.host_id == identity.host_id
             })
+    }
+
+    /// A recorded pane verifies its session while Rex shows it in its window
+    /// on this host. It also verifies once it has closed with its program,
+    /// when Rex still has the session and no longer has the block. A block
+    /// that Rex still has anywhere else proves nothing.
+    pub async fn verify_recorded_pane(
+        &self,
+        binding: &WorkerBinding,
+        host: &HostId,
+    ) -> Result<(), RexError> {
+        let view = self.inspect_session(&binding.session_id).await?;
+        let Err(mismatch) = view.verify_binding(binding, host) else {
+            return Ok(());
+        };
+        match self.listed_block(binding).await? {
+            None => Ok(()),
+            Some(_) => Err(mismatch),
+        }
     }
 
     pub fn for_process(server: Option<&str>) -> anyhow::Result<Self> {
@@ -801,35 +848,10 @@ impl RexClient {
         cwd: &Path,
     ) -> Result<WorkerBinding, RexError> {
         let request = CreateRequest::worker(title, program, args, cwd)?;
-        let [mut window] = request.initial_windows;
-        window.layout.block.label = title.to_owned();
-        let receipt = self
-            .api(
-                "session.new_window",
-                &NewWindowRequest {
-                    session_id: session.clone(),
-                    window_label: title.to_owned(),
-                    layout: window.layout,
-                    focus: false,
-                },
-            )
-            .await
-            .map_err(|error| creation_failure(error, Some(session.clone())))?;
-        let window: CreatedWindow =
-            serde_json::from_slice(&receipt).map_err(|_| RexError::CreationUncertain {
-                session_id: Some(session.clone()),
-            })?;
-        let [block] = window.block_ids.as_slice() else {
-            return Err(RexError::CreationUncertain {
-                session_id: Some(session.clone()),
-            });
-        };
-        Ok(WorkerBinding {
-            session_id: session.clone(),
-            window_id: window.window_id,
-            block_id: block.clone(),
-            revision: window.revision,
-        })
+        let [window] = request.initial_windows;
+        let mut block = window.layout.block;
+        block.label = title.to_owned();
+        self.new_window(session, title, block).await
     }
 
     pub async fn promote_session(&self, session: &SessionId) -> Result<(), RexError> {
@@ -920,11 +942,6 @@ impl RexClient {
         args: &[String],
         cwd: &Path,
     ) -> Result<WorkerResume, RexError> {
-        let process_request = ProcessRequest {
-            session_id: binding.session_id.clone(),
-            block_id: binding.block_id.clone(),
-            args: Empty {},
-        };
         for attempt in 0..20 {
             match self.pane_holds(binding, started_by).await? {
                 PaneHolds::Exited | PaneHolds::OtherProcess => break,
@@ -936,33 +953,13 @@ impl RexClient {
         }
         let request = CreateRequest::worker("Chat", program, args, cwd)?;
         let [window] = request.initial_windows;
-        let receipt = self
-            .api(
-                "session.new_window",
-                &NewWindowRequest {
-                    session_id: binding.session_id.clone(),
-                    window_label: window.window_label,
-                    layout: window.layout,
-                    focus: false,
-                },
+        let replacement = self
+            .new_window(
+                &binding.session_id,
+                &window.window_label,
+                window.layout.block,
             )
-            .await
-            .map_err(|error| creation_failure(error, Some(binding.session_id.clone())))?;
-        let window: CreatedWindow =
-            serde_json::from_slice(&receipt).map_err(|_| RexError::CreationUncertain {
-                session_id: Some(binding.session_id.clone()),
-            })?;
-        let [block] = window.block_ids.as_slice() else {
-            return Err(RexError::CreationUncertain {
-                session_id: Some(binding.session_id.clone()),
-            });
-        };
-        let replacement = WorkerBinding {
-            session_id: binding.session_id.clone(),
-            window_id: window.window_id,
-            block_id: block.clone(),
-            revision: window.revision,
-        };
+            .await?;
         // Once creation succeeded, every later failure must retain uncertainty
         // about this same session rather than authorize another allocation.
         if !self.confirm_creation(&replacement, identity).await {
@@ -970,43 +967,141 @@ impl RexClient {
                 session_id: Some(binding.session_id.clone()),
             });
         }
-        // Its history remains in Pi. Close only the exact exited pane recorded
-        // for this task, after a replacement exists in the same session.
-        let cleanup = async {
-            let process: TerminalProcess = decode(
-                &self
-                    .api("com.superlogical.terminal.process", &process_request)
-                    .await
-                    .map_err(read_failure)?,
-            )?;
-            if process.state() == TerminalState::Exited {
-                self.api(
-                    "block.close",
-                    &BlockRequest {
-                        session_id: binding.session_id.clone(),
-                        block_id: binding.block_id.clone(),
-                    },
-                )
-                .await
-                .map_err(read_failure)?;
-                let view = self.inspect_session(&binding.session_id).await?;
-                if view
-                    .windows
-                    .iter()
-                    .flat_map(|window| &window.layers)
-                    .flat_map(|layer| &layer.blocks)
-                    .any(|block| block.block_id.as_ref() == Some(&binding.block_id))
-                {
-                    return Err(RexError::BindingMismatch);
-                }
-            }
-            Ok::<_, RexError>(())
-        }
-        .await;
-        if cleanup.is_err() {
-            eprintln!("Previous Rex worker pane remains; its replacement is running.");
+        match self.close_superseded(binding, started_by).await {
+            OldPane::Closed => {}
+            OldPane::HandedOver => eprintln!(
+                "Rex worker pane {} stays open for you; its replacement is running.",
+                binding.block_id
+            ),
+            OldPane::MaybeDetached => eprintln!(
+                "Rex worker pane {} may be detached from every window; its replacement is running.",
+                binding.block_id
+            ),
         }
         Ok(WorkerResume::Started(replacement))
+    }
+
+    /// Close the pane a replacement superseded if it holds the worker's own
+    /// exit. The conversation lives in Pi, so closing loses nothing. Anything
+    /// else in the pane stays where the user can see it.
+    async fn close_superseded(&self, pane: &WorkerBinding, started_by: Option<Uuid>) -> OldPane {
+        let mut step = GuardedClose::Read;
+        loop {
+            step = match self.guarded_close_step(pane, started_by, step).await {
+                GuardedClose::Done(old) => return old,
+                next => next,
+            };
+        }
+    }
+
+    async fn guarded_close_step(
+        &self,
+        pane: &WorkerBinding,
+        started_by: Option<Uuid>,
+        step: GuardedClose,
+    ) -> GuardedClose {
+        let block = BlockRequest {
+            session_id: pane.session_id.clone(),
+            block_id: pane.block_id.clone(),
+        };
+        match step {
+            GuardedClose::Read => match self.read_pane(pane).await {
+                Ok(read) => after_read(started_by, read),
+                Err(_) => GuardedClose::Done(OldPane::HandedOver),
+            },
+            GuardedClose::Detach { recorded } => {
+                match self.api("session.detach_block", &block).await {
+                    Ok(_) => GuardedClose::RecheckWhileDetached { recorded },
+                    Err(failure) if failure.is_missing() => GuardedClose::Done(OldPane::Closed),
+                    Err(_) => GuardedClose::PutBack,
+                }
+            }
+            GuardedClose::RecheckWhileDetached { recorded } => match self.read_pane(pane).await {
+                Ok(read) => after_recheck(recorded, read),
+                Err(_) => GuardedClose::PutBack,
+            },
+            GuardedClose::Close => match self.api("block.close", &block).await {
+                Ok(_) => GuardedClose::Done(OldPane::Closed),
+                Err(failure) if failure.is_missing() => GuardedClose::Done(OldPane::Closed),
+                Err(_) => GuardedClose::PutBack,
+            },
+            GuardedClose::PutBack => {
+                GuardedClose::Done(self.put_back(pane).await.unwrap_or(OldPane::MaybeDetached))
+            }
+            done @ GuardedClose::Done(_) => done,
+        }
+    }
+
+    /// Bring a detached pane back into view in a window of its own. Rex
+    /// places a detached block only beside a placed one, so a placeholder
+    /// holds the new window open until the pane arrives. A failed move says
+    /// nothing certain. Its 404 may name the pane or a placeholder that
+    /// already closed itself, and any other error may hide a move that
+    /// landed. So the listing decides, and a pane still detached gets one
+    /// fresh placeholder.
+    async fn put_back(&self, pane: &WorkerBinding) -> Result<OldPane, RexError> {
+        let mut placeholders_left = 2;
+        loop {
+            let Some(old) = self.listed_block(pane).await? else {
+                return Ok(OldPane::Closed);
+            };
+            if old.placement == Placement::Placed {
+                return Ok(OldPane::HandedOver);
+            }
+            if placeholders_left == 0 {
+                return Ok(OldPane::MaybeDetached);
+            }
+            placeholders_left -= 1;
+            let placeholder = self
+                .new_window(&pane.session_id, &old.label, WorkerBlock::placeholder()?)
+                .await?;
+            let moved = self
+                .api(
+                    "session.move_block",
+                    &MoveBlock {
+                        session_id: pane.session_id.clone(),
+                        block_id: pane.block_id.clone(),
+                        anchor_block_id: placeholder.block_id,
+                    },
+                )
+                .await;
+            if moved.is_ok() {
+                return Ok(OldPane::HandedOver);
+            }
+        }
+    }
+
+    async fn new_window(
+        &self,
+        session: &SessionId,
+        label: &str,
+        block: WorkerBlock,
+    ) -> Result<WorkerBinding, RexError> {
+        let uncertain = || RexError::CreationUncertain {
+            session_id: Some(session.clone()),
+        };
+        let receipt = self
+            .api(
+                "session.new_window",
+                &NewWindowRequest {
+                    session_id: session.clone(),
+                    window_label: label.to_owned(),
+                    layout: SingleBlock { block },
+                    focus: false,
+                },
+            )
+            .await
+            .map_err(|error| creation_failure(error, Some(session.clone())))?;
+        let window: CreatedWindow = serde_json::from_slice(&receipt).map_err(|_| uncertain())?;
+        let [block] = window.block_ids.as_slice() else {
+            return Err(uncertain());
+        };
+        Ok(WorkerBinding {
+            session_id: session.clone(),
+            window_id: window.window_id,
+            block_id: block.clone(),
+            revision: window.revision,
+        })
     }
 
     async fn api<T: Serialize>(&self, method: &str, request: &T) -> Result<Vec<u8>, CallFailure> {
@@ -1140,6 +1235,8 @@ fn classify_common_error(error: &[u8]) -> Option<CallFailure> {
         || trimmed.ends_with("code=method_not_found)")
     {
         Some(CallFailure::MethodNotFound)
+    } else if trimmed.ends_with("(status=404 code=not_found)") {
+        Some(CallFailure::NotFound)
     } else if text.contains("(status=403 ") {
         Some(CallFailure::Forbidden)
     } else {
@@ -1152,19 +1249,26 @@ enum CallFailure {
     InvalidInput,
     Failed,
     MethodNotFound,
+    NotFound,
     Forbidden,
     OutputTooLarge,
     SessionNotFound,
     ServerDown { location: String },
+}
+impl CallFailure {
+    fn is_missing(&self) -> bool {
+        matches!(self, Self::NotFound | Self::SessionNotFound)
+    }
 }
 fn read_failure(error: CallFailure) -> RexError {
     match error {
         CallFailure::Unavailable => RexError::Unavailable,
         CallFailure::ServerDown { location } => RexError::ServerDown { location },
         CallFailure::InvalidInput => RexError::InvalidInput,
-        CallFailure::Failed | CallFailure::MethodNotFound | CallFailure::Forbidden => {
-            RexError::ReadFailed
-        }
+        CallFailure::Failed
+        | CallFailure::MethodNotFound
+        | CallFailure::NotFound
+        | CallFailure::Forbidden => RexError::ReadFailed,
         CallFailure::OutputTooLarge => RexError::OutputTooLarge,
         CallFailure::SessionNotFound => RexError::SessionNotFound,
     }
@@ -1212,7 +1316,7 @@ struct TerminalProcess {
     foreground: Option<TerminalChild>,
     last_exit: Option<TerminalExit>,
 }
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TerminalState {
     Running,
     Exited,
@@ -1223,6 +1327,56 @@ enum PaneHolds {
     OtherProcess,
     Exited,
     Pending,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaneRead {
+    Gone,
+    Holds {
+        process: TerminalState,
+        instance: Uuid,
+    },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OldPane {
+    Closed,
+    HandedOver,
+    MaybeDetached,
+}
+/// Closing a superseded pane. It never closes a shell anyone could see. The
+/// pane leaves every view before the read that decides its close, and a shell
+/// that Rex restores there after a restart stays out of view too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuardedClose {
+    Read,
+    Detach { recorded: Uuid },
+    RecheckWhileDetached { recorded: Uuid },
+    Close,
+    PutBack,
+    Done(OldPane),
+}
+/// The step after reading a pane still in view. Rex restores a pane with a
+/// fresh shell under a new instance, and an exit there may be a shell the
+/// user typed in and left. So only an exit under the instance that started
+/// the worker is the worker's own.
+fn after_read(started_by: Option<Uuid>, read: PaneRead) -> GuardedClose {
+    match read {
+        PaneRead::Gone => GuardedClose::Done(OldPane::Closed),
+        PaneRead::Holds {
+            process: TerminalState::Exited,
+            instance,
+        } if started_by == Some(instance) => GuardedClose::Detach { recorded: instance },
+        PaneRead::Holds { .. } => GuardedClose::Done(OldPane::HandedOver),
+    }
+}
+fn after_recheck(recorded: Uuid, read: PaneRead) -> GuardedClose {
+    match read {
+        PaneRead::Gone => GuardedClose::Done(OldPane::Closed),
+        PaneRead::Holds {
+            process: TerminalState::Exited,
+            instance,
+        } if instance == recorded => GuardedClose::Close,
+        PaneRead::Holds { .. } => GuardedClose::PutBack,
+    }
 }
 impl TerminalProcess {
     fn state(&self) -> TerminalState {
@@ -1264,6 +1418,31 @@ struct MoveSession {
     session_id: SessionId,
     before_session_id: Option<SessionId>,
 }
+#[derive(Serialize)]
+struct MoveBlock {
+    session_id: SessionId,
+    block_id: BlockId,
+    anchor_block_id: BlockId,
+}
+#[derive(Deserialize)]
+struct BlockList {
+    #[serde(default, deserialize_with = "nullable_vec")]
+    blocks: Vec<ListedBlock>,
+}
+#[derive(Deserialize)]
+struct ListedBlock {
+    block_id: Option<String>,
+    label: String,
+    placement: Placement,
+}
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum Placement {
+    Placed,
+    /// Rex asks clients to read a placement they do not know as detached.
+    #[serde(other)]
+    Detached,
+}
 
 #[derive(Deserialize, Serialize)]
 struct CreateRequest {
@@ -1299,24 +1478,11 @@ impl CreateRequest {
                         label: "Chat".to_owned(),
                         options: TerminalOptions {
                             shell: DirectShell::None,
+                            login: None,
                             command,
                             cwd: cwd.to_owned(),
-                            path_prepend: std::env::var_os("PATH")
-                                .map(|path| {
-                                    std::env::split_paths(&path)
-                                        .map(|directory| {
-                                            directory
-                                                .into_os_string()
-                                                .into_string()
-                                                .map_err(|_| RexError::InvalidInput)
-                                        })
-                                        .collect::<Result<Vec<_>, _>>()
-                                })
-                                .transpose()?
-                                .unwrap_or_default(),
-                            exit: ExitPolicy {
-                                on_completion: false,
-                            },
+                            path_prepend: path_prepend()?,
+                            exit: ExitPolicy::ON_ANY_EXIT,
                         },
                     },
                 },
@@ -1339,6 +1505,45 @@ struct WorkerBlock {
     label: String,
     options: TerminalOptions,
 }
+const PLACEHOLDER_LABEL: &str = "beep-boop:placeholder";
+/// How long a placeholder lives. It closes itself, because a close sent after
+/// a Rex restart would reach the shell Rex restored in its place, in view.
+/// It must outlive the call that creates it and the move that follows.
+const PLACEHOLDER_LIFETIME: Duration = Duration::from_secs(3 * CALL_TIMEOUT.as_secs());
+impl WorkerBlock {
+    fn placeholder() -> Result<Self, RexError> {
+        Ok(Self {
+            flavor: TerminalFlavor::Shell,
+            label: PLACEHOLDER_LABEL.to_owned(),
+            options: TerminalOptions {
+                shell: DirectShell::None,
+                // Rex starts a login program with a dash before argv[0], and a
+                // multi-call coreutils then knows no program by that name.
+                login: Some(false),
+                command: vec![
+                    "sleep".to_owned(),
+                    PLACEHOLDER_LIFETIME.as_secs().to_string(),
+                ],
+                cwd: "/".to_owned(),
+                path_prepend: path_prepend()?,
+                exit: ExitPolicy::ON_ANY_EXIT,
+            },
+        })
+    }
+}
+fn path_prepend() -> Result<Vec<String>, RexError> {
+    let Some(path) = std::env::var_os("PATH") else {
+        return Ok(Vec::new());
+    };
+    std::env::split_paths(&path)
+        .map(|directory| {
+            directory
+                .into_os_string()
+                .into_string()
+                .map_err(|_| RexError::InvalidInput)
+        })
+        .collect()
+}
 #[derive(Deserialize, Serialize)]
 enum TerminalFlavor {
     #[serde(rename = "com.superlogical.terminal.shell")]
@@ -1352,6 +1557,8 @@ enum DirectShell {
 #[derive(Deserialize, Serialize)]
 struct TerminalOptions {
     shell: DirectShell,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    login: Option<bool>,
     command: Vec<String>,
     cwd: String,
     path_prepend: Vec<String>,
@@ -1360,6 +1567,16 @@ struct TerminalOptions {
 #[derive(Deserialize, Serialize)]
 struct ExitPolicy {
     on_completion: bool,
+    quick_exit_threshold_ms: u32,
+}
+impl ExitPolicy {
+    /// Rex closes the pane when its program exits, so a pane lives as long
+    /// as its program. Without a zero threshold Rex keeps a pane whose
+    /// program exits quickly.
+    const ON_ANY_EXIT: Self = Self {
+        on_completion: true,
+        quick_exit_threshold_ms: 0,
+    };
 }
 #[derive(Deserialize)]
 struct CreatedHeader {
@@ -1872,8 +2089,234 @@ esac
                 .map(|path| path.into_os_string().into_string().unwrap())
                 .collect::<Vec<_>>()
         );
-        assert!(!worker.options.exit.on_completion);
+        let options = &serde_json::to_value(&request).unwrap()["initial_windows"][0]["layout"]["block"]
+            ["options"];
+        assert_eq!(
+            options["exit"],
+            serde_json::json!({ "on_completion": true, "quick_exit_threshold_ms": 0 }),
+            "Rex closes a worker's pane when its program exits, however quickly"
+        );
+        assert!(
+            options.get("login").is_none(),
+            "A worker keeps Rex's default argv"
+        );
         assert!(CreateRequest::worker("Task", "tool", &[], Path::new("relative")).is_err());
+    }
+
+    #[test]
+    fn only_the_workers_own_exit_closes_and_only_if_it_reads_the_same_out_of_view() {
+        use GuardedClose::{Close, Detach, Done, PutBack};
+        use OldPane::{Closed, HandedOver};
+        use TerminalState::{Exited, Pending, Running};
+        let started = Uuid::parse_str(INSTANCE).unwrap();
+        let restarted = Uuid::from_u128(8);
+        let holds = |process, instance| PaneRead::Holds { process, instance };
+        for (reason, started_by, read, step) in [
+            (
+                "a pane Rex no longer has is closed",
+                Some(started),
+                PaneRead::Gone,
+                Done(Closed),
+            ),
+            (
+                "the worker's own exit leaves view first",
+                Some(started),
+                holds(Exited, started),
+                Detach { recorded: started },
+            ),
+            (
+                "an exit under a later instance may be a restored shell the user left",
+                Some(started),
+                holds(Exited, restarted),
+                Done(HandedOver),
+            ),
+            (
+                "an exit with no recorded instance may be one too",
+                None,
+                holds(Exited, started),
+                Done(HandedOver),
+            ),
+            (
+                "a running process stays",
+                Some(started),
+                holds(Running, started),
+                Done(HandedOver),
+            ),
+            (
+                "a starting process stays",
+                Some(started),
+                holds(Pending, started),
+                Done(HandedOver),
+            ),
+        ] {
+            assert_eq!(after_read(started_by, read), step, "In view, {reason}");
+        }
+        for (reason, read, step) in [
+            (
+                "a pane closed meanwhile is closed",
+                PaneRead::Gone,
+                Done(Closed),
+            ),
+            (
+                "the same exit under the same instance closes",
+                holds(Exited, started),
+                Close,
+            ),
+            (
+                "a restart restores a shell, which goes back",
+                holds(Running, restarted),
+                PutBack,
+            ),
+            (
+                "an exit under a later instance goes back",
+                holds(Exited, restarted),
+                PutBack,
+            ),
+            (
+                "a process that runs again goes back",
+                holds(Running, started),
+                PutBack,
+            ),
+        ] {
+            assert_eq!(after_recheck(started, read), step, "Detached, {reason}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_put_back_refused_as_not_found_counts_as_closed_only_if_the_pane_is_gone() {
+        const TEST: &str =
+            "rex::tests::a_put_back_refused_as_not_found_counts_as_closed_only_if_the_pane_is_gone";
+        let Some(case) = fake_rex::case() else {
+            for missing in ["pane", "anchor"] {
+                fake_rex::run(
+                    TEST,
+                    missing,
+                    &[
+                        ("AGENT_TEST_FAKE_REX_RESTART_AFTER", "session.detach_block"),
+                        ("AGENT_TEST_FAKE_REX_MOVE_MISSING", missing),
+                    ],
+                );
+            }
+            return;
+        };
+        let old = close_superseded_origin().await;
+        let methods = fake_rex::methods();
+        assert!(
+            methods.contains(&"session.move_block".to_owned()),
+            "The restored shell was not put back: {methods:?}"
+        );
+        if case == "pane" {
+            assert_eq!(old, OldPane::Closed, "Rex no longer has the pane");
+        } else {
+            assert_eq!(
+                old,
+                OldPane::MaybeDetached,
+                "The placeholder was gone, so the pane stays detached"
+            );
+            assert_eq!(
+                moves(&methods),
+                2,
+                "The put-back is tried once more and no further: {methods:?}"
+            );
+        }
+        assert!(
+            !methods.contains(&"block.close".to_owned()),
+            "Nothing is closed: {methods:?}"
+        );
+    }
+
+    async fn close_superseded_origin() -> OldPane {
+        let pane = WorkerBinding {
+            session_id: SessionId::parse(fake_rex::ORIGIN_SESSION).unwrap(),
+            window_id: WindowId::parse(fake_rex::ORIGIN_WINDOW).unwrap(),
+            block_id: BlockId::parse(fake_rex::ORIGIN_BLOCK).unwrap(),
+            revision: 1,
+        };
+        RexClient::for_process(None)
+            .unwrap()
+            .close_superseded(&pane, Some(Uuid::parse_str(INSTANCE).unwrap()))
+            .await
+    }
+
+    fn moves(methods: &[String]) -> usize {
+        methods
+            .iter()
+            .filter(|method| *method == "session.move_block")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_put_back_whose_placeholder_expired_goes_beside_a_fresh_one() {
+        const TEST: &str =
+            "rex::tests::a_put_back_whose_placeholder_expired_goes_beside_a_fresh_one";
+        if fake_rex::case().is_none() {
+            fake_rex::run(
+                TEST,
+                "anchor-once",
+                &[
+                    ("AGENT_TEST_FAKE_REX_RESTART_AFTER", "session.detach_block"),
+                    ("AGENT_TEST_FAKE_REX_MOVE_MISSING", "anchor-once"),
+                ],
+            );
+            return;
+        }
+        let old = close_superseded_origin().await;
+        let methods = fake_rex::methods();
+        assert_eq!(
+            old,
+            OldPane::HandedOver,
+            "The second placeholder was still there: {methods:?}"
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| *method == "session.new_window")
+                .count(),
+            2,
+            "Each move gets a placeholder of its own: {methods:?}"
+        );
+        assert_eq!(moves(&methods), 2, "{methods:?}");
+        assert!(
+            !methods.contains(&"block.close".to_owned()),
+            "Nothing is closed: {methods:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_put_back_whose_move_failed_goes_beside_a_fresh_placeholder() {
+        const TEST: &str =
+            "rex::tests::a_put_back_whose_move_failed_goes_beside_a_fresh_placeholder";
+        if fake_rex::case().is_none() {
+            fake_rex::run(
+                TEST,
+                "move-fails-once",
+                &[
+                    ("AGENT_TEST_FAKE_REX_RESTART_AFTER", "session.detach_block"),
+                    ("AGENT_TEST_FAKE_REX_FAIL_ONCE_AT", "session.move_block"),
+                ],
+            );
+            return;
+        }
+        let old = close_superseded_origin().await;
+        let methods = fake_rex::methods();
+        assert_eq!(
+            old,
+            OldPane::HandedOver,
+            "Rex still listed the pane as detached after the failed move: {methods:?}"
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| *method == "session.new_window")
+                .count(),
+            2,
+            "Each move gets a placeholder of its own: {methods:?}"
+        );
+        assert_eq!(moves(&methods), 2, "{methods:?}");
+        assert!(
+            !methods.contains(&"block.close".to_owned()),
+            "Nothing is closed: {methods:?}"
+        );
     }
 
     #[test]
@@ -2206,6 +2649,7 @@ case "$method" in
     value="{\"window_id\":\"$window\",\"block_ids\":[\"$replacement\"],\"revision\":2}" ;;
   whoami)
     value="{\"host_id\":\"$host\",\"instance_id\":\"66666666-6666-4666-8666-666666666666\",\"rex_version\":\"fixture\"}" ;;
+  session.detach_block) value='{"revision":3}' ;;
   block.close) : > "$root/closed"; value='{}' ;;
   *) fail "Unexpected native method $method" 1 ;;
 esac
@@ -2269,50 +2713,149 @@ printf '%s\n' "$value"
     ) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let process: TerminalProcess = decode(
-                &client
-                    .api(
-                        "com.superlogical.terminal.process",
-                        &ProcessRequest {
-                            session_id: binding.session_id.clone(),
-                            block_id: binding.block_id.clone(),
-                            args: Empty {},
-                        },
-                    )
-                    .await
-                    .map_err(read_failure)?,
-            )?;
-            if process.state() == TerminalState::Exited
-                && let Some(exit) = process.last_exit
-            {
-                anyhow::ensure!(
-                    exit._exit_code == 0,
-                    "Native marker process did not exit successfully"
-                );
-                break;
+            let output = client
+                .run(vec![
+                    "capture".to_owned(),
+                    "-s".to_owned(),
+                    binding.session_id.to_string(),
+                    "-b".to_owned(),
+                    binding.block_id.to_string(),
+                    "--trim".to_owned(),
+                    "--unwrap".to_owned(),
+                ])
+                .await
+                .map_err(read_failure)?;
+            if String::from_utf8(output)?.contains(marker) {
+                return Ok(());
             }
             anyhow::ensure!(
                 tokio::time::Instant::now() < deadline,
-                "Native marker process did not finish"
+                "Native terminal did not show the marker"
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let output = client
+    }
+
+    async fn assert_closes_with_its_program(
+        client: &RexClient,
+        binding: &WorkerBinding,
+        identity: &RexIdentity,
+    ) -> anyhow::Result<()> {
+        client
             .run(vec![
-                "capture".to_owned(),
+                "send-key".to_owned(),
                 "-s".to_owned(),
                 binding.session_id.to_string(),
                 "-b".to_owned(),
                 binding.block_id.to_string(),
-                "--trim".to_owned(),
-                "--unwrap".to_owned(),
+                "enter".to_owned(),
             ])
             .await
             .map_err(read_failure)?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while client.listed_block(binding).await?.is_some() {
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "Rex kept the pane after its program exited"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let presence = client
+            .worker_presence(binding, Some(identity.instance_id), &identity.host_id)
+            .await?;
         anyhow::ensure!(
-            String::from_utf8(output)?.contains(marker),
-            "Native terminal did not show the marker"
+            matches!(presence, crate::protocol::WorkerPresence::MissingTerminal),
+            "A pane that closed with its program did not read as missing: {presence:?}"
         );
+        Ok(())
+    }
+
+    fn private_test_server() -> anyhow::Result<(RexClient, String)> {
+        let server = std::env::var("AGENT_TEST_REX_SERVER")
+            .ok()
+            .filter(|server| server.starts_with("unix://"))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Set AGENT_TEST_REX_SERVER to a private unix:// Rex server; live tests never use the personal one"
+                )
+            })?;
+        Ok((RexClient::for_process(Some(&server))?, server))
+    }
+
+    async fn pane_kept_after_exit(
+        client: &RexClient,
+        label: &str,
+    ) -> anyhow::Result<WorkerBinding> {
+        let title = format!("{label}-{}", Uuid::new_v4());
+        let args = ["-c".to_owned(), "exit 3".to_owned()];
+        let mut request = serde_json::to_value(CreateRequest::worker(
+            &title,
+            "/bin/sh",
+            &args,
+            Path::new("/tmp"),
+        )?)?;
+        request["initial_windows"][0]["layout"]["block"]["options"]["exit"] =
+            serde_json::json!({ "on_completion": false });
+        let binding = decode_creation(
+            &client
+                .api("session.create", &request)
+                .await
+                .map_err(read_failure)?,
+        )?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !matches!(
+            client.read_pane(&binding).await?,
+            PaneRead::Holds {
+                process: TerminalState::Exited,
+                ..
+            }
+        ) {
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "The legacy pane's program did not exit"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Ok(binding)
+    }
+
+    async fn restart_private_server(
+        client: &RexClient,
+        server: &str,
+        state: &str,
+    ) -> anyhow::Result<()> {
+        use std::os::unix::process::CommandExt;
+        let _ = client
+            .run(vec!["server".to_owned(), "stop".to_owned()])
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !matches!(client.whoami().await, Err(RexError::ServerDown { .. })) {
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "The private Rex server did not stop"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        std::process::Command::new("rex")
+            .args(["server", "run", "--listen", server, "--state-dir", state])
+            .args(["--config", "/dev/null"])
+            .env_remove("REX_SERVER")
+            .env_remove("REX_SESSION")
+            .env_remove("REX_BLOCK")
+            .env_remove("REX_CLIENT")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn_serialized()?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while client.whoami().await.is_err() {
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "The private Rex server did not start again"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         Ok(())
     }
 
@@ -2335,19 +2878,20 @@ printf '%s\n' "$value"
         Ok(())
     }
 
-    /// Opt-in only: creates and removes one synthetic session on the selected running Rex server.
     #[tokio::test]
-    #[ignore = "requires a running Rex server; creates and removes one synthetic session"]
+    #[ignore = "requires a private Rex server; creates and removes one synthetic session"]
     async fn live_native_rex_worker_contract() -> anyhow::Result<()> {
-        let client =
-            RexClient::for_process(std::env::var("AGENT_TEST_REX_SERVER").ok().as_deref())?;
+        let (client, _) = private_test_server()?;
         let identity = client.whoami().await?;
         let before = client.list_sessions().await?;
         let title = format!("agent-rex-contract-{}", Uuid::new_v4());
         let marker = "agent-rex-contract-marker";
-        let args = vec![format!("{marker}\n")];
+        let args = vec![
+            "-c".to_owned(),
+            format!("printf '%s\\n' {marker}; read -r line"),
+        ];
         let binding = match client
-            .create_session(&title, "/usr/bin/printf", &args, Path::new("/tmp"))
+            .create_session(&title, "/bin/sh", &args, Path::new("/tmp"))
             .await
         {
             Ok(binding) => binding,
@@ -2385,7 +2929,7 @@ printf '%s\n' "$value"
                 .create_worker_window(
                     &binding.session_id,
                     "Review",
-                    "/usr/bin/printf",
+                    "/bin/sh",
                     &args,
                     Path::new("/tmp"),
                 )
@@ -2437,41 +2981,11 @@ printf '%s\n' "$value"
                 "Native agent terminal label is missing"
             );
             assert_native_output(&client, &review, marker).await?;
-
-            let resumed = match client
-                .resume_worker(
-                    &binding,
-                    Some(identity.instance_id),
-                    &identity,
-                    "/usr/bin/printf",
-                    &args,
-                    Path::new("/tmp"),
-                )
+            assert_closes_with_its_program(&client, &review, &identity).await?;
+            client
+                .inspect_session(&binding.session_id)
                 .await?
-            {
-                WorkerResume::Started(resumed) => resumed,
-                WorkerResume::Running | WorkerResume::Pending => {
-                    anyhow::bail!("An exited parent was not confirmed as exited")
-                }
-            };
-            anyhow::ensure!(
-                resumed.session_id == binding.session_id && resumed.block_id != binding.block_id,
-                "Parent resume allocated a different task session"
-            );
-            let view = client.inspect_session(&binding.session_id).await?;
-            view.verify_binding(&resumed, &identity.host_id)?;
-            view.verify_binding(&review, &identity.host_id)?;
-            anyhow::ensure!(
-                view.windows.len() == 2
-                    && !view
-                        .windows
-                        .iter()
-                        .flat_map(|window| &window.layers)
-                        .flat_map(|layer| &layer.blocks)
-                        .any(|block| block.block_id.as_ref() == Some(&binding.block_id)),
-                "Parent resume left its exited owned terminal behind"
-            );
-            assert_native_output(&client, &resumed, marker).await?;
+                .verify_binding(&binding, &identity.host_id)?;
 
             client
                 .api(
@@ -2514,7 +3028,163 @@ printf '%s\n' "$value"
             "Rex's answer for a closed session did not read as missing: {closed:?}"
         );
         eprintln!(
-            "Native Rex contract verified: three successful marker processes, two named windows in one session, parent reuse, sidebar promotion, independent cleanup readback, and a closed session read as missing."
+            "Native Rex contract verified: two marker programs in two named windows of one session, a pane that closed with its program, sidebar promotion, independent cleanup readback, and a closed session read as missing."
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a private Rex server that it restarts; creates and removes two synthetic sessions"]
+    async fn live_guarded_close_closes_a_legacy_exit_and_puts_back_a_restored_shell()
+    -> anyhow::Result<()> {
+        let (client, server) = private_test_server()?;
+        let state = std::env::var("AGENT_TEST_REX_STATE_DIR").map_err(|_| {
+            anyhow::anyhow!(
+                "Set AGENT_TEST_REX_STATE_DIR to the private server's --state-dir. The test restarts that server and leaves it running, so start it with `rex server run --listen <AGENT_TEST_REX_SERVER> --state-dir <AGENT_TEST_REX_STATE_DIR> --config /dev/null`, with the same `rex` first on PATH"
+            )
+        })?;
+        let identity = client.whoami().await?;
+        let started_by = Some(identity.instance_id);
+        let exited = pane_kept_after_exit(&client, "agent-rex-legacy-exit").await?;
+        let restored = match pane_kept_after_exit(&client, "agent-rex-legacy-restore").await {
+            Ok(restored) => restored,
+            Err(error) => {
+                close_test_session(&client, &exited.session_id).await?;
+                return Err(error);
+            }
+        };
+        let result = tokio::time::timeout(Duration::from_secs(120), async {
+            let waits = ["-c".to_owned(), "read -r line".to_owned()];
+            let WorkerResume::Started(replacement) = client
+                .resume_worker(
+                    &exited,
+                    started_by,
+                    &identity,
+                    "/bin/sh",
+                    &waits,
+                    Path::new("/tmp"),
+                )
+                .await?
+            else {
+                anyhow::bail!("A legacy pane whose worker exited was not replaced");
+            };
+            anyhow::ensure!(
+                client.listed_block(&exited).await?.is_none(),
+                "The worker's own exit stayed after its replacement started"
+            );
+            anyhow::ensure!(
+                client
+                    .listed_block(&replacement)
+                    .await?
+                    .is_some_and(|block| block.placement == Placement::Placed),
+                "The replacement pane is not in view"
+            );
+
+            let mut step = GuardedClose::Read;
+            while !matches!(step, GuardedClose::RecheckWhileDetached { .. }) {
+                step = client.guarded_close_step(&restored, started_by, step).await;
+                anyhow::ensure!(
+                    !matches!(step, GuardedClose::Done(_)),
+                    "The guarded close ended before its recheck: {step:?}"
+                );
+            }
+            restart_private_server(&client, &server, &state).await?;
+            anyhow::ensure!(
+                client.whoami().await?.instance_id != identity.instance_id,
+                "Rex kept its instance across the restart"
+            );
+            while !matches!(step, GuardedClose::Done(_)) {
+                step = client.guarded_close_step(&restored, started_by, step).await;
+            }
+            anyhow::ensure!(
+                step == GuardedClose::Done(OldPane::HandedOver),
+                "A shell Rex restored during the guarded close was not handed over: {step:?}"
+            );
+            let back = client
+                .listed_block(&restored)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("The restored shell was closed"))?;
+            anyhow::ensure!(
+                back.placement == Placement::Placed,
+                "The restored shell was left out of view"
+            );
+            anyhow::ensure!(
+                matches!(
+                    client.read_pane(&restored).await?,
+                    PaneRead::Holds {
+                        process: TerminalState::Running,
+                        ..
+                    }
+                ),
+                "The restored shell no longer runs"
+            );
+            let windows: NativeWindows = decode(
+                &client
+                    .run(vec![
+                        "window".to_owned(),
+                        "ls".to_owned(),
+                        "-s".to_owned(),
+                        restored.session_id.to_string(),
+                        "--json".to_owned(),
+                    ])
+                    .await
+                    .map_err(read_failure)?,
+            )?;
+            let labels: Vec<_> = windows
+                .windows
+                .iter()
+                .map(|window| window.label.as_str())
+                .collect();
+            anyhow::ensure!(
+                labels == [back.label.as_str()],
+                "The restored shell is not back in a window named for it: {labels:?}"
+            );
+            let deadline =
+                tokio::time::Instant::now() + PLACEHOLDER_LIFETIME + Duration::from_secs(5);
+            loop {
+                let listed: BlockList = decode(
+                    &client
+                        .api(
+                            "session.list_blocks",
+                            &SessionRequest {
+                                session_id: restored.session_id.clone(),
+                            },
+                        )
+                        .await
+                        .map_err(read_failure)?,
+                )?;
+                if !listed
+                    .blocks
+                    .iter()
+                    .any(|block| block.label == PLACEHOLDER_LABEL)
+                {
+                    break;
+                }
+                anyhow::ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "The placeholder did not close itself"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            anyhow::ensure!(
+                client
+                    .listed_block(&restored)
+                    .await?
+                    .is_some_and(|block| block.placement == Placement::Placed),
+                "The restored shell left view when the placeholder closed"
+            );
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        let exited_cleanup = close_test_session(&client, &exited.session_id).await;
+        let restored_cleanup = close_test_session(&client, &restored.session_id).await;
+        exited_cleanup?;
+        restored_cleanup?;
+        result.map_err(|_| {
+            anyhow::anyhow!("The guarded-close test exceeded its two-minute limit")
+        })??;
+        eprintln!(
+            "Guarded close verified: a legacy pane's own exit closed after its replacement started, and a shell Rex restored between the detach and the recheck went back into view, still running, in a window named for it. Its placeholder then closed itself."
         );
         Ok(())
     }
