@@ -24,6 +24,8 @@ repo_root=$(cd "$native_dir/.." && pwd)
 # and simulator builds must not reuse an inherited SDK from the other platform.
 with_sdk() { bash "$native_dir/scripts/with-sdk.sh" "$@"; }
 python3 "$native_dir/scripts/test-sdk-selection.py"
+python3 "$native_dir/scripts/check-test-preferences.py"
+python3 "$native_dir/scripts/test-test-preferences.py"
 mkdir -p "$repo_root/target/ios-validation"
 run_dir=$(mktemp -d "$repo_root/target/ios-validation/run.XXXXXX")
 printf 'Native validation output: %s\n' "$run_dir"

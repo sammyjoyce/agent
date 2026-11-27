@@ -102,9 +102,7 @@ private func serveNightlyDeps(work: FixtureCoordinator, personal: FixtureCoordin
   await serveNightlyDeps(work: workPeer, personal: personalPeer)
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "relaunch-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   let launch: @MainActor () -> Coordinators = {
     Coordinators(
       registration: nil, defaults: defaults, applicationSupport: root, caches: root,

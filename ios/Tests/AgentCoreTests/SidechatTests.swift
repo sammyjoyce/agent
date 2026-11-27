@@ -193,9 +193,7 @@ func sidechatNotificationOverrideKeepsDeviceRegisteredWhenMainAlertsOff() async 
 func sidechatPushNotificationRoutesDirectlyAndSuppressesOnlyWhenActive() async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "sidechat-alert-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   defaults.set(true, forKey: "notificationsEnabled")
 
   var work = CoordinatorProfile(
@@ -394,9 +392,7 @@ func sidechatNotificationRecoveryAndRapidOnOffUnregister() async throws {
 func sidechatPushNotificationDoesNotMisrouteRemovedCoordinator() async throws {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "sidechat-removed-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
-  defer { defaults.removePersistentDomain(forName: suite) }
+  let defaults = TestPreferences()
   defaults.set(true, forKey: "notificationsEnabled")
 
   var work = CoordinatorProfile(
@@ -548,10 +544,8 @@ func sidechatSendClearsLocalArchivedStateAndPresenceTokenProtectsBannerSuppressi
 
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
-  let suite = "sidechat-token-\(UUID())"
-  try await MainActor.run {
-    let defaults = try #require(UserDefaults(suiteName: suite))
-    defer { defaults.removePersistentDomain(forName: suite) }
+  await MainActor.run {
+    let defaults = TestPreferences()
     let notifications = AppNotifications(
       defaults: defaults, applicationSupport: root, caches: root, transport: .tailnet,
       permission: { true })
@@ -575,8 +569,7 @@ func rootConversationNotificationRoutesToMainEvenWhenReadyReportsCustomRootID() 
   let (personalListener, personalPort) = try await listen(personalFixture)
 
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-  let suite = "sidechat-root-notify-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: suite))
+  let defaults = TestPreferences()
   defaults.set(true, forKey: "notificationsEnabled")
 
   let notifications = AppNotifications(
@@ -590,7 +583,6 @@ func rootConversationNotificationRoutesToMainEvenWhenReadyReportsCustomRootID() 
   defer {
     workListener.cancel()
     personalListener.cancel()
-    defaults.removePersistentDomain(forName: suite)
     try? FileManager.default.removeItem(at: root)
   }
 

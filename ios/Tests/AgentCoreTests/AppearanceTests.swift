@@ -6,9 +6,7 @@ import Testing
 
 @Test @MainActor
 func appearancePreferencesFollowSystemUnlessExplicitlyOverridden() throws {
-  let name = "appearance-fixture-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: name))
-  defer { defaults.removePersistentDomain(forName: name) }
+  let defaults = TestPreferences()
   let fresh = AppStorage(
     wrappedValue: AppAppearance.system, AppAppearance.preferenceKey, store: defaults)
   #expect(fresh.wrappedValue == .system)

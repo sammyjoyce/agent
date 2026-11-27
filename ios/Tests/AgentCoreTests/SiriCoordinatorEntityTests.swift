@@ -12,8 +12,7 @@ struct SiriCoordinatorEntityTests {
   @MainActor
   private final class SavedFixture {
     let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-    let suite = "siri-coordinators-\(UUID())"
-    let defaults: UserDefaults
+    let defaults: TestPreferences
     let profiles: [CoordinatorProfile]
     let notifications: AppNotifications
     private let transport: CoordinatorTransport
@@ -24,7 +23,7 @@ struct SiriCoordinatorEntityTests {
       paired: Bool = true, spotlight: SpotlightFake? = nil,
       permission: @escaping @MainActor () async throws -> Bool = AppNotifications.alertPermission
     ) throws {
-      defaults = try #require(UserDefaults(suiteName: suite))
+      defaults = TestPreferences()
       profiles = try names.enumerated().map { index, name in
         var profile = CoordinatorProfile(
           name: try TagName(name), address: try CoordinatorAddress(host: "100.64.1.\(index + 2)"))
@@ -58,7 +57,6 @@ struct SiriCoordinatorEntityTests {
     }
 
     func clean() {
-      defaults.removePersistentDomain(forName: suite)
       try? FileManager.default.removeItem(at: root)
     }
   }

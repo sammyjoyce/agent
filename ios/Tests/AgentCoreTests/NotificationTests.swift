@@ -113,7 +113,7 @@ func notificationWithdrawalOrdersAfterAnInflightTokenAndSuppressesLateRegistrati
   }
 }
 
-@MainActor private func notificationsWithoutSavedCoordinators(_ defaults: UserDefaults)
+@MainActor private func notificationsWithoutSavedCoordinators(_ defaults: TestPreferences)
   -> AppNotifications
 {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
@@ -125,9 +125,7 @@ func notificationWithdrawalOrdersAfterAnInflightTokenAndSuppressesLateRegistrati
 func notificationForegroundPolicyAndTapUseTheExistingMainWithoutPersistingDeviceTokens()
   async throws
 {
-  let name = "notification-fixture-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: name))
-  defer { defaults.removePersistentDomain(forName: name) }
+  let defaults = TestPreferences()
   defaults.set(true, forKey: "notificationsEnabled")
   let notifications = notificationsWithoutSavedCoordinators(defaults)
   #expect(notifications.presents(.unnamed))
@@ -149,19 +147,18 @@ func notificationForegroundPolicyAndTapUseTheExistingMainWithoutPersistingDevice
   notifications.open(.unnamed)
   #expect(notifications.openRequest != first)
   await notifications.registration.received(token: String(repeating: "ab", count: 32))
-  #expect(defaults.persistentDomain(forName: name)?.keys.sorted() == ["notificationsEnabled"])
+  #expect(defaults.dictionaryRepresentation().keys.sorted() == ["notificationsEnabled"])
 }
 
 @MainActor
 private final class AlertFixture {
   let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-  let suite = "alert-route-\(UUID())"
-  let defaults: UserDefaults
+  let defaults: TestPreferences
   let profiles: [CoordinatorProfile]
   let notifications: AppNotifications
 
   init(count: Int = 2) throws {
-    defaults = try #require(UserDefaults(suiteName: suite))
+    defaults = TestPreferences()
     defaults.set(true, forKey: "notificationsEnabled")
     profiles = try (0..<count).map { index in
       var profile = CoordinatorProfile(
@@ -178,7 +175,6 @@ private final class AlertFixture {
   }
 
   func clean() {
-    defaults.removePersistentDomain(forName: suite)
     try? FileManager.default.removeItem(at: root)
   }
 }
@@ -386,9 +382,7 @@ func notificationRemovalIntentSurvivesAnUncertainReceiptAndAReopenedClient() asy
 
 @Test @MainActor
 func notificationsDefaultOnWithoutOverridingAnExplicitPreference() throws {
-  let name = "notification-default-fixture-\(UUID())"
-  let defaults = try #require(UserDefaults(suiteName: name))
-  defer { defaults.removePersistentDomain(forName: name) }
+  let defaults = TestPreferences()
   #expect(defaults.object(forKey: "notificationsEnabled") == nil)
   #expect(notificationsWithoutSavedCoordinators(defaults).registration.enabled)
   defaults.set(false, forKey: "notificationsEnabled")

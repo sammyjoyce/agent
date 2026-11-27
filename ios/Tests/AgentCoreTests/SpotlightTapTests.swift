@@ -65,9 +65,7 @@ struct SpotlightTapTests {
     }
     let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
-    let suite = "spotlight-tap-\(UUID())"
-    let defaults = try #require(UserDefaults(suiteName: suite))
-    defer { defaults.removePersistentDomain(forName: suite) }
+    let defaults = TestPreferences()
     defaults.set(false, forKey: "notificationsEnabled")
     let spotlight = SpotlightFake()
     let notifications = AppNotifications(
