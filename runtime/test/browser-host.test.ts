@@ -613,7 +613,7 @@ for (const [flow, directory] of [["current release", defaultExtensionDirectory],
       // The survivor is Beep Boop's own page, not 0.6's claimed blank, which
       // keeps the extension origin.
       const survivor = added[0]; assert.ok(survivor);
-      assert.notEqual(await f.client.evaluate(survivor.targetId, "origin"), `chrome-extension://${extensionId}`);
+      assert.equal(await f.client.evaluate(survivor.targetId, "origin"), "null");
       assert.equal(during.some(page => page.url.startsWith(`chrome-extension://${extensionId}/connect.html`)), false);
       const tab = opened.tabs[0]; assert.ok(tab);
       const closed = (await f.host.execute(request({ type: "close_tab", tab_id: tab.id }))).response;

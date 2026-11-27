@@ -568,8 +568,9 @@ export class BrowserHost {
       return page;
     } catch (error) {
       // Close only pages positively tied to this connection: its confirmed
-      // handoff and any page it created, including one newPage adopted before
-      // failing. 0.6 releases a session's tabs without removing them.
+      // handoff, the page it created, and any popup that page already opened.
+      // 0.6 releases a session's tabs without removing them. An unconfirmed
+      // handoff is left alone.
       const created = [...this.owned.values()].map(tab => tab.page);
       await Promise.all([...new Set([...handedPages, ...created])].map(page => closeWithin(page, 5000)));
       await this.close().catch(() => {});
@@ -921,7 +922,7 @@ export class BrowserHost {
       const recovery = this.config.debugging_port !== undefined && this.config.debugging_port !== null
         ? "Confirm the configured Chrome is running with its native debugging port enabled."
         : error instanceof ConnectionFailure && error.stage === "connector_identity"
-        ? "The Playwright extension paired, but its tab handoff did not match a supported flow (the 0.5 connect page or the 0.6 claimed blank tab). Its connect flow may have changed in a newer extension release. Beep Boop adopted no tab and closed only the tab handed to this connection."
+        ? "The Playwright extension paired, but its tab handoff did not match a supported flow (the 0.5 connect page or the 0.6 claimed blank tab). Its connect flow may have changed in a newer extension release. Beep Boop adopted and closed no tab; any tab the extension handed this connection may still be open."
         : "Confirm the Playwright extension is installed in the configured profile and its pairing token is available to Beep Boop.";
       return { type: mutates(action) ? "uncertain" : "disconnected", session_id,
         message: `${this.failureDetail(error)} Chrome did not confirm this operation. Native tabs may still be open and cleanup was not verified. Inspect its outcome before repeating it. ${recovery} Old handles are invalid after disconnection.` };
