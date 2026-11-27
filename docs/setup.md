@@ -750,6 +750,23 @@ choices fail explicitly. See the official
 [fast-mode guide](https://developers.openai.com/api/docs/guides/fast-mode).
 Existing tasks keep their saved selection.
 
+`observer_release_after_seconds` sets how long a task's terminal stays on
+finished work, from 1 to 86400 seconds. The default is 900, which is 15
+minutes. Work is finished when its task is resolved, or its agent is done or
+failed, and no input waits. The coordinator then releases each attached
+terminal once that time has passed since the work finished or since the
+terminal attached, whichever is later. New input or a reopened task cancels the
+release. A released terminal exits, and Rex closes its pane, only if it shows
+its own task and holds nothing that you typed or sent. Any other terminal stays
+open and attached to its task, and the time starts again. An input that you
+sent as the release arrived may not have reached the task. The terminal stays
+open for it too. When the terminal later ends, it saves that input privately,
+shows the file's path and waits for Enter. A terminal that ends for another
+reason, such as a lost coordinator, saves its unsent input in the same way. If
+it cannot save, it shows the input and waits for Enter, so you can copy it
+first. While a terminal waits for Enter, Rex shows its pane as blocked. A
+`--no-tui` terminal stays open after every release.
+
 Sources are optional `[[sources]]` entries. Set `enabled = false` to skip a feed
 without even discovering its accounts. An empty list disables external intake;
 internal task outcomes remain available.

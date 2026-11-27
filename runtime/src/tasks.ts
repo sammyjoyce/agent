@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { setImmediate } from "node:timers/promises";
+import { setImmediate, setTimeout as sleep } from "node:timers/promises";
 import { AttachmentStore, validateInput } from "./attachments.js";
 import type { AttachmentRef } from "./generated/AttachmentRef.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
@@ -91,7 +91,10 @@ export type ActorStart =
   | { state: "no_work" }
   /** `host_offline`: the recorded host is not connected, and no other host is chosen. */
   | { state: "unplaced" | "host_offline" | "unavailable"; reason: string };
-type ActorObserver = { session: WorkerSession; interactive: boolean; held?: ((session: WorkerSession) => void)[] };
+const OBSERVER_RELEASE_AFTER_MS = 15 * 60_000;
+type ObserverLifetime = { state: "attached" } | { state: "releasing"; at: number } | { state: "released" };
+type ActorObserver = { session: WorkerSession; interactive: boolean; held?: ((session: WorkerSession) => void)[];
+  readonly attachedAt: number; lifetime: ObserverLifetime; readonly released: AbortController };
 /** `run_stopped`: /goal pause aborted one native run. Its host calls stay cancelled until the conversation is idle, and
  * inputs still reach Pi so a later Stop can withdraw them. */
 type ActorTurn = { phase: "open" | "run_stopped"; controller: AbortController }
@@ -104,6 +107,13 @@ type TaskActor = { readonly ref: ActorRef; readonly mode: ActorMode; readonly ex
   readonly bound: Promise<void>; started(): void; readonly exit: Promise<ActorAnswer>; wake?: () => void; drained?: () => void };
 type ActorPlacement = { type: "placed"; host: WorkerHost } | { type: "host_at_start" } | { type: "unplaced" | "host_offline"; reason: string };
 function isAbortedJob(actor: TaskActor): boolean { return actor.mode === "job" && actor.turn.controller.signal.aborted; }
+function finishedWork(actor: TaskRecord | TaskAgentRecord): boolean {
+  switch (actor.state.state) {
+    case "open": case "waiting": return false;
+    case "resolved": case "done": case "failed": return actor.pending.length === 0;
+    default: { const unknown: never = actor.state; throw new TaskError(`Unknown actor state ${JSON.stringify(unknown)}`); }
+  }
+}
 const CONFINED_ACTOR_ONLY = "A confined task runs only its scheduler's input, as coordinator background work without agents or terminals";
 const PREDATES_CONFINEMENT = "This task held work before Dreams reserved its job id; it does not run, and a new task runs Dreams";
 const CONFINED_SCHEDULER_WRITES = "Only the scheduler writes to a confined task";
@@ -292,6 +302,7 @@ export class TaskStore {
   private claimReceiptWait = CLAIM_RECEIPT_WAIT_MS;
   private goals: GoalPolicy | undefined;
   private confinement: ActorConfinement = () => undefined;
+  private observerReleaseAfter = OBSERVER_RELEASE_AFTER_MS;
   constructor(readonly session: Harness, readonly inference = new ConversationModels()) { inference.bind(session); }
   async prepare(): Promise<void> {
     await this.recordsStore.prepare(this.session, async () => (await this.session.snapshot(Tasks, BACKGROUND_CONTEXT))?.tasks ?? [], task => task.id,
@@ -334,6 +345,7 @@ export class TaskStore {
   useClaimReceiptWait(milliseconds: number): void { this.claimReceiptWait = milliseconds; }
   useActorExecution(execution: ActorExecution): void { this.execution = execution; }
   useConfinement(rule: ActorConfinement): void { this.confinement = rule; }
+  useObserverReleaseAfter(milliseconds: number): void { this.observerReleaseAfter = milliseconds; }
   isConfined(task: Pick<TaskRecord, "sources">): boolean { return this.confinement(task) !== undefined; }
   async isIsolatedTask(task: Pick<TaskRecord, "delivery_conversation_id">): Promise<boolean> {
     if (task.delivery_conversation_id === undefined) return false;
@@ -745,6 +757,7 @@ export class TaskStore {
       return undefined;
     }, BACKGROUND_CONTEXT);
     if (refused !== undefined) throw new TaskError(refused);
+    this.wakeActor(id);
     const saved = await this.get(id);
     if (this.hasSidechatDelivery(saved) && saved.state.state === "waiting" && saved.state.target === "owner") {
       await this.flushOwnerWait(saved.id);
@@ -1350,8 +1363,10 @@ export class TaskStore {
     }
     const task = await this.get(id);
     if (active !== undefined) { active.revision += 1; active.wake?.(); }
+    if (agentId !== undefined) this.wakeActor(id);
     return task;
   }
+  private wakeActor(taskId: string, agentId?: string): void { this.running.get(this.actorKey(taskId, agentId))?.wake?.(); }
   private async pushIn(tx: Tx, task: TaskRecord, actor: TaskRecord | TaskAgentRecord, input: TaskInput): Promise<void> {
     if (queuedInput(actor, input) === undefined) actor.pending.push(input);
     actor.state = { state: "open" };
@@ -1583,6 +1598,7 @@ export class TaskStore {
       await this.reportAgentIn(tx, task, agent, summary, failure,
         origin === undefined ? undefined : { entry_id: origin.id.toString(), call_id: provenance?.call_id ?? null });
     }, BACKGROUND_CONTEXT);
+    this.wakeActor(taskId, agentId);
     return this.get(taskId);
   }
   private async reportAgentIn(tx: Tx, task: TaskRecord, agent: TaskAgentRecord, summary: string, failure?: string,
@@ -2161,7 +2177,7 @@ export class TaskStore {
       else observer.held.push(event);
     }
   }
-  private release(observer: ActorObserver): void {
+  private deliverHeld(observer: ActorObserver): void {
     const held = observer.held ?? [];
     delete observer.held;
     for (const event of held) event(observer.session);
@@ -2169,6 +2185,37 @@ export class TaskStore {
   private hasInteractiveObserver(actor: TaskActor): boolean {
     for (const observer of actor.observers) if (observer.interactive) return true;
     return false;
+  }
+  private releaseAt(observer: ActorObserver, finishedAt: number): number {
+    return Math.max(finishedAt, observer.attachedAt) + this.observerReleaseAfter;
+  }
+  private async holdIdle(active: TaskActor, revision: number): Promise<void> {
+    let finishedAt: number | undefined;
+    try {
+      while (active.revision === revision && this.hasInteractiveObserver(active) && !active.fenced) {
+        // Armed before the read, so a change committed during the read still wakes this hold.
+        const woken = new Promise<void>((resolve) => { active.wake = resolve; });
+        const finished = finishedWork(this.actor(await this.get(active.ref.task_id), active.ref.agent_id));
+        if (active.revision !== revision || active.fenced) break;
+        const now = Date.now();
+        finishedAt = finished ? finishedAt ?? now : undefined;
+        for (const observer of active.observers) {
+          if (!observer.interactive || observer.lifetime.state === "released") continue;
+          const at = finishedAt === undefined ? undefined : this.releaseAt(observer, finishedAt);
+          observer.lifetime = at === undefined ? { state: "attached" } : at > now ? { state: "releasing", at } : { state: "released" };
+          if (observer.lifetime.state === "released") observer.released.abort();
+        }
+        const next = Math.min(...[...active.observers].map((observer) => observer.lifetime.state === "releasing" ? observer.lifetime.at : Infinity));
+        if (next === Infinity) { await woken; continue; }
+        // An idle actor never kept the process alive, so a pending release must not either.
+        const timer = new AbortController();
+        await Promise.race([woken, sleep(next - now, undefined, { signal: timer.signal, ref: false }).catch(() => {})]);
+        timer.abort();
+      }
+    } finally {
+      delete active.wake;
+      for (const observer of active.observers) if (observer.lifetime.state === "releasing") observer.lifetime = { state: "attached" };
+    }
   }
   private async reopenTurn(actor: TaskActor): Promise<void> {
     while (actor.turn.phase !== "open" && actor.mode === "interactive" && !actor.fenced) {
@@ -2196,7 +2243,8 @@ export class TaskStore {
     const confirmed = await this.confirmBinding(input, call);
     let task = confirmed.task, worker: Extract<WorkerState, { state: "bound" | "resuming" }> = confirmed.worker;
     const attached: ActorObserver | undefined = observer === undefined ? undefined
-      : { session: observer, interactive: input.interactive === true, held: [] };
+      : { session: observer, interactive: input.interactive === true, held: [], attachedAt: Date.now(), lifetime: { state: "attached" },
+        released: new AbortController() };
     for (;;) {
       let actor = this.running.get(key);
       if (actor?.phase === "closing") {
@@ -2219,7 +2267,7 @@ export class TaskStore {
       } else if (attached === undefined) throw new TaskError("This task already has an attached worker");
       else {
         const joining = actor.phase === "bound";
-        actor.observers.add(attached);
+        actor.observers.add(attached); actor.wake?.();
         if (joining) {
           try {
             await actor.bound;
@@ -2227,7 +2275,7 @@ export class TaskStore {
             await attached.session.ready(actor.conversation, this.actor(await this.get(ref.task_id), ref.agent_id).title);
             const busy = actor.busy, quiet = attached.held?.length === 0;
             if (busy) attached.session.working?.();
-            this.release(attached);
+            this.deliverHeld(attached);
             if (!busy && quiet) attached.session.idle();
           } catch (error) { if (actor.observers.delete(attached)) actor.wake?.(); throw error; }
         }
@@ -2235,11 +2283,12 @@ export class TaskStore {
       if (attached === undefined || observer === undefined) return actor.exit;
       let detach = () => {};
       const detached = new Promise<undefined>((resolve) => { detach = () => resolve(undefined); });
-      observer.signal.addEventListener("abort", detach, { once: true });
-      if (observer.signal.aborted) detach();
+      const ended = AbortSignal.any([observer.signal, attached.released.signal]);
+      ended.addEventListener("abort", detach, { once: true });
+      if (ended.aborted) detach();
       try { return await Promise.race([actor.exit, detached]) ?? actor.answer; }
       finally {
-        observer.signal.removeEventListener("abort", detach);
+        ended.removeEventListener("abort", detach);
         if (actor.observers.delete(attached)) actor.wake?.();
       }
     }
@@ -2315,7 +2364,7 @@ export class TaskStore {
       for (const observer of [...active.observers]) {
         if (!active.observers.has(observer)) continue;
         await observer.session.ready(conversation, actor.title);
-        this.release(observer);
+        this.deliverHeld(observer);
       }
       active.started();
       this.session.resume();
@@ -2396,10 +2445,7 @@ export class TaskStore {
           active.busy = false; turnInHand = undefined;
           if (!this.hasInteractiveObserver(active)) break;
           this.publish(active, (session) => session.idle());
-          while (active.revision === revision && this.hasInteractiveObserver(active) && !active.fenced) {
-            await new Promise<void>((resolve) => { active.wake = resolve; });
-          }
-          delete active.wake;
+          await this.holdIdle(active, revision);
           continue;
         }
         if (confined !== undefined && next.scheduled === undefined && (await this.session.commit((tx) =>

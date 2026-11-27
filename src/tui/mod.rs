@@ -94,6 +94,9 @@ enum Update {
     Observation(ObservationState),
     InputUncertain(String),
     Draft(tokio::sync::oneshot::Sender<ComposerInput>),
+    StopWithDraft(tokio::sync::oneshot::Sender<ComposerInput>),
+    PauseKeys(tokio::sync::oneshot::Sender<ComposerInput>),
+    ReadKeys,
     Info(tokio::sync::oneshot::Sender<TuiInfo>),
     Notice(String),
     RestoreInput(ComposerInput),
@@ -259,6 +262,26 @@ impl TuiHandle {
         let (sender, draft) = tokio::sync::oneshot::channel();
         self.send(Update::Draft(sender))?;
         draft.await.context("The terminal draft could not be read")
+    }
+    /// Reads the draft and stops the interface in one step, so no input
+    /// follows the draft. The interface first reads the keys that have already
+    /// arrived. Inputs sent before the draft wait in the input channel.
+    pub async fn stop_with_draft(&self) -> Result<ComposerInput> {
+        let (sender, draft) = tokio::sync::oneshot::channel();
+        self.send(Update::StopWithDraft(sender))?;
+        draft.await.context("The terminal draft could not be read")
+    }
+    /// Stops reading keys and answers with the draft. The interface first
+    /// reads the keys that have already arrived, so the answer and the input
+    /// channel hold everything typed so far. Later keys wait in the terminal
+    /// until `read_keys`.
+    pub async fn pause_keys(&self) -> Result<ComposerInput> {
+        let (sender, draft) = tokio::sync::oneshot::channel();
+        self.send(Update::PauseKeys(sender))?;
+        draft.await.context("The terminal draft could not be read")
+    }
+    pub fn read_keys(&self) -> Result<()> {
+        self.send(Update::ReadKeys)
     }
     pub async fn info(&self) -> Result<TuiInfo> {
         let (sender, info) = tokio::sync::oneshot::channel();
@@ -3056,6 +3079,7 @@ fn run(
     mut state: State,
 ) -> Result<()> {
     let mut tick = Instant::now();
+    let mut reads_keys = true;
     loop {
         if inputs.is_closed() {
             return screen.finish(&mut state);
@@ -3093,6 +3117,21 @@ fn run(
                 Ok(Update::Draft(sender)) => {
                     let _ = sender.send(state.composer_draft());
                 }
+                Ok(Update::StopWithDraft(sender)) => {
+                    // The final frame asks the terminal where its cursor is.
+                    // crossterm keeps each key it reads meanwhile for a later
+                    // read, so the keys are read after the frame.
+                    let finished = screen.finish(&mut state);
+                    send_arrived_keys(&mut state, &inputs)?;
+                    let _ = sender.send(state.composer_draft());
+                    return finished;
+                }
+                Ok(Update::PauseKeys(sender)) => {
+                    send_arrived_keys(&mut state, &inputs)?;
+                    reads_keys = false;
+                    let _ = sender.send(state.composer_draft());
+                }
+                Ok(Update::ReadKeys) => reads_keys = true,
                 Ok(Update::Info(sender)) => {
                     let _ = sender.send(state.info.clone());
                 }
@@ -3149,17 +3188,35 @@ fn run(
         if state.changed {
             screen.draw(&mut state)?;
         }
-        if event::poll(if updates_pending {
+        let wait = if updates_pending {
             Duration::ZERO
         } else {
             Duration::from_millis(40)
-        })? && let Some(input) = state.input(event::read()?)
-        {
-            inputs
-                .send(input)
-                .context("The agent input receiver closed")?;
+        };
+        if !reads_keys {
+            // A pause lasts until the next update, which resumes or stops the interface.
+            thread::sleep(wait.min(Duration::from_millis(2)));
+        } else if event::poll(wait)? {
+            send_key_input(&mut state, &inputs)?;
         }
     }
+}
+
+/// Reads every key that the terminal already holds, paused or not.
+fn send_arrived_keys(state: &mut State, inputs: &UnboundedSender<TuiInput>) -> Result<()> {
+    while event::poll(Duration::ZERO)? {
+        send_key_input(state, inputs)?;
+    }
+    Ok(())
+}
+
+fn send_key_input(state: &mut State, inputs: &UnboundedSender<TuiInput>) -> Result<()> {
+    if let Some(input) = state.input(event::read()?) {
+        inputs
+            .send(input)
+            .context("The agent input receiver closed")?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@
  * are refused every target they do not own. Nothing here reaches the user's own Rex server.
  *
  *   node dist/test/acceptance/rex-lab.js --beep-boop <store path> --rex <store path> --evidence <dir>
+ *     [--observer-release-after-seconds <n>]
  */
 import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -15,16 +16,20 @@ import { parseArgs } from "node:util";
 import { execFileAsync, isRecord, now, PrivateCoordinator, SecretScanner, waitFor } from "./chrome-lab.js";
 
 type Step = { code: string } | { tool: string; args: Record<string, unknown> } | { text: string };
-type Phase = "main" | "work" | "agent";
+type Phase = "main" | "work" | "agent" | "close";
 type Seen = { phase: Phase; step: number; at: number; declared: string[]; rexNamespace: boolean; rexSection: number; outputs: string[] };
 type Out = Record<string, any>;
 
-const { values } = parseArgs({ options: { "beep-boop": { type: "string" }, rex: { type: "string" }, evidence: { type: "string" }, keep: { type: "boolean" } } });
+const { values } = parseArgs({ options: { "beep-boop": { type: "string" }, rex: { type: "string" }, evidence: { type: "string" },
+  "observer-release-after-seconds": { type: "string" }, keep: { type: "boolean" } } });
 function required(value: string | undefined, flag: string): string {
   if (value === undefined) throw new Error("Pass --beep-boop, --rex and --evidence; " + flag + " is missing");
   return value;
 }
 const beepBoop = required(values["beep-boop"], "--beep-boop"), rexPath = required(values.rex, "--rex"), evidence = required(values.evidence, "--evidence");
+const releaseAfter = values["observer-release-after-seconds"], graceSeconds = Number(releaseAfter ?? 900), graceMs = graceSeconds * 1000;
+if (!Number.isInteger(graceSeconds) || graceSeconds < 1) throw new Error("--observer-release-after-seconds takes a whole number of seconds");
+const LATE_ATTACH_SLACK_MS = 10_000;
 mkdirSync(evidence, { recursive: true });
 
 const tag = "rexlab-" + randomBytes(4).toString("hex");
@@ -36,10 +41,13 @@ const TERM_DRAFT = "REXLAB_TERM_DRAFT_" + nonce, KILL_DRAFT = "REXLAB_KILL_DRAFT
 const UNSAVED = "REXLAB_UNSAVED_" + nonce, UNSAVED_DRAFT = "REXLAB_UNSAVED_DRAFT_" + nonce;
 const key = (phase: Phase) => tag + ":" + phase;
 const seen: Seen[] = [];
+const at = (phase: Phase, step: number) => seen.find((entry) => entry.phase === phase && entry.step === step);
 const finals = new Map<Phase, string>();
 const ids: { decoySession?: string; decoyBlock?: string; inSession?: string; workerBlock?: string } = {};
 let markReady: () => void = () => {};
 const ready = new Promise<void>((resolve) => { markReady = resolve; });
+let markAttached: () => void = () => {};
+const attached = new Promise<void>((resolve) => { markAttached = resolve; });
 
 function text(content: unknown): string {
   if (typeof content === "string") return content;
@@ -161,6 +169,11 @@ const SCRIPTS: Record<Phase, ((outs: string[]) => Promise<Step> | Step)[]> = {
     () => ({ tool: "report_result", args: { summary: "Rex lab agent inspected its terminal." } }),
     () => ({ text: "Rex lab agent finished." }),
   ],
+  close: [
+    async () => { await attached; return { tool: "record_task", args: { summary: "Rex lab closed.",
+      state: { state: "resolved", evidence: "The lab saw the task's next worker pane attach." } } }; },
+    () => ({ text: "Rex lab closed." }),
+  ],
 };
 
 function toolOutputs(input: unknown[], from: number): string[] {
@@ -178,7 +191,7 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
   let index = -1, phase: Phase | undefined;
   input.forEach((item, position) => {
     if (!isRecord(item) || item.role !== "user") return;
-    const found = (["main", "work", "agent"] as const).find((candidate) => text(item.content).includes(key(candidate)));
+    const found = (["main", "work", "agent", "close"] as const).find((candidate) => text(item.content).includes(key(candidate)));
     if (found !== undefined) { index = position; phase = found; }
   });
   const updates = input.flatMap((item) => isRecord(item) && item.type === "additional_tools" && Array.isArray(item.tools) ? item.tools : []);
@@ -240,7 +253,8 @@ const address = server.address();
 if (address === null || typeof address === "string") throw new Error("The model fixture has no port");
 
 const coordinator = PrivateCoordinator.create({ beepBoop, rex: rexPath, modelPort: address.port, nodeName: "rexlab", browserConfig: "",
-  logFile: join(evidence, "coordinator.log"), scanner: new SecretScanner(), cliLog: join(evidence, "cli.jsonl") });
+  logFile: join(evidence, "coordinator.log"), scanner: new SecretScanner(), cliLog: join(evidence, "cli.jsonl"),
+  ...(releaseAfter === undefined ? {} : { extraConfigToml: "observer_release_after_seconds = " + graceSeconds }) });
 const socket = join(coordinator.dir, "rex.sock"), home = join(coordinator.dir, "home");
 /** The Rex CLI against the lab's private server only. */
 async function rex(args: string[]): Promise<string> {
@@ -284,11 +298,11 @@ async function stoppedAt(session: string, block: string, timeoutMs: number): Pro
   return waitFor("the program in " + block + " to stop", timeoutMs, async () => runs(await held(session, block)) ? undefined : Date.now(), 100)
     .catch(() => undefined);
 }
-async function leftRex(session: string, block: string, stopped: number): Promise<{ left_ms: number } | { remained: unknown }> {
+async function leftRex(session: string, block: string, since: number, withinMs = 2_000): Promise<{ left_ms: number } | { remained: unknown }> {
   for (;;) {
     const entry = (await listed(session)).find((item) => item.block_id === block);
-    if (entry === undefined) return { left_ms: Date.now() - stopped };
-    if (Date.now() - stopped > 2_000) return { remained: { entry, process: await held(session, block) } };
+    if (entry === undefined) return { left_ms: Date.now() - since };
+    if (Date.now() - since > withinMs) return { remained: { entry, process: await held(session, block) } };
     await delay(100);
   }
 }
@@ -435,6 +449,30 @@ async function heldDraft(taskId: string, session: string): Promise<Record<string
   return { sent, presented, saved, screen: shown.slice(-800), status, left };
 }
 
+async function releaseLifecycle(taskId: string, session: string): Promise<Record<string, unknown>> {
+  const previous = (await labTask())?.worker.binding?.block_id;
+  const sent = await coordinator.send(taskId, key("close") + " Resolve the task again.");
+  const presented = await waitFor("the task's next worker pane", 120_000, async () => {
+    const binding = (await labTask())?.worker.binding;
+    return binding !== undefined && binding.block_id !== previous ? binding : undefined;
+  }, 1000).catch(() => undefined);
+  const block = presented?.block_id ?? "";
+  const screen = presented === undefined ? undefined : await waitFor("the next pane to show the closing input", 60_000, async () => {
+    const captured = await rex(["capture", "-s", session, "-b", block, "--trim"]);
+    return captured.includes(key("close")) ? captured : undefined;
+  }, 1000).catch(() => undefined);
+  markAttached();
+  check("P3: the task's next worker pane attaches while its work runs", screen !== undefined, { sent, presented, screen: screen?.slice(-800) });
+  await waitFor("the closing turn", 60_000, () => finals.get("close"), 200).catch(() => undefined);
+  const state = (await labTask())?.state;
+  check("P3: the task resolved again", state?.state === "resolved", state);
+  const finished = at("close", 1)?.at;
+  const left = presented === undefined || finished === undefined ? undefined : await leftRex(session, block, finished, graceMs + 2_000);
+  check("P3: the resolved task's worker pane stays for the grace", left !== undefined && ("remained" in left || left.left_ms >= graceMs), left);
+  check("P3: after the grace its run-task ends and its block leaves session.list_blocks within 2 s", left !== undefined && "left_ms" in left, left);
+  return { sent, presented, finished_at: finished, left };
+}
+
 const checks: { name: string; pass: boolean; observed: unknown }[] = [];
 const check = (name: string, pass: boolean, observed: unknown) => { checks.push({ name, pass, observed }); };
 const report: Record<string, unknown> = { tag, marker: MARKER, started_at: now() };
@@ -456,13 +494,15 @@ try {
   await waitFor("the agent to finish", 60_000, () => finals.get("agent"), 1000);
 
   const work = seen.filter((entry) => entry.phase === "work");
-  const at = (phase: Phase, step: number) => seen.find((entry) => entry.phase === phase && entry.step === step);
   const last = (entry: Seen | undefined) => entry?.outputs.map(decoded).filter((value) => value !== undefined).at(-1) ?? {};
   const main = last(at("work", 1)), afterCancel = last(at("work", 3)), closing = last(at("work", 6)), agent = last(at("agent", 1));
   const cancelIssued = at("work", 1), cancelEnded = at("work", 2);
   const cancel = { elapsed_ms: cancelIssued !== undefined && cancelEnded !== undefined ? cancelEnded.at - cancelIssued.at : null,
     output: cancelEnded?.outputs.at(-1)?.slice(0, 600) };
   Object.assign(report, { worker: main, after_cancel: afterCancel, closing, agent, cancel });
+  const agentFinished = at("agent", 2)?.at;
+  const agentLeft = typeof agent.here?.blockId !== "string" || agentFinished === undefined ? Promise.resolve(undefined)
+    : leftRex(binding.session_id, agent.here.blockId, agentFinished, graceMs + LATE_ATTACH_SLACK_MS).catch((error: unknown) => ({ failed: String(error) }));
 
   const mainRequests = seen.filter((entry) => entry.phase === "main");
   check("main offers no Rex tools and no rex namespace", mainRequests.length > 0 && mainRequests.every((entry) =>
@@ -534,6 +574,11 @@ try {
   check("the task resolved", resolved?.state.state === "resolved", resolved?.state);
   report.panes = await paneLifecycle(bound.id, binding.session_id);
   report.unsaved = await unsavedDraft(bound.id, binding.session_id);
+  report.release = await releaseLifecycle(bound.id, binding.session_id);
+  const agentPane = report.agent_pane = await agentLeft;
+  check("P3: the finished agent's pane stays for the grace", agentPane !== undefined
+    && ("remained" in agentPane || ("left_ms" in agentPane && agentPane.left_ms >= graceMs)), agentPane);
+  check("P3: then the agent's run-task ends and its block leaves session.list_blocks", agentPane !== undefined && "left_ms" in agentPane, agentPane);
   report.held = await heldDraft(bound.id, binding.session_id);
 } catch (error) {
   check("lab ran to completion", false, error instanceof Error ? error.stack : String(error));

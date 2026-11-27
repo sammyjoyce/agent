@@ -140,6 +140,11 @@ pub struct CoordinatorBootstrap {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub background: Option<crate::background::BackgroundSettings>,
+    /// How long an interactive task terminal stays attached to finished work.
+    /// Without it, the runtime's default of 15 minutes applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub observer_release_after_seconds: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, JsonSchema, TS)]

@@ -3,4 +3,9 @@ import type { AgentNode } from "./AgentNode.js";
 import type { BackgroundSettings } from "./BackgroundSettings.js";
 import type { CoordinatorSettings } from "./CoordinatorSettings.js";
 
-export type CoordinatorBootstrap = { settings: CoordinatorSettings, node: AgentNode | null, background?: BackgroundSettings, };
+export type CoordinatorBootstrap = { settings: CoordinatorSettings, node: AgentNode | null, background?: BackgroundSettings,
+/**
+ * How long an interactive task terminal stays attached to finished work.
+ * Without it, the runtime's default of 15 minutes applies.
+ */
+observer_release_after_seconds?: number, };

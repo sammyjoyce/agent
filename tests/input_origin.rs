@@ -223,6 +223,7 @@ async fn cli_and_native_origins_reach_inference_per_input_without_text_or_host_i
                         sources: vec![],
                     },
                     background: None,
+                    observer_release_after_seconds: None,
                 },
             })
             .await

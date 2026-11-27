@@ -640,7 +640,7 @@ export type SendOutcome =
   | { type: "dispatched"; input_id: string }
   | { type: "accepted_dispatch_failed"; input_id: string; error: string };
 export type CoordinatorOptions = { beepBoop: string; rex: string; modelPort: number; nodeName: string; browserConfig: string;
-  logFile: string; scanner: SecretScanner; cliLog: string };
+  logFile: string; scanner: SecretScanner; cliLog: string; extraConfigToml?: string };
 
 export class PrivateCoordinator {
   private serve: ChildProcess | undefined;
@@ -658,7 +658,7 @@ export class PrivateCoordinator {
 context_repositories = []
 job_directories = []
 sources = []
-
+${options.extraConfigToml ?? ""}
 [model]
 provider = "azure"
 model_id = "gpt-4.1"

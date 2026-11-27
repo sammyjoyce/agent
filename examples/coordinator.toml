@@ -3,6 +3,9 @@
 context_repositories = []
 # Git-managed job directories. Validate and apply changes with agent jobs sync.
 job_directories = []
+# Seconds a task terminal stays on finished work before the coordinator
+# releases it and Rex closes its pane. The default is 900.
+# observer_release_after_seconds = 900
 
 # Defaults for new work. Existing tasks keep their saved model selection.
 [model]

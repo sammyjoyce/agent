@@ -80,6 +80,7 @@ await import(pathToFileURL({}).href);
                     },
                     node: None,
                     background: None,
+                    observer_release_after_seconds: None,
                 }),
                 None,
                 None,
