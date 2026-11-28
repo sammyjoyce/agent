@@ -470,10 +470,12 @@ and configured CLIs first, Chrome tools second, and desktop computer use last.
 ### macOS menu bar status app
 
 - [x] **Local service status in the macOS menu bar.** Ship a lightweight macOS
-  menu bar app showing Beep Boop's status on that Mac, including whether the
-  local service is running and its installed versus running versions. *(`macos/BeepBoopMenuBar/`
-  queries `NativeRequest::ServiceStatus` over `agent.sock` and compares installed
-  `beep-boop --version` and the folder of the resolved executable against the running service.)*
+  menu bar app showing Beep Boop's status on that Mac, including whether local
+  services are running and their installed versus running versions. *(`macos/BeepBoopMenuBar/`
+  discovers configured LaunchAgents and queries `NativeRequest::ServiceStatus`
+  over local coordinator (`agent.sock`), worker (`worker.sock`), and standby
+  (`standby.sock`) sockets, comparing each service's installed `beep-boop --version`
+  and resolved executable directory against the running process.)*
 
 ### Apple Notes, Reminders, Mail and Messages (`macctl`)
 

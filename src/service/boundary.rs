@@ -10,7 +10,7 @@ use crate::{
         apply::{DreamsHeld, DreamsRejected, POLICY_CHANGED},
         ops,
     },
-    native::{NativeEvent, ServiceRequest},
+    native::{NativeEvent, ServiceRequest, ServiceRole, local_status::current_executable_path},
     protocol::ErrorCode,
     runtime::Runtime,
 };
@@ -22,21 +22,19 @@ pub(super) async fn handle<W: AsyncWrite + Unpin>(
     request: ServiceRequest,
 ) -> Result<()> {
     let outcome: std::result::Result<NativeEvent, (ErrorCode, String)> = match request {
-        ServiceRequest::ServiceStatus => {
-            let executable_path = std::env::current_exe().ok().map(|path| {
-                path.canonicalize()
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .into_owned()
-            });
-            Ok(NativeEvent::ServiceStatus {
-                coordinator_id: runtime.coordinator_id().to_string(),
-                pid: std::process::id(),
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-                executable_path,
-                state_dir: broker.state_dir().to_string_lossy().into_owned(),
-            })
-        }
+        ServiceRequest::ServiceStatus => Ok(NativeEvent::ServiceStatus {
+            coordinator_id: runtime.coordinator_id().to_string(),
+            pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            executable_path: current_executable_path(),
+            state_dir: broker.state_dir().to_string_lossy().into_owned(),
+            role: Some(ServiceRole::Coordinator),
+            connection_state: None,
+            target: None,
+            node_name: None,
+            applied_position: None,
+            detail: None,
+        }),
         ServiceRequest::DreamsList => async {
             let policy = broker.dreams_policy_now()?;
             let (runs, pending_count) =

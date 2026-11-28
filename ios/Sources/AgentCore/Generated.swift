@@ -1648,23 +1648,41 @@ public struct NativeEventDreamsApplied: Codable, Sendable, Equatable {
 }
 
 public struct NativeEventServiceStatus: Codable, Sendable, Equatable {
+    public var `appliedPosition`: Int?
+    public var `connectionState`: ServiceConnectionState?
     public var `coordinatorId`: String
+    public var `detail`: String?
     public var `executablePath`: String?
+    public var `nodeName`: String?
     public var `pid`: Int
+    public var `role`: ServiceRole?
     public var `stateDir`: String
+    public var `target`: String?
     public var `version`: String
-    public init(`coordinatorId`: String, `executablePath`: String? = nil, `pid`: Int, `stateDir`: String, `version`: String) {
+    public init(`appliedPosition`: Int? = nil, `connectionState`: ServiceConnectionState? = nil, `coordinatorId`: String, `detail`: String? = nil, `executablePath`: String? = nil, `nodeName`: String? = nil, `pid`: Int, `role`: ServiceRole? = nil, `stateDir`: String, `target`: String? = nil, `version`: String) {
+        self.`appliedPosition` = `appliedPosition`
+        self.`connectionState` = `connectionState`
         self.`coordinatorId` = `coordinatorId`
+        self.`detail` = `detail`
         self.`executablePath` = `executablePath`
+        self.`nodeName` = `nodeName`
         self.`pid` = `pid`
+        self.`role` = `role`
         self.`stateDir` = `stateDir`
+        self.`target` = `target`
         self.`version` = `version`
     }
     enum CodingKeys: String, CodingKey {
+        case `appliedPosition` = "applied_position"
+        case `connectionState` = "connection_state"
         case `coordinatorId` = "coordinator_id"
+        case `detail` = "detail"
         case `executablePath` = "executable_path"
+        case `nodeName` = "node_name"
         case `pid` = "pid"
+        case `role` = "role"
         case `stateDir` = "state_dir"
+        case `target` = "target"
         case `version` = "version"
     }
 }
@@ -2621,6 +2639,20 @@ public struct ScheduledOccurrence: Codable, Sendable, Equatable {
         case `scheduleId` = "schedule_id"
         case `scheduledAt` = "scheduled_at"
     }
+}
+
+public enum ServiceConnectionState: String, Codable, Sendable, Equatable {
+    case `connected` = "connected"
+    case `connecting` = "connecting"
+    case `reconnecting` = "reconnecting"
+    case `following` = "following"
+    case `authorityUnreachable` = "authority_unreachable"
+}
+
+public enum ServiceRole: String, Codable, Sendable, Equatable {
+    case `coordinator` = "coordinator"
+    case `worker` = "worker"
+    case `standby` = "standby"
 }
 
 public enum SidechatNotificationPreference: String, Codable, Sendable, Equatable {

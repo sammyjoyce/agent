@@ -2800,12 +2800,15 @@ mod tests {
                 version,
                 executable_path,
                 state_dir,
+                role,
+                ..
             } => {
                 assert_eq!(coordinator_id, &runtime_coordinator_id(&state));
                 assert_eq!(*pid, std::process::id());
                 assert_eq!(version, env!("CARGO_PKG_VERSION"));
                 assert!(executable_path.is_some());
                 assert_eq!(state_dir, &state.to_string_lossy());
+                assert_eq!(*role, Some(crate::native::ServiceRole::Coordinator));
             }
             other => panic!("Expected ServiceStatus event, got {other:?}"),
         }

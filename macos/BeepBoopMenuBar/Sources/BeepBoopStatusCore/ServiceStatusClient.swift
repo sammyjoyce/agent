@@ -8,19 +8,37 @@ public struct RunningServiceInfo: Equatable, Sendable {
   public var version: String
   public var executablePath: String?
   public var stateDir: String
+  public var role: ServiceRole
+  public var connectionState: ServiceConnectionState?
+  public var target: String?
+  public var nodeName: String?
+  public var appliedPosition: UInt64?
+  public var detail: String?
 
   public init(
     coordinatorID: String,
     pid: UInt32,
     version: String,
     executablePath: String?,
-    stateDir: String
+    stateDir: String,
+    role: ServiceRole = .coordinator,
+    connectionState: ServiceConnectionState? = nil,
+    target: String? = nil,
+    nodeName: String? = nil,
+    appliedPosition: UInt64? = nil,
+    detail: String? = nil
   ) {
     self.coordinatorID = coordinatorID
     self.pid = pid
     self.version = version
     self.executablePath = executablePath
     self.stateDir = stateDir
+    self.role = role
+    self.connectionState = connectionState
+    self.target = target
+    self.nodeName = nodeName
+    self.appliedPosition = appliedPosition
+    self.detail = detail
   }
 }
 
@@ -52,6 +70,96 @@ public enum VersionAlignment: Equatable, Sendable {
   case binaryReplaced(version: String, installedPath: String, runningPath: String)
 }
 
+public enum ServiceHealth: Equatable, Sendable {
+  case healthy
+  case starting
+  case degraded
+  case stopped
+}
+
+public struct LocalServiceTarget: Equatable, Sendable {
+  public var role: ServiceRole
+  public var stateDir: URL
+  public var socketFileName: String
+  public var configuredBinaryPath: String?
+  public var configured: Bool
+
+  public init(
+    role: ServiceRole,
+    stateDir: URL,
+    socketFileName: String,
+    configuredBinaryPath: String? = nil,
+    configured: Bool = false
+  ) {
+    self.role = role
+    self.stateDir = stateDir
+    self.socketFileName = socketFileName
+    self.configuredBinaryPath = configuredBinaryPath
+    self.configured = configured
+  }
+
+  public var socketURL: URL {
+    stateDir.appending(path: socketFileName)
+  }
+}
+
+public struct ServiceSnapshot: Equatable, Sendable, Identifiable {
+  public var role: ServiceRole
+  public var configured: Bool
+  public var socketPath: String
+  public var stateDir: String
+  public var running: ServiceRunningState
+  public var installed: InstalledBinaryInfo?
+  public var alignment: VersionAlignment
+  public var health: ServiceHealth
+
+  public var id: String {
+    "\(role.rawValue):\(socketPath)"
+  }
+
+  public init(
+    role: ServiceRole,
+    configured: Bool,
+    socketPath: String,
+    stateDir: String,
+    running: ServiceRunningState,
+    installed: InstalledBinaryInfo?,
+    alignment: VersionAlignment,
+    health: ServiceHealth
+  ) {
+    self.role = role
+    self.configured = configured
+    self.socketPath = socketPath
+    self.stateDir = stateDir
+    self.running = running
+    self.installed = installed
+    self.alignment = alignment
+    self.health = health
+  }
+}
+
+public struct LocalHostSnapshot: Equatable, Sendable {
+  public var services: [ServiceSnapshot]
+  public var installedCLI: InstalledBinaryInfo?
+  public var overallHealth: ServiceHealth
+  public var defaultStateDir: String
+  public var checkedAt: Date
+
+  public init(
+    services: [ServiceSnapshot],
+    installedCLI: InstalledBinaryInfo?,
+    overallHealth: ServiceHealth,
+    defaultStateDir: String,
+    checkedAt: Date
+  ) {
+    self.services = services
+    self.installedCLI = installedCLI
+    self.overallHealth = overallHealth
+    self.defaultStateDir = defaultStateDir
+    self.checkedAt = checkedAt
+  }
+}
+
 public struct LocalServiceSnapshot: Equatable, Sendable {
   public var socketPath: String
   public var stateDir: String
@@ -79,18 +187,26 @@ public struct LocalServiceSnapshot: Equatable, Sendable {
 
 public struct ServiceStatusClient: Sendable {
   public static let socketFileName = "agent.sock"
+  public static let workerSocketFileName = "worker.sock"
+  public static let standbySocketFileName = "standby.sock"
   private static let versionCommandTimeoutSeconds: TimeInterval = 3
   private static let socketTimeoutSeconds = 2
 
   public var stateDir: URL
   public var explicitBinaryPath: String?
+  public var launchAgentsDir: URL?
+  public var explicitTargets: [LocalServiceTarget]?
 
   public init(
     stateDir: URL? = nil,
-    explicitBinaryPath: String? = nil
+    explicitBinaryPath: String? = nil,
+    launchAgentsDir: URL? = nil,
+    explicitTargets: [LocalServiceTarget]? = nil
   ) {
     self.stateDir = stateDir ?? Self.defaultStateDirectory()
     self.explicitBinaryPath = explicitBinaryPath
+    self.launchAgentsDir = launchAgentsDir
+    self.explicitTargets = explicitTargets
   }
 
   /// Matches `src/state.rs` default macOS state location (`Application Support/agent`).
@@ -100,6 +216,19 @@ public struct ServiceStatusClient: Sendable {
       ?? FileManager.default.homeDirectoryForCurrentUser.appending(
         path: "Library/Application Support", directoryHint: .isDirectory)
     return base.appending(path: "agent", directoryHint: .isDirectory)
+  }
+
+  public static func defaultLaunchAgentsDirectory() -> URL {
+    FileManager.default.homeDirectoryForCurrentUser.appending(
+      path: "Library/LaunchAgents", directoryHint: .isDirectory)
+  }
+
+  public static func socketFileName(for role: ServiceRole) -> String {
+    switch role {
+    case .coordinator: Self.socketFileName
+    case .worker: Self.workerSocketFileName
+    case .standby: Self.standbySocketFileName
+    }
   }
 
   public var socketURL: URL {
@@ -130,6 +259,325 @@ public struct ServiceStatusClient: Sendable {
     return await Task.detached(priority: .utility) {
       client.refresh(environment: environment)
     }.value
+  }
+
+  /// Inspects every configured or active local Beep Boop service (coordinator, worker, standby).
+  public func refreshHost(
+    environment: [String: String] = ProcessInfo.processInfo.environment
+  ) -> LocalHostSnapshot {
+    let cliInstalled = inspectInstalledBinary(environment: environment)
+    let targets = explicitTargets ?? discoverTargets()
+    var versionCache: [String: InstalledBinaryInfo?] = [:]
+    var snapshots: [ServiceSnapshot] = []
+
+    for target in targets {
+      let running = queryRunningService(socketPath: target.socketURL.path, defaultRole: target.role)
+      let isActive: Bool
+      switch running {
+      case .running, .runningWithoutStatus:
+        isActive = true
+      case .stopped:
+        isActive = false
+      }
+      guard isActive || target.configured else { continue }
+
+      let installed: InstalledBinaryInfo?
+      if let configuredBinary = target.configuredBinaryPath,
+        FileManager.default.isExecutableFile(atPath: configuredBinary)
+      {
+        if let cached = versionCache[configuredBinary] {
+          installed = cached
+        } else {
+          let probed = inspectBinary(atPath: configuredBinary)
+          versionCache[configuredBinary] = probed
+          installed = probed
+        }
+      } else {
+        installed = cliInstalled
+      }
+
+      let alignment = Self.compare(running: running, installed: installed)
+      let role: ServiceRole
+      if case .running(let info) = running {
+        role = info.role
+      } else {
+        role = target.role
+      }
+      let health = Self.classifyHealth(running: running, alignment: alignment)
+      snapshots.append(
+        ServiceSnapshot(
+          role: role,
+          configured: target.configured,
+          socketPath: target.socketURL.path,
+          stateDir: target.stateDir.path,
+          running: running,
+          installed: installed,
+          alignment: alignment,
+          health: health
+        ))
+    }
+
+    let overall = Self.aggregateHealth(snapshots)
+    return LocalHostSnapshot(
+      services: snapshots,
+      installedCLI: cliInstalled,
+      overallHealth: overall,
+      defaultStateDir: stateDir.path,
+      checkedAt: Date()
+    )
+  }
+
+  public func refreshHostAsync(
+    environment: [String: String] = ProcessInfo.processInfo.environment
+  ) async -> LocalHostSnapshot {
+    let client = self
+    return await Task.detached(priority: .utility) {
+      client.refreshHost(environment: environment)
+    }.value
+  }
+
+  public func discoverTargets() -> [LocalServiceTarget] {
+    let fm = FileManager.default
+    var byKey: [String: LocalServiceTarget] = [:]
+
+    func addTarget(_ target: LocalServiceTarget) {
+      let canonicalSocket = target.stateDir
+        .resolvingSymlinksInPath()
+        .appending(path: target.socketFileName)
+        .standardizedFileURL.path
+      let key = "\(target.role.rawValue):\(canonicalSocket)"
+      if let existing = byKey[key] {
+        byKey[key] = LocalServiceTarget(
+          role: existing.role,
+          stateDir: existing.stateDir,
+          socketFileName: existing.socketFileName,
+          configuredBinaryPath: existing.configuredBinaryPath ?? target.configuredBinaryPath,
+          configured: existing.configured || target.configured
+        )
+      } else {
+        byKey[key] = target
+      }
+    }
+
+    // 1. Read user LaunchAgents for Beep Boop services so custom `--state-dir` and
+    //    per-service binaries (e.g. wrapped worker vs unwrapped standby) are discovered
+    //    regardless of LaunchAgent label naming.
+    let agentsDir = launchAgentsDir ?? Self.defaultLaunchAgentsDirectory()
+    if let entries = try? fm.contentsOfDirectory(at: agentsDir, includingPropertiesForKeys: nil) {
+      for url in entries where url.pathExtension == "plist" {
+        if let parsed = Self.parseLaunchAgentPlist(at: url, defaultStateDir: stateDir) {
+          addTarget(parsed)
+        }
+      }
+    }
+
+    // 2. Always probe conventional sockets in the default state directory and sibling standby dir.
+    //    These probes remain `configured: false` so only active listeners appear; stale sockets
+    //    without an active LaunchAgent never create phantom stopped entries or override `Disabled`.
+    addTarget(
+      LocalServiceTarget(
+        role: .coordinator,
+        stateDir: stateDir,
+        socketFileName: Self.socketFileName,
+        configured: false
+      ))
+    addTarget(
+      LocalServiceTarget(
+        role: .worker,
+        stateDir: stateDir,
+        socketFileName: Self.workerSocketFileName,
+        configured: false
+      ))
+    addTarget(
+      LocalServiceTarget(
+        role: .standby,
+        stateDir: stateDir,
+        socketFileName: Self.standbySocketFileName,
+        configured: false
+      ))
+
+    let siblingStandbyDir = stateDir.deletingLastPathComponent().appending(
+      path: "agent-standby", directoryHint: .isDirectory)
+    if siblingStandbyDir.resolvingSymlinksInPath().standardizedFileURL.path
+      != stateDir.resolvingSymlinksInPath().standardizedFileURL.path
+    {
+      addTarget(
+        LocalServiceTarget(
+          role: .standby,
+          stateDir: siblingStandbyDir,
+          socketFileName: Self.standbySocketFileName,
+          configured: false
+        ))
+    }
+
+    return byKey.values.sorted { lhs, rhs in
+      let lhsRank = Self.roleSortRank(lhs.role)
+      let rhsRank = Self.roleSortRank(rhs.role)
+      if lhsRank != rhsRank { return lhsRank < rhsRank }
+      return lhs.socketURL.path < rhs.socketURL.path
+    }
+  }
+
+  public static func parseLaunchAgentPlist(
+    at url: URL,
+    defaultStateDir: URL
+  ) -> LocalServiceTarget? {
+    guard let data = try? Data(contentsOf: url),
+      let plist = try? PropertyListSerialization.propertyList(from: data, format: nil)
+        as? [String: Any],
+      let args = plist["ProgramArguments"] as? [String]
+    else { return nil }
+
+    // Locate the `beep-boop` executable token inside ProgramArguments (skipping `/bin/sh -c ...`).
+    guard
+      let binIndex = args.firstIndex(where: { arg in
+        guard arg.hasPrefix("/") else { return false }
+        let name = URL(fileURLWithPath: arg).lastPathComponent
+        return name == "beep-boop" || name == ".beep-boop-wrapped" || name == "beep-boop-serve"
+      })
+    else { return nil }
+
+    let binPath = args[binIndex]
+    let tail = Array(args[(binIndex + 1)...])
+    var explicitStateDir: URL?
+    var hasCoordinatorFlag = false
+    var sawServe = false
+    var sawFailover = false
+    var role: ServiceRole?
+    var idx = 0
+    while idx < tail.count {
+      let arg = tail[idx]
+      if arg == "--state-dir", idx + 1 < tail.count {
+        explicitStateDir = URL(fileURLWithPath: tail[idx + 1], isDirectory: true)
+        idx += 2
+        continue
+      }
+      if arg.hasPrefix("--state-dir=") {
+        let value = String(arg.dropFirst("--state-dir=".count))
+        if !value.isEmpty {
+          explicitStateDir = URL(fileURLWithPath: value, isDirectory: true)
+        }
+        idx += 1
+        continue
+      }
+      if arg == "--coordinator", idx + 1 < tail.count {
+        hasCoordinatorFlag = true
+        idx += 2
+        continue
+      }
+      if arg.hasPrefix("--coordinator=") {
+        hasCoordinatorFlag = true
+        idx += 1
+        continue
+      }
+      if arg == "--config" || arg == "--runtime" || arg == "--instructions"
+        || arg == "--rex-server" || arg == "--tailnet-port" || arg == "--interval-seconds"
+      {
+        idx += 2
+        continue
+      }
+      if arg == "serve" {
+        sawServe = true
+      } else if arg == "maintain" {
+        role = .worker
+      } else if arg == "failover" {
+        sawFailover = true
+      } else if sawFailover && arg == "follow" {
+        role = .standby
+      }
+      idx += 1
+    }
+
+    if role == nil && sawServe {
+      role = hasCoordinatorFlag ? .worker : .coordinator
+    }
+    if role == nil && URL(fileURLWithPath: binPath).lastPathComponent == "beep-boop-serve" {
+      role = .coordinator
+    }
+    guard let resolvedRole = role else { return nil }
+
+    // Honor launchd `Disabled` and `KeepAlive.PathState` gates (such as standby's
+    // `coordinator-id` marker).
+    var configured = (plist["Disabled"] as? Bool) != true
+    if configured,
+      let keepAlive = plist["KeepAlive"] as? [String: Any],
+      let pathState = keepAlive["PathState"] as? [String: Bool]
+    {
+      for (path, expectedExists) in pathState {
+        if FileManager.default.fileExists(atPath: path) != expectedExists {
+          configured = false
+        }
+      }
+    }
+
+    let resolvedStateDir = explicitStateDir ?? defaultStateDir
+    let configuredBinary: String? =
+      URL(fileURLWithPath: binPath).lastPathComponent == "beep-boop-serve" ? nil : binPath
+    return LocalServiceTarget(
+      role: resolvedRole,
+      stateDir: resolvedStateDir,
+      socketFileName: Self.socketFileName(for: resolvedRole),
+      configuredBinaryPath: configuredBinary,
+      configured: configured
+    )
+  }
+
+  public static func classifyHealth(
+    running: ServiceRunningState,
+    alignment: VersionAlignment
+  ) -> ServiceHealth {
+    switch running {
+    case .stopped:
+      return .stopped
+    case .runningWithoutStatus:
+      return .degraded
+    case .running(let info):
+      switch info.connectionState {
+      case .reconnecting, .authorityUnreachable:
+        return .degraded
+      case .connecting:
+        switch alignment {
+        case .versionMismatch, .binaryReplaced, .binaryMissing:
+          return .degraded
+        default:
+          return .starting
+        }
+      case .connected, .following, nil:
+        switch alignment {
+        case .upToDate:
+          return .healthy
+        case .versionMismatch, .binaryReplaced, .binaryMissing, .serviceRunningWithoutStatus:
+          return .degraded
+        case .serviceStopped:
+          return .stopped
+        }
+      }
+    }
+  }
+
+  public static func aggregateHealth(_ services: [ServiceSnapshot]) -> ServiceHealth {
+    guard !services.isEmpty else { return .stopped }
+    if services.allSatisfy({ $0.health == .stopped }) {
+      return .stopped
+    }
+    if services.contains(where: { $0.health == .degraded }) {
+      return .degraded
+    }
+    if services.contains(where: { $0.health == .stopped }) {
+      return .degraded
+    }
+    if services.contains(where: { $0.health == .starting }) {
+      return .starting
+    }
+    return .healthy
+  }
+
+  private static func roleSortRank(_ role: ServiceRole) -> Int {
+    switch role {
+    case .coordinator: 0
+    case .worker: 1
+    case .standby: 2
+    }
   }
 
   public static func compare(
@@ -179,6 +627,10 @@ public struct ServiceStatusClient: Sendable {
     guard let path = resolveBinaryPath(environment: environment) else {
       return nil
     }
+    return inspectBinary(atPath: path)
+  }
+
+  private func inspectBinary(atPath path: String) -> InstalledBinaryInfo? {
     let resolved = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
     guard let rawOutput = runVersionCommand(binaryPath: path) else {
       return nil
@@ -259,7 +711,10 @@ public struct ServiceStatusClient: Sendable {
     return payload
   }
 
-  public func queryRunningService(socketPath: String) -> ServiceRunningState {
+  public func queryRunningService(
+    socketPath: String,
+    defaultRole: ServiceRole = .coordinator
+  ) -> ServiceRunningState {
     guard FileManager.default.fileExists(atPath: socketPath) else {
       return .stopped(reason: "Socket not found at \(socketPath)")
     }
@@ -306,7 +761,7 @@ public struct ServiceStatusClient: Sendable {
       }
     }
     guard connectResult == 0 else {
-      return .stopped(reason: "Coordinator offline (\(String(cString: strerror(errno))))")
+      return .stopped(reason: "Service offline (\(String(cString: strerror(errno))))")
     }
 
     let payload: Data
@@ -364,7 +819,13 @@ public struct ServiceStatusClient: Sendable {
             pid: UInt32(clamping: status.pid),
             version: status.version,
             executablePath: status.executablePath,
-            stateDir: status.stateDir
+            stateDir: status.stateDir,
+            role: status.role ?? defaultRole,
+            connectionState: status.connectionState,
+            target: status.target,
+            nodeName: status.nodeName,
+            appliedPosition: status.appliedPosition.map { UInt64(clamping: $0) },
+            detail: status.detail
           ))
       case .failure(let failure):
         return .runningWithoutStatus(reason: failure.message)

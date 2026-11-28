@@ -11,6 +11,8 @@ import type { NativeJobStatus } from "./NativeJobStatus.js";
 import type { NativeSettingsSnapshot } from "./NativeSettingsSnapshot.js";
 import type { NotificationStatus } from "./NotificationStatus.js";
 import type { SavedConversation } from "./SavedConversation.js";
+import type { ServiceConnectionState } from "./ServiceConnectionState.js";
+import type { ServiceRole } from "./ServiceRole.js";
 import type { SidechatSummary } from "./SidechatSummary.js";
 import type { SlashCommand } from "./SlashCommand.js";
 import type { SourceState } from "./SourceState.js";
@@ -29,4 +31,28 @@ accepted_input_origins?: Array<string>, conversation_settings?: boolean, work_in
 /**
  * Additive to the legacy notice shape, so older observers still decode it.
  */
-settings?: NativeSettingsSnapshot, job_status?: NativeJobStatus, } | { "type": "failure", message: string, code?: ErrorCode, } | { "type": "idle" } | { "type": "disconnect" } | { "type": "notifications", status: NotificationStatus, } | { "type": "done" } | { "type": "dreams_list", runs: Array<DreamsRunSummary>, pending_count: number, } | { "type": "dreams_show", report: DreamsRunDetail, } | { "type": "dreams_applied", run: string, commit: string, already_applied: boolean, } | { "type": "service_status", coordinator_id: string, pid: number, version: string, executable_path?: string, state_dir: string, } | { "type": "identity", coordinator_id: string, };
+settings?: NativeSettingsSnapshot, job_status?: NativeJobStatus, } | { "type": "failure", message: string, code?: ErrorCode, } | { "type": "idle" } | { "type": "disconnect" } | { "type": "notifications", status: NotificationStatus, } | { "type": "done" } | { "type": "dreams_list", runs: Array<DreamsRunSummary>, pending_count: number, } | { "type": "dreams_show", report: DreamsRunDetail, } | { "type": "dreams_applied", run: string, commit: string, already_applied: boolean, } | { "type": "service_status", coordinator_id: string, pid: number, version: string, executable_path?: string, state_dir: string,
+/**
+ * Additive: absent on older coordinators, which are always `coordinator`.
+ */
+role?: ServiceRole,
+/**
+ * Live connectivity or replication state for worker and standby roles.
+ */
+connection_state?: ServiceConnectionState,
+/**
+ * Configured coordinator target address for worker daemons.
+ */
+target?: string,
+/**
+ * Registered local node name for worker daemons.
+ */
+node_name?: string,
+/**
+ * Last applied replicated log position for standby daemons.
+ */
+applied_position?: bigint,
+/**
+ * Non-fatal status detail (for example reconnect reason or authority outage).
+ */
+detail?: string, } | { "type": "identity", coordinator_id: string, };

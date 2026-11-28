@@ -1,4 +1,6 @@
 //! Native presentation boundary. Pi owns conversation state; Clap owns controls.
+pub mod local_status;
+
 use crate::{
     chat_commands::ChatCommand,
     protocol::{
@@ -458,11 +460,55 @@ pub enum NativeEvent {
         #[ts(optional)]
         executable_path: Option<String>,
         state_dir: String,
+        /// Additive: absent on older coordinators, which are always `coordinator`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        role: Option<ServiceRole>,
+        /// Live connectivity or replication state for worker and standby roles.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        connection_state: Option<ServiceConnectionState>,
+        /// Configured coordinator target address for worker daemons.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        target: Option<String>,
+        /// Registered local node name for worker daemons.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        node_name: Option<String>,
+        /// Last applied replicated log position for standby daemons.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        applied_position: Option<u64>,
+        /// Non-fatal status detail (for example reconnect reason or authority outage).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        detail: Option<String>,
     },
     // Older apps fail on unknown events, but they never send `Identify`.
     Identity {
         coordinator_id: String,
     },
+}
+
+/// Local daemon role answering a `ServiceStatus` query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceRole {
+    Coordinator,
+    Worker,
+    Standby,
+}
+
+/// Live connectivity or replication state of a local Beep Boop daemon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceConnectionState {
+    Connected,
+    Connecting,
+    Reconnecting,
+    Following,
+    AuthorityUnreachable,
 }
 
 /// Validated requests answered strictly at the coordinator service boundary, never forwarded to Pi.

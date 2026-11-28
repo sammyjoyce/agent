@@ -835,6 +835,8 @@ const STATE_ENTRIES: &[(EntryName, Disposition)] = &[
     (EntryName::Exact("diagnostics"), Disposition::Local),
     (EntryName::Exact("coordinator.log"), Disposition::Local),
     (EntryName::Exact("agent.sock"), Disposition::Local),
+    (EntryName::Exact("worker.sock"), Disposition::Local),
+    (EntryName::Exact("standby.sock"), Disposition::Local),
     (EntryName::Exact("writer.lock"), Disposition::Local),
     (EntryName::Exact("effects.lock"), Disposition::Local),
     (EntryName::Exact("effects"), Disposition::Local),
@@ -1769,6 +1771,8 @@ mod tests {
         fs::write(state.join("effects.lock"), "").unwrap();
         fs::create_dir(state.join("effects")).unwrap();
         fs::write(state.join("effects").join("4242"), "1794872808").unwrap();
+        fs::write(state.join("worker.sock"), "").unwrap();
+        fs::write(state.join("standby.sock"), "").unwrap();
 
         let inventory = Inventory::scan(&state).unwrap();
         assert_eq!(

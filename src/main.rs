@@ -980,13 +980,41 @@ async fn run(
                     json,
                     &commands::join(&state, coordinator_id, replace, &script, failover)?,
                 )?,
-                FailoverAction::Follow { once, interval } => commands::follow(
-                    &state,
-                    &script,
-                    failover,
-                    (!once).then(|| Duration::from_secs(interval)),
-                    |followed| print_receipt(json, followed),
-                )?,
+                FailoverAction::Follow { once, interval } => {
+                    if once {
+                        commands::follow(&state, &script, failover, None, None, |followed| {
+                            print_receipt(json, followed)
+                        })?;
+                    } else {
+                        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+                        let state = state.clone();
+                        let script = script.clone();
+                        let failover = failover.clone();
+                        let mut task = tokio::task::spawn_blocking(move || {
+                            commands::follow(
+                                &state,
+                                &script,
+                                &failover,
+                                Some(Duration::from_secs(interval)),
+                                Some(stop_rx),
+                                |followed| print_receipt(json, followed),
+                            )
+                        });
+                        let mut terminate = signal(SignalKind::terminate())?;
+                        tokio::select! {
+                            result = &mut task => result??,
+                            signal_result = tokio::signal::ctrl_c() => {
+                                signal_result?;
+                                drop(stop_tx);
+                                task.await??;
+                            }
+                            _ = terminate.recv() => {
+                                drop(stop_tx);
+                                task.await??;
+                            }
+                        }
+                    }
+                }
                 FailoverAction::Promote {
                     replace_epoch,
                     old_owner_stopped,
@@ -4952,8 +4980,26 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
         .as_ref()
         .map(|failover| OwnerWatch::new(failover, script))
         .transpose()?;
+    let status = match agent_cli::native::local_status::LocalStatusServer::start_worker(
+        directory,
+        coordinator.unwrap_or_default().to_owned(),
+    ) {
+        Ok(server) => Some(server),
+        Err(error) => {
+            service_notice(format_args!(
+                "Local worker status socket unavailable: {error:#}"
+            ));
+            None
+        }
+    };
     let mut delay = 1;
-    let shutdown = tokio::signal::ctrl_c();
+    let mut terminate = signal(SignalKind::terminate())?;
+    let shutdown = async {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    };
     tokio::pin!(shutdown);
     loop {
         // Registration owns no effects yet, so shutdown can cancel this setup.
@@ -4971,7 +5017,7 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
             .await?;
             let settings = coordinator_answer(environment(client)).await?;
             configure_messages(&settings.sources).await;
-            let (reader, mut writer, child, link) = coordinator_answer(async {
+            let (reader, mut writer, child, link, coordinator_id) = coordinator_answer(async {
                 let mut wire = connection(client, false).await?;
                 write_command(
                     &mut *wire.writer,
@@ -4992,7 +5038,7 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
                     bail!("Coordinator did not accept this worker");
                 };
                 let link = OwnerLink::new(coordinator_id, owner_epoch);
-                Ok((reader, wire.writer, wire.child, link))
+                Ok((reader, wire.writer, wire.child, link, coordinator_id))
             })
             .await?;
             if let Err(error) = floor.admit(link) {
@@ -5000,118 +5046,134 @@ async fn worker_service(client: ClientContext<'_>, interval: u16) -> Result<()> 
                 let _ = close_connection(&mut *writer, child).await;
                 return Err(error);
             }
-            Ok::<_, anyhow::Error>((node, reader, writer, child, link))
+            Ok::<_, anyhow::Error>((node, reader, writer, child, link, coordinator_id))
         };
         let registered = tokio::select! {
             registered = register => registered,
             signal = &mut shutdown => { signal?; return Ok(()); }
         };
-        if let Ok((node, mut reader, mut writer, child, link)) = registered {
-            delay = 1;
-            service_notice(format_args!("Worker connected as {}.", node.name));
-            // Collection needs another connection while this one serves effects.
-            let profile = config.clone();
-            let target = coordinator.map(str::to_owned);
-            let runtime = script.to_owned();
-            let state = directory.to_owned();
-            let collector = rex.clone();
-            let terminal = terminal.clone();
-            let collection = WatchGuard(tokio::spawn(async move {
-                let client = ClientContext {
-                    config: &profile,
-                    coordinator: target.as_deref(),
-                    script: &runtime,
-                    directory: &state,
-                    rex: &collector,
-                    terminal: &terminal,
-                };
-                loop {
-                    if exchange(
-                        client,
-                        RuntimeCommand::CollectResources {
-                            host_id: node.host_id.clone(),
-                        },
-                    )
-                    .await
-                    .is_err()
-                    {
-                        service_notice(
-                            "Worker cleanup could not complete; saved ownership is retained.",
-                        );
+        match registered {
+            Ok((node, mut reader, mut writer, child, link, coordinator_id)) => {
+                delay = 1;
+                if let Some(status) = &status {
+                    let coordinator_id =
+                        coordinator_id.map(|id| id.to_string()).unwrap_or_default();
+                    status.set_worker_connected(coordinator_id, node.name.clone());
+                }
+                service_notice(format_args!("Worker connected as {}.", node.name));
+                // Collection needs another connection while this one serves effects.
+                let profile = config.clone();
+                let target = coordinator.map(str::to_owned);
+                let runtime = script.to_owned();
+                let state = directory.to_owned();
+                let collector = rex.clone();
+                let terminal = terminal.clone();
+                let collection = WatchGuard(tokio::spawn(async move {
+                    let client = ClientContext {
+                        config: &profile,
+                        coordinator: target.as_deref(),
+                        script: &runtime,
+                        directory: &state,
+                        rex: &collector,
+                        terminal: &terminal,
+                    };
+                    loop {
+                        if exchange(
+                            client,
+                            RuntimeCommand::CollectResources {
+                                host_id: node.host_id.clone(),
+                            },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            service_notice(
+                                "Worker cleanup could not complete; saved ownership is retained.",
+                            );
+                        }
+                        sleep(Duration::from_secs(interval.into())).await;
                     }
-                    sleep(Duration::from_secs(interval.into())).await;
-                }
-            }));
-            let watched = async {
-                match &watch {
-                    Some(watch) => watch.ended(&floor, link).await,
-                    None => std::future::pending().await,
-                }
-            };
-            tokio::pin!(watched);
-            let mut effects = HostEffects::new(Capacity::RegisteredWorker);
-            let result = async {
-                loop {
-                    tokio::select! {
-                        signal = &mut shutdown => { signal?; return Ok::<_, anyhow::Error>(true); }
-                        error = &mut watched => {
-                            service_notice(format_args!("{error:#}"));
-                            return Err(error);
-                        }
-                        completed = effects.next(), if !effects.is_empty() => {
-                            let reply = completed?.context("Worker effect queue closed")?;
-                            write_command(&mut *writer, &RuntimeCommand::HostReply { call_id: reply.call_id, result: reply.result }).await?;
-                        }
-                        frame = reader.next_frame() => {
-                            let frame = frame?.context("Coordinator closed the worker connection")?;
-                            match decode_coordinator_event(&frame)? {
-                                RuntimeEventKind::HostCancel { call_id } => { effects.cancel(&call_id); }
-                                RuntimeEventKind::HostCall { call_id, command } => {
-                                    if let Err(error) = floor.check(link) {
-                                        service_notice(format_args!("{error:#}"));
-                                        let result = HostResult::Failed {
-                                            delivery: Some(HostDelivery::NotStarted),
-                                            message: format!("{error:#}; no command was started"),
-                                        };
-                                        write_command(&mut *writer, &RuntimeCommand::HostReply { call_id, result }).await?;
-                                        return Err(error);
+                }));
+                let watched = async {
+                    match &watch {
+                        Some(watch) => watch.ended(&floor, link).await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::pin!(watched);
+                let mut effects = HostEffects::new(Capacity::RegisteredWorker);
+                let result = async {
+                    loop {
+                        tokio::select! {
+                            signal = &mut shutdown => { signal?; return Ok::<_, anyhow::Error>(true); }
+                            error = &mut watched => {
+                                service_notice(format_args!("{error:#}"));
+                                return Err(error);
+                            }
+                            completed = effects.next(), if !effects.is_empty() => {
+                                let reply = completed?.context("Worker effect queue closed")?;
+                                write_command(&mut *writer, &RuntimeCommand::HostReply { call_id: reply.call_id, result: reply.result }).await?;
+                            }
+                            frame = reader.next_frame() => {
+                                let frame = frame?.context("Coordinator closed the worker connection")?;
+                                match decode_coordinator_event(&frame)? {
+                                    RuntimeEventKind::HostCancel { call_id } => { effects.cancel(&call_id); }
+                                    RuntimeEventKind::HostCall { call_id, command } => {
+                                        if let Err(error) = floor.check(link) {
+                                            service_notice(format_args!("{error:#}"));
+                                            let result = HostResult::Failed {
+                                                delivery: Some(HostDelivery::NotStarted),
+                                                message: format!("{error:#}; no command was started"),
+                                            };
+                                            write_command(&mut *writer, &RuntimeCommand::HostReply { call_id, result }).await?;
+                                            return Err(error);
+                                        }
+                                        let executor = executor.clone();
+                                        if let Admission::Rejected(reply) = effects.spawn(call_id, |cancelled| async move {
+                                            executor.execute_cancelled(*command, cancelled).await
+                                        })? {
+                                            write_command(&mut *writer, &RuntimeCommand::HostReply { call_id: reply.call_id, result: reply.result }).await?;
+                                        }
                                     }
-                                    let executor = executor.clone();
-                                    if let Admission::Rejected(reply) = effects.spawn(call_id, |cancelled| async move {
-                                        executor.execute_cancelled(*command, cancelled).await
-                                    })? {
-                                        write_command(&mut *writer, &RuntimeCommand::HostReply { call_id: reply.call_id, result: reply.result }).await?;
-                                    }
+                                    _ => bail!("Unexpected event on the registered worker connection"),
                                 }
-                                _ => bail!("Unexpected event on the registered worker connection"),
                             }
                         }
                     }
                 }
-            }.await;
-            drop(collection);
-            // Reconnecting must not abandon a write admitted by this connection.
-            let mut draining = effects.shutdown();
-            let mut drained = Ok(());
-            while let Some(reply) = draining.next().await {
-                let delivery = match reply {
-                    Ok(reply) => {
-                        write_command(
-                            &mut *writer,
-                            &RuntimeCommand::HostReply {
-                                call_id: reply.call_id,
-                                result: reply.result,
-                            },
-                        )
-                        .await
-                    }
-                    Err(error) => Err(error),
-                };
-                drained = drained.and(delivery);
+                .await;
+                drop(collection);
+                // Reconnecting must not abandon a write admitted by this connection.
+                let mut draining = effects.shutdown();
+                let mut drained = Ok(());
+                while let Some(reply) = draining.next().await {
+                    let delivery = match reply {
+                        Ok(reply) => {
+                            write_command(
+                                &mut *writer,
+                                &RuntimeCommand::HostReply {
+                                    call_id: reply.call_id,
+                                    result: reply.result,
+                                },
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    drained = drained.and(delivery);
+                }
+                let closed = close_connection(&mut *writer, child).await;
+                if result.as_ref().is_ok_and(|stopped| *stopped) {
+                    return result.map(|_| ()).and(drained).and(closed);
+                }
+                if let (Some(status), Err(error)) = (&status, &result) {
+                    status.set_worker_reconnecting(format!("{error:#}"));
+                }
             }
-            let closed = close_connection(&mut *writer, child).await;
-            if result.as_ref().is_ok_and(|stopped| *stopped) {
-                return result.map(|_| ()).and(drained).and(closed);
+            Err(error) => {
+                if let Some(status) = &status {
+                    status.set_worker_reconnecting(format!("{error:#}"));
+                }
             }
         }
         service_notice(format_args!(

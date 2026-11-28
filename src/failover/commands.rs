@@ -487,21 +487,39 @@ fn restore_checkpoint(
 }
 
 /// Applies new log entries and their files to a standby. With `interval` it
-/// polls until the process is interrupted, reports each pass that applied
-/// something, and waits out an authority that does not answer.
+/// polls until `stop` signals or the process is interrupted, reports each pass
+/// that applied something, and waits out an authority that does not answer.
 pub fn follow(
     state: &Path,
     script: &Path,
     config: &FailoverConfig,
     interval: Option<Duration>,
+    stop: Option<std::sync::mpsc::Receiver<()>>,
     mut report: impl FnMut(&Followed) -> Result<()>,
 ) -> Result<()> {
     holder(config)?;
     let (lock, coordinator_id) = lock_state(state)?;
     let authority = Authority::open(script, config, coordinator_id)?;
+    let status = if interval.is_some() {
+        match crate::native::local_status::LocalStatusServer::start_standby(
+            state,
+            coordinator_id.to_string(),
+        ) {
+            Ok(server) => Some(server),
+            Err(error) => {
+                eprintln!("Local standby status socket unavailable: {error:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     loop {
         match apply_log(&authority, &lock, state) {
             Ok((from, applied)) => {
+                if let Some(status) = &status {
+                    status.set_standby_following(applied.get());
+                }
                 if interval.is_none() || applied != from {
                     report(&Followed {
                         coordinator_id,
@@ -511,12 +529,21 @@ pub fn follow(
                 }
             }
             Err(error) if interval.is_some() && error.is::<AuthorityUnreachable>() => {
+                if let Some(status) = &status {
+                    status.set_standby_unreachable(format!("{error:#}"));
+                }
                 eprintln!("{error:#}");
             }
             Err(error) => return Err(error),
         }
         match interval {
-            Some(interval) => thread::sleep(interval),
+            Some(interval) => match &stop {
+                Some(rx) => match rx.recv_timeout(interval) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                },
+                None => thread::sleep(interval),
+            },
             None => return Ok(()),
         }
     }
