@@ -84,6 +84,67 @@ sending the message again. Reopen it to see live progress, steer or queue more
 context. Saved messages load automatically in the background while the composer
 remains usable.
 
+### Terminal program resume in Rex (`OSC 7577`)
+
+When started in a terminal that provides `OSC7577_TOKEN` (such as Rex),
+`beep-boop` removes `OSC7577_TOKEN` from its environment before starting worker
+threads or child processes so tools, scripts and workers cannot inherit it.
+Interactive chat TUI reports a resume command:
+
+- Main chat: `beep-boop chat` (plus any explicit scope flags repeated as typed:
+  `--coordinator`, `--config`, `--state-dir`, `--instructions`, `--runtime`,
+  `--rex-server`).
+- Sidechats and resumed conversations: `beep-boop chat --conversation <id>`
+  (plus any explicit scope flags repeated as typed).
+
+Scope flags keep their original order, `--flag=value` / `--flag value` form, and
+raw path spelling against the preserved local launch `cwd`, so Rex's `flags`
+trust verifier matches the launched command line directly. Transient flags
+(`--model`, `--provider`, `--reasoning`, `--fast`, `--sidechat`, initial
+prompts) are never repeated, and the reported `cwd` stays the local launch
+directory even while inspecting a remote conversation. Coordinator-allocated
+`run-task` worker panes do not register `OSC 7577` resume commands. Explicit
+user quit (`Ctrl+C`, `Ctrl+D`, `/exit`, `/quit`) clears the terminal's resume
+record; `SIGTERM`, `SIGHUP`, and terminal loss leave it in place so the terminal
+can bring the session back.
+
+To let Rex resume `beep-boop chat` in `init.lua` (verify with `rex config check`;
+see Rex's [Program Resume docs](https://www.superlogical.com/rex/docs/build/program-resume)):
+
+```lua
+local beep_boop_flags = {
+  ["--coordinator"] = { "keep", values = 1 },
+  ["--config"] = { "keep", values = 1 },
+  ["--state-dir"] = { "keep", values = 1 },
+  ["--instructions"] = { "keep", values = 1 },
+  ["--runtime"] = { "keep", values = 1 },
+  ["--rex-server"] = { "keep", values = 1 },
+  ["--conversation"] = { "drop", values = 1 },
+  ["--sidechat"] = { "drop", values = 1 },
+  ["--provider"] = { "drop", values = 1 },
+  ["--model"] = { "drop", values = 1 },
+  ["--reasoning"] = { "drop", values = 1 },
+  ["--default-reasoning"] = "drop",
+  ["--fast"] = "drop",
+  ["--no-fast"] = "drop",
+}
+rex.set("resume.trust.beep_boop_main", {
+  command = { "beep-boop", "chat" },
+  flags = beep_boop_flags,
+})
+rex.set("resume.trust.beep_boop_conversation", {
+  command = { "beep-boop", "chat", "--conversation", rex.match.id },
+  flags = beep_boop_flags,
+})
+```
+
+If you set `AGENT_COORDINATOR=<host>` in the environment instead of passing
+`--coordinator <host>` on the command line, `beep-boop` reports
+`--coordinator <host>` so restarts do not fall back to a local coordinator; add
+an explicit trust rule without `flags` (for example
+`command = { "beep-boop", "chat", "--coordinator", "example-host" }`) or pass
+`--coordinator` on the command line.
+
 Task sessions open directly into an interactive `Chat` tab. Reply there or
 through the main agent; both use the same task conversation. Named child tabs
 return results while remaining available for follow-ups. Live activity shows
@@ -1390,7 +1451,7 @@ the old state directory under a new name.
 Upgrade the standby before the owner, or together with it. A standby refuses
 an entry that a newer Pi Durable wrote and stops following until it runs that
 release too. A newer standby replays the entries of the releases it was tested
-against, so a standby on Pi Durable 1.6.0 follows a log that 1.4.0 or 1.5.2 began.
+against, so a standby on Pi Durable 1.7.0 follows a log that 1.4.0, 1.5.2 or 1.6.0 began.
 
 ### Keep the log short
 

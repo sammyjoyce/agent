@@ -41,6 +41,7 @@ function addUsage(total: Usage, usage: Usage): void {
   total.cacheWrite += usage.cacheWrite; total.totalTokens += usage.totalTokens;
   if (usage.cacheWrite1h !== undefined) total.cacheWrite1h = (total.cacheWrite1h ?? 0) + usage.cacheWrite1h;
   if (usage.reasoning !== undefined) total.reasoning = (total.reasoning ?? 0) + usage.reasoning;
+  if (usage.imageOutput !== undefined) total.imageOutput = (total.imageOutput ?? 0) + usage.imageOutput;
   const keys: ("input" | "output" | "cacheRead" | "cacheWrite" | "total")[] = ["input", "output", "cacheRead", "cacheWrite", "total"];
   for (const key of keys) total.cost[key] += usage.cost[key];
 }
@@ -135,7 +136,8 @@ export function createCompaction(
             if (total === undefined) ledger[name] = { input: usage.input, output: usage.output, cacheRead: usage.cacheRead,
               cacheWrite: usage.cacheWrite, totalTokens: usage.totalTokens, cost: { ...usage.cost },
               ...(usage.reasoning === undefined ? {} : { reasoning: usage.reasoning }),
-              ...(usage.cacheWrite1h === undefined ? {} : { cacheWrite1h: usage.cacheWrite1h }) };
+              ...(usage.cacheWrite1h === undefined ? {} : { cacheWrite1h: usage.cacheWrite1h }),
+              ...(usage.imageOutput === undefined ? {} : { imageOutput: usage.imageOutput }) };
             else addUsage(total, usage);
             return saved.text;
           }, context);
@@ -152,7 +154,7 @@ export function createCompaction(
         const summary = summaries.join("\n\n");
         if (parts.length === 1) {
           failures?.delete(sessionId);
-          return { summary };
+          return { kind: "summary", summary };
         }
         if (Buffer.byteLength(summary) >= Buffer.byteLength(source)) throw new Error("Checkpoint reduction did not shrink; source is retained");
         source = summary;

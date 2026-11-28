@@ -412,7 +412,7 @@ so this does not require an upstream storage fork.
 
 ## Embeddings
 
-Pi AI 1.6.0 has no public embedding API. Add one narrow Rust `EmbeddingProvider`
+Pi AI 1.7.0 has no public embedding API. Add one narrow Rust `EmbeddingProvider`
 trait with query/document purpose and batched text input. Its validated output
 carries an embedding-space identity: model revision/digest, dimensions, pooling,
 normalization and instruction version. Reject invalid vectors or mixed spaces.

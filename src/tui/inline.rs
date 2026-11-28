@@ -2,7 +2,8 @@
 //! composer remain in the inline viewport; native selection never needs mouse capture.
 
 use crate::tui::{
-    State, TerminalModes, WindowTitle, activity,
+    State, TerminalModes, TuiResume, WindowTitle, activity,
+    program_resume::ProgramResumeReporter,
     program_status::{Osc7501Command, ProgramStatusReport},
     scrollback_links::{Osc8Guard, ScrollbackBackend, ScrollbackLinks},
     terminal_title,
@@ -103,11 +104,12 @@ pub(super) struct Screen {
     size: Size,
     title: String,
     program_status: BTreeMap<Option<String>, String>,
+    program_resume: Option<ProgramResumeReporter>,
     _modes: TerminalModes,
 }
 
 impl Screen {
-    pub(super) fn open() -> Result<Self> {
+    pub(super) fn open(resume: Option<TuiResume>) -> Result<Self> {
         enable_raw_mode().context("Could not enable terminal editing")?;
         let modes = TerminalModes;
         let mut output = std::io::stdout();
@@ -128,6 +130,7 @@ impl Screen {
             size,
             title: String::new(),
             program_status: BTreeMap::new(),
+            program_resume: resume.map(TuiResume::into_reporter),
             _modes: modes,
         })
     }
@@ -154,8 +157,19 @@ impl Screen {
             &mut self.program_status,
             &state.program_status_reports(),
         )?;
+        if let Some(resume) = &mut self.program_resume {
+            let target = state.program_resume_target();
+            resume.sync(&mut std::io::stdout(), target.as_ref())?;
+        }
         self.terminal.draw(|frame| state.draw(frame))?;
         state.changed |= state.has_native_output();
+        Ok(())
+    }
+
+    pub(super) fn refresh_program_resume(&mut self) -> Result<()> {
+        if let Some(resume) = &mut self.program_resume {
+            resume.refresh(&mut std::io::stdout())?;
+        }
         Ok(())
     }
 
@@ -183,11 +197,14 @@ impl Screen {
         Ok(())
     }
 
-    pub(super) fn finish(&mut self, state: &mut State) -> Result<()> {
+    pub(super) fn finish(&mut self, state: &mut State, clear_program_resume: bool) -> Result<()> {
         // A bounded final snapshot keeps exit responsive during a large replay.
         // Unprinted history and ongoing work remain in their durable owner.
         self.reframe(self.terminal.size()?, 1)?;
         state.flush_output(&mut self.terminal, true)?;
+        if clear_program_resume && let Some(resume) = &mut self.program_resume {
+            resume.clear_on_user_exit(&mut std::io::stdout())?;
+        }
         let top = self.terminal.get_frame().area().y;
         execute!(
             std::io::stdout(),

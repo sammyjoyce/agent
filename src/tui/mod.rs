@@ -6,12 +6,17 @@ mod conversations;
 mod inline;
 mod markdown;
 mod pending;
+mod program_resume;
 mod program_status;
 mod scrollback_links;
 mod shell;
 mod transcript;
 mod work;
 
+pub use program_resume::{
+    PROGRAM_RESUME_TOKEN_ENV, ProgramResumeCommand, ProgramResumeScope, ProgramResumeToken,
+    TuiResume,
+};
 pub use program_status::blocked_on_user_report;
 pub use work::WorkStream;
 
@@ -116,7 +121,11 @@ enum Update {
     },
     ResetConversation(TuiInfo),
     WorkStream(WorkStream),
-    Stop,
+    MainConversationId(String),
+    RefreshProgramResume,
+    Stop {
+        clear_resume: bool,
+    },
 }
 
 enum HistoryUpdate {
@@ -191,6 +200,12 @@ impl TuiHandle {
     }
     pub fn work_stream(&self, stream: WorkStream) -> Result<()> {
         self.send(Update::WorkStream(stream))
+    }
+    pub fn set_main_conversation_id(&self, id: String) -> Result<()> {
+        self.send(Update::MainConversationId(id))
+    }
+    pub fn refresh_program_resume(&self) -> Result<()> {
+        self.send(Update::RefreshProgramResume)
     }
     pub fn begin_history_replay(&self) -> Result<HistoryReplay> {
         self.history_replay(false)
@@ -326,8 +341,18 @@ pub struct TuiGuard {
     thread: Option<thread::JoinHandle<Result<()>>>,
 }
 impl TuiGuard {
-    pub async fn stop(mut self) -> Result<()> {
-        let _ = self.sender.send(Update::Stop);
+    /// Stop the renderer while keeping any registered `OSC 7577` resume command
+    /// in place (for `SIGTERM`, `SIGHUP`, terminal loss, or unexpected shutdown).
+    pub async fn stop(self) -> Result<()> {
+        self.stop_with(false).await
+    }
+    /// Stop the renderer after an explicit user quit (`Ctrl+C`, `Ctrl+D`, `/exit`,
+    /// `/quit`), clearing any registered `OSC 7577` resume command.
+    pub async fn stop_user_exit(self) -> Result<()> {
+        self.stop_with(true).await
+    }
+    async fn stop_with(mut self, clear_resume: bool) -> Result<()> {
+        let _ = self.sender.send(Update::Stop { clear_resume });
         let Some(thread) = self.thread.take() else {
             return Ok(());
         };
@@ -338,7 +363,9 @@ impl TuiGuard {
 }
 impl Drop for TuiGuard {
     fn drop(&mut self) {
-        let _ = self.sender.send(Update::Stop);
+        let _ = self.sender.send(Update::Stop {
+            clear_resume: false,
+        });
         if let Some(thread) = self.thread.take() {
             let _ = join(thread);
         }
@@ -356,13 +383,29 @@ impl Tui {
         title: String,
         cwd: String,
     ) -> Result<(TuiHandle, UnboundedReceiver<TuiInput>, TuiGuard)> {
-        Self::start(TuiInfo {
-            title,
-            model: None,
-            cwd,
-        })
+        Self::connecting_with_resume(title, cwd, None)
+    }
+    pub fn connecting_with_resume(
+        title: String,
+        cwd: String,
+        resume: Option<TuiResume>,
+    ) -> Result<(TuiHandle, UnboundedReceiver<TuiInput>, TuiGuard)> {
+        Self::start_with_resume(
+            TuiInfo {
+                title,
+                model: None,
+                cwd,
+            },
+            resume,
+        )
     }
     pub fn start(info: TuiInfo) -> Result<(TuiHandle, UnboundedReceiver<TuiInput>, TuiGuard)> {
+        Self::start_with_resume(info, None)
+    }
+    pub fn start_with_resume(
+        info: TuiInfo,
+        resume: Option<TuiResume>,
+    ) -> Result<(TuiHandle, UnboundedReceiver<TuiInput>, TuiGuard)> {
         ensure!(
             std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
             "The interactive interface requires a terminal"
@@ -373,7 +416,7 @@ impl Tui {
         let thread = thread::Builder::new()
             .name("agent-tui".into())
             .spawn(move || {
-                let mut screen = match Screen::open() {
+                let mut screen = match Screen::open(resume) {
                     Ok(screen) => screen,
                     Err(error) => {
                         let _ = ready.send(Err(error));
@@ -779,6 +822,8 @@ struct State {
     auth_pending: bool,
     goal_status: Option<crate::protocol::GoalStatus>,
     waiting_on: Option<(program_status::BlockedKind, String)>,
+    main_conversation_id: String,
+    observed_conversation_id: Option<String>,
     history_offset: Option<usize>,
     history_entry: Option<HistoryEntry>,
     loading_history: Option<HistoryLoad>,
@@ -839,6 +884,8 @@ impl State {
             auth_pending: false,
             goal_status: None,
             waiting_on: None,
+            main_conversation_id: "1".into(),
+            observed_conversation_id: None,
             history_offset: Some(0),
             history_entry: None,
             loading_history: None,
@@ -1499,6 +1546,8 @@ impl State {
             RuntimeEventKind::ConversationSettings { settings } => self.info.model = Some(settings.model),
             RuntimeEventKind::MainReady { conversation_id, model, cwd, .. } => {
                 self.output.banner.ready();
+                self.main_conversation_id = conversation_id.clone();
+                self.observed_conversation_id = Some(conversation_id.clone());
                 self.work.set_current_conversation(conversation_id);
                 self.info.model = Some(model);
                 self.set_cwd(cwd);
@@ -1719,6 +1768,7 @@ impl State {
         working: bool,
     ) {
         self.reset_observed_activity();
+        self.observed_conversation_id = Some(conversation_id.clone());
         self.work.set_current_conversation(conversation_id);
         self.info = TuiInfo {
             title,
@@ -1730,12 +1780,33 @@ impl State {
         self.output.banner.ready();
         self.working(working);
     }
+    fn set_main_conversation_id(&mut self, id: String) {
+        if self.main_conversation_id != id {
+            self.main_conversation_id = id;
+            if self.observed_conversation_id.is_some() {
+                self.changed = true;
+            }
+        }
+    }
+    pub(super) fn program_resume_target(&self) -> Option<program_resume::ResumeTarget> {
+        let current = self.observed_conversation_id.as_deref()?;
+        Some(if current == self.main_conversation_id {
+            program_resume::ResumeTarget::Main
+        } else {
+            program_resume::ResumeTarget::Conversation(current.to_owned())
+        })
+    }
     fn reset_conversation(&mut self, info: TuiInfo) {
         // The task graph watch is coordinator-wide and emits only on change,
         // so switching conversations must keep the last work snapshot and stream state intact.
+        // Keep the current resume identity until the replacement conversation is ready.
         let snapshot = self.work.take_snapshot();
         let stream = self.work.stream();
+        let main_conversation_id = std::mem::take(&mut self.main_conversation_id);
+        let observed_conversation_id = self.observed_conversation_id.take();
         *self = Self::new(info);
+        self.main_conversation_id = main_conversation_id;
+        self.observed_conversation_id = observed_conversation_id;
         if let Some(graph) = snapshot {
             self.work.set_graph(graph);
         }
@@ -3082,7 +3153,7 @@ fn run(
     let mut reads_keys = true;
     loop {
         if inputs.is_closed() {
-            return screen.finish(&mut state);
+            return screen.finish(&mut state, false);
         }
         // A retained-history burst can fill the update queue. Bound each
         // batch by frame time so its first page and input remain responsive.
@@ -3090,8 +3161,11 @@ fn run(
         let mut updates_pending = true;
         for _ in 0..256 {
             match updates.try_recv() {
-                Ok(Update::Stop) | Err(mpsc::TryRecvError::Disconnected) => {
-                    return screen.finish(&mut state);
+                Ok(Update::Stop { clear_resume }) => {
+                    return screen.finish(&mut state, clear_resume);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return screen.finish(&mut state, false);
                 }
                 Err(mpsc::TryRecvError::Empty) => {
                     updates_pending = false;
@@ -3121,7 +3195,7 @@ fn run(
                     // The final frame asks the terminal where its cursor is.
                     // crossterm keeps each key it reads meanwhile for a later
                     // read, so the keys are read after the frame.
-                    let finished = screen.finish(&mut state);
+                    let finished = screen.finish(&mut state, false);
                     send_arrived_keys(&mut state, &inputs)?;
                     let _ = sender.send(state.composer_draft());
                     return finished;
@@ -3175,6 +3249,12 @@ fn run(
                 Ok(Update::WorkStream(stream)) => {
                     state.work.set_stream(stream);
                     state.changed = true;
+                }
+                Ok(Update::MainConversationId(id)) => {
+                    state.set_main_conversation_id(id);
+                }
+                Ok(Update::RefreshProgramResume) => {
+                    screen.refresh_program_resume()?;
                 }
             }
             if updates_started.elapsed() >= Duration::from_millis(8) {
@@ -5842,7 +5922,7 @@ mod tests {
         guard.stop().await.unwrap();
         assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
         let scoped_failure = || -> anyhow::Result<()> {
-            let _screen = crate::tui::Screen::open()?;
+            let _screen = crate::tui::Screen::open(None)?;
             anyhow::bail!("synthetic error after terminal setup");
         };
         assert!(scoped_failure().is_err());

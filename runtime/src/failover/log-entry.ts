@@ -37,8 +37,10 @@ export type BatchOutcome = { readonly kind: "stored"; readonly seq: Seq } | { re
  */
 export async function commitBatch(storage: Storage, writes: readonly StorageWrite[], context: Context): Promise<BatchOutcome> {
   let stored: Seq | undefined;
-  const { refused } = await storage.commit([writes], (_index, seq) => { stored = seq; }, context);
-  return stored === undefined ? { kind: "refused", reason: refused } : { kind: "stored", seq: stored };
+  const result = await storage.commit([writes], (_index, seq) => { stored = seq; }, context);
+  if (result.kind === "refused") return { kind: "refused", reason: result.refused };
+  if (stored === undefined) throw new Error("Pi Durable reported a stored batch without assigning a sequence");
+  return { kind: "stored", seq: stored };
 }
 
 /** Commits the batch of the log entry at `at`, which Pi must store. */
@@ -56,12 +58,15 @@ type PiVersions = Pick<Versions, "pi_durable" | "chord">;
 /**
  * Older Pi Durable and Chord releases whose log entries a release replays.
  * Their batches commit through the reader's Pi to the rows their own Pi wrote,
- * as failover-replay-1.4.0.test.ts checks against logs that 1.4.0 and 1.5.2 wrote.
+ * as failover-replay-1.4.0.test.ts checks against logs that 1.4.0, 1.5.2, and 1.6.0 wrote.
  */
 const REPLAYED_WRITERS: readonly { readonly reader: PiVersions; readonly writer: PiVersions }[] = [
   { reader: { pi_durable: "1.5.2", chord: "1.5.2" }, writer: { pi_durable: "1.4.0", chord: "1.4.0" } },
   { reader: { pi_durable: "1.6.0", chord: "1.6.0" }, writer: { pi_durable: "1.4.0", chord: "1.4.0" } },
   { reader: { pi_durable: "1.6.0", chord: "1.6.0" }, writer: { pi_durable: "1.5.2", chord: "1.5.2" } },
+  { reader: { pi_durable: "1.7.0", chord: "1.7.0" }, writer: { pi_durable: "1.4.0", chord: "1.4.0" } },
+  { reader: { pi_durable: "1.7.0", chord: "1.7.0" }, writer: { pi_durable: "1.5.2", chord: "1.5.2" } },
+  { reader: { pi_durable: "1.7.0", chord: "1.7.0" }, writer: { pi_durable: "1.6.0", chord: "1.6.0" } },
 ];
 
 const samePi = (left: PiVersions, right: PiVersions) => left.pi_durable === right.pi_durable && left.chord === right.chord;

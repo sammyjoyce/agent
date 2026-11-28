@@ -15,7 +15,7 @@ retrieval), [setup](setup.md) (services, trust, scheduled jobs and Dreams), and
 
 Built on [Pi Durable](https://github.com/earendil-works/pi/tree/main/packages/durable)
 and [Pi telemetry](https://github.com/earendil-works/pi/tree/main/packages/telemetry)
-1.6.0; upstream interfaces remain experimental and are verified at each pinned
+1.7.0; upstream interfaces remain experimental and are verified at each pinned
 upgrade.
 
 - **Coordinator, durability and recovery.** One Rust supervisor and narrow
@@ -330,6 +330,16 @@ restore is not shipped yet.
   to `idle`, and clean detach to `clear`, with hierarchical child `id=...`
   records for child agents and delegates across Rex's Activity Mode, tab
   indicators, Dock badge, `Go to Anything` and future mobile notifications.
+- [x] **Program Resume Protocol (`OSC 7577`) in the TUI.** Strip
+  `OSC7577_TOKEN` from the process environment before starting worker threads or
+  child processes (with defense-in-depth scrubbing in `src/host.rs` and
+  `runtime/src/bridge.ts`). Interactive chat TUI (`src/tui/program_resume.rs`)
+  reports `beep-boop chat [--conversation <id>]` commands with explicit scope
+  flags repeated as typed (matching Rex's `resume.trust.*.flags` verifier) and
+  the local launch `cwd`, updates atomically across `/resume`, `/sidechat` and
+  `/main`, refreshes on `SIGCONT`, clears on explicit user quit (`Ctrl+C`,
+  `Ctrl+D`, `/exit`, `/quit`), preserves the record on `SIGTERM`/`SIGHUP`/terminal
+  loss, and keeps coordinator-allocated `run-task` worker panes out of `OSC 7577`.
 - [x] **Full Disk Access preflight (`server.apple.privacy_status`).** Query
   `server.apple.privacy_status` over the local Unix socket (no TCC prompt) in
   `beep-boop rex install` (`src/rex/install.rs`) and Messages source diagnostics

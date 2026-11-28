@@ -225,9 +225,10 @@ for (const [name, connect] of Object.entries(authorities)) {
     const reused = (await logBatches(link)).flat().find((write) => write.type === "entry");
     assert.ok(reused);
     const head = owner.log.head, before = tables(directory);
-    const { stored, refused } = await commitGroup(owner.storage, [[reused]]);
-    assert.equal(stored, 0);
-    assert.match(String(refused), /already belongs to entry/);
+    const group = await commitGroup(owner.storage, [[reused]]);
+    assert.equal(group.kind, "refused");
+    assert.equal(group.stored, 0);
+    assert.match(String(group.refused), /already belongs to entry/);
     assert.equal((await link.record())?.state.head, head);
     assert.equal(owner.log.head, head);
     assert.deepEqual(tables(directory), before);
@@ -242,9 +243,10 @@ for (const [name, connect] of Object.entries(authorities)) {
     assert.ok(reused?.type === "entry");
     const fresh: StorageWrite = { type: "entry", value: { ...reused.value, id: await owner.storage.mintId() } };
     const head = owner.log.head, before = tables(directory);
-    const { stored, refused } = await commitGroup(owner.storage, [Object.assign([fresh], { toJSON: () => [reused] })]);
-    assert.equal(stored, 0);
-    assert.match(String(refused), /already belongs to entry/);
+    const group = await commitGroup(owner.storage, [Object.assign([fresh], { toJSON: () => [reused] })]);
+    assert.equal(group.kind, "refused");
+    assert.equal(group.stored, 0);
+    assert.match(String(group.refused), /already belongs to entry/);
     assert.equal((await link.record())?.state.head, head, "the log did not move");
     assert.equal(owner.log.head, head);
     assert.deepEqual(tables(directory), before);
@@ -286,8 +288,8 @@ for (const [name, connect] of Object.entries(authorities)) {
     const fresh = async (data: string): Promise<StorageWrite[]> => [{ type: "entry", value: { ...template.value, id: await owner.storage.mintId(), data } }];
     const head = owner.log.head;
     const group = await commitGroup(owner.storage, [await fresh("group 1"), await fresh("group 2"), await fresh("group 3")]);
+    assert.equal(group.kind, "stored");
     assert.equal(group.stored, 3);
-    assert.equal(group.refused, undefined);
     const [firstSeq] = group.seqs;
     assert.ok(firstSeq !== undefined);
     assert.deepEqual(group.seqs, [firstSeq, firstSeq + 1, firstSeq + 2]);
@@ -308,6 +310,7 @@ for (const [name, connect] of Object.entries(authorities)) {
     const fresh = async (data: string): Promise<StorageWrite[]> => [{ type: "entry", value: { ...reused.value, id: await owner.storage.mintId(), data } }];
     const head = owner.log.head;
     const group = await commitGroup(owner.storage, [await fresh("before the refusal"), [reused], await fresh("after the refusal")]);
+    assert.equal(group.kind, "refused");
     assert.equal(group.stored, 1);
     assert.equal(group.seqs.length, 1);
     assert.match(String(group.refused), /already belongs to entry/);

@@ -27,8 +27,8 @@ export function noticeContextModel(origin: EntryRecord | undefined, text: readon
     : [{ ...message, content: text.map((part) => ({ type: "text" as const, text: part })) }]) ?? [];
 }
 
-function admitIn(tx: Tx, target: Pick<Conversation, "submit">, requestId: string, model: NonNullable<EntryRecord["model"]>) {
-  return target.submit(tx, { type: "write", requestId, entry: { kind: "agent.notice_context", model } });
+function admitIn(tx: Tx, target: Pick<Conversation, "admit">, requestId: string, model: NonNullable<EntryRecord["model"]>) {
+  return target.admit(tx, { type: "write", requestId, entry: { kind: "agent.notice_context", model } });
 }
 
 export const NoticeContextPlacement = defineTask<null, Checkpoint, null>({

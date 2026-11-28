@@ -58,6 +58,10 @@ import { StartupDiagnostics } from "./startup-diagnostics.js";
 import { openConversationDatabase } from "./conversation-database.js";
 import { effectGate, exitFenced, openReplicatedOwnership, type Ownership } from "./failover/ownership.js";
 
+// Defense-in-depth: never let the runtime or any child it spawns (MCP servers,
+// browser scripts, codemode workers) inherit a terminal's OSC 7577 token.
+delete process.env.OSC7577_TOKEN;
+
 function notificationConfig(): ApnsConfig | undefined {
   const saved = process.env.AGENT_APNS_CONFIG;
   if (saved === undefined) return undefined;

@@ -13,6 +13,12 @@ use std::{
     sync::{Mutex, PoisonError},
 };
 
+/// Environment variable through which a terminal passes its per-pane Program Resume
+/// (`OSC 7577`) secret. Defined at the process-spawn boundary so both `host` (which
+/// scrubs it from child commands) and `tui` (which consumes it once at startup) share
+/// one definition without coupling execution to presentation.
+pub const PROGRAM_RESUME_TOKEN_ENV: &str = "OSC7577_TOKEN";
+
 static CHILD_START: Mutex<()> = Mutex::new(());
 
 fn start_alone<T>(start: impl FnOnce() -> io::Result<T>) -> io::Result<T> {

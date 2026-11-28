@@ -475,11 +475,17 @@ async fn read_file_sends_host_images_natively_and_keeps_text_reads() {
     .unwrap();
     let requests = files.join("queue.json.requests");
     let environment = format!(
-        "process.env.OPENAI_API_KEY='sk-synthetic-fixture';\nprocess.env.AGENT_TEST_MODEL_QUEUE={};\n",
+        "process.env.OPENAI_API_KEY='sk-synthetic-fixture';\n\
+         process.env.CLOUDFLARE_API_KEY='cf-synthetic-fixture';\n\
+         process.env.CLOUDFLARE_ACCOUNT_ID='synthetic-account';\n\
+         process.env.CLOUDFLARE_GATEWAY_ID='synthetic-gateway';\n\
+         process.env.AGENT_TEST_MODEL_QUEUE={};\n",
         serde_json::to_string(&queue).unwrap()
     );
+    // OpenAI retired direct o3-mini in Pi AI 1.7.0; Cloudflare AI Gateway still
+    // exposes a text-only openai-responses o3-mini entry for the blind-model path.
     let text_only = ModelSelection {
-        provider: ModelProvider::OpenAi,
+        provider: ModelProvider::CloudflareAiGateway,
         model_id: "o3-mini".into(),
         reasoning: None,
         fast: false,

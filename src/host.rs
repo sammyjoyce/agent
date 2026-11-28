@@ -1007,6 +1007,9 @@ pub(crate) async fn run_process_ending(
     if let Some(environment) = environment {
         command.env_clear().envs(environment.iter().cloned());
     }
+    // Never pass a terminal's OSC 7577 Program Resume secret to hosted tools or
+    // child commands, even when an explicit environment map was supplied.
+    command.env_remove(crate::serialized_spawn::PROGRAM_RESUME_TOKEN_ENV);
     // Actor identity belongs to this effect, never to the long-lived host's
     // inherited environment or an earlier task.
     if let Some(sender) = sender_conversation_id {
@@ -2442,6 +2445,35 @@ setInterval(() => {}, 1000);
         };
         assert_eq!(exit_code, 124);
         assert!(stderr.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn run_process_strips_osc7577_token_even_from_explicit_environment() {
+        let environment = vec![
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            (
+                crate::serialized_spawn::PROGRAM_RESUME_TOKEN_ENV.into(),
+                "secret-resume-token".into(),
+            ),
+            ("OTHER_KEEP".into(), "kept".into()),
+        ];
+        let output = run_process(ProcessRequest {
+            program: "/bin/sh",
+            args: &[
+                "-c".into(),
+                "printf 'token=<%s> other=<%s>' \"${OSC7577_TOKEN:-}\" \"${OTHER_KEEP:-}\"".into(),
+            ],
+            cwd: std::path::Path::new("/"),
+            deadline: Duration::from_secs(5),
+            output_limit: 4096,
+            sender_conversation_id: None,
+            environment: Some(&environment),
+            stdin: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, "token=<> other=<kept>");
     }
 }
 

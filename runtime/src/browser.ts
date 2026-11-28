@@ -156,7 +156,7 @@ export function createBrowserTools(browsers: BrowserStore, executions: Execution
       const execution = executions.get(owner);
       const result = await browsers.perform(owner, { type: "release" }, operation, execution.call);
       if (result.response?.type === "closed" && result.response.tabs.length === 0) return undefined;
-      return { continue: "Browser cleanup could not be fully verified. Inspect browser_status if the connection is still live, preserve uncertain tabs, and report any retained tabs or unresolved cleanup in the answer. Do not repeat an uncertain external action." };
+      return { kind: "continue", continue: "Browser cleanup could not be fully verified. Inspect browser_status if the connection is still live, preserve uncertain tabs, and report any retained tabs or unresolved cleanup in the answer. Do not repeat an uncertain external action." };
     },
   })], tools: [
     defineTool({ name: "browser_user_tabs", description: "List existing user web tabs in configured native Chrome before opening a fresh tab when a signed-in session may already exist. This does not navigate, focus or claim a tab. Defaults to the actor's execution host; name a connected host explicitly for another machine. A live connection remains on its original host.",

@@ -153,7 +153,9 @@ class OwnerLog implements LogWriter {
         this.#head = at;
       }
       for (const [index, seq] of stored.entries()) receive(index, seq);
-      return refused === undefined ? { stored: stored.length } : { stored: stored.length, refused: refused.reason };
+      return refused === undefined
+        ? { kind: "stored", stored: stored.length }
+        : { kind: "refused", stored: stored.length, refused: refused.reason };
     });
 
   #serialized<T>(step: () => Promise<T>): Promise<T> {

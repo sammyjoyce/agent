@@ -36,12 +36,17 @@ if (apnsOrigin !== undefined) {
   syncBuiltinESMExports();
 }
 
+const SYNTHETIC_RESPONSES_URLS = new Set([
+  "https://api.openai.com/v1/responses",
+  "https://gateway.ai.cloudflare.com/v1/synthetic-account/synthetic-gateway/openai/responses",
+]);
+
 // Only the external provider is synthetic. Pi, application tools and the bridge
 // are imported unchanged and consume actual Responses API event frames.
 globalThis.fetch = async (input, options) => {
   const url = input instanceof Request ? input.url : input.toString();
   if (authority !== undefined && new URL(url).origin === authority.origin) return network(input, options);
-  assert.equal(url, "https://api.openai.com/v1/responses", "The fixture must never contact an external service");
+  assert.ok(SYNTHETIC_RESPONSES_URLS.has(url), `The fixture must never contact an external service: ${url}`);
   assert.equal(typeof options?.body, "string");
   const body: unknown = JSON.parse(String(options?.body));
   assert.ok(object(body) && Array.isArray(body.input));

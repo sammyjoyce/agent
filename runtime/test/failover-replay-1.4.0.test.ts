@@ -21,7 +21,7 @@ async function writtenBy140(link: TestAuthority): Promise<LogEntry[]> {
 }
 
 for (const [name, connect] of Object.entries(authorities)) {
-  test(`${name}: a log that Pi Durable 1.4.0 wrote replays on 1.6.0 to the tables its owner wrote, and an owner continues it`, async (t) => {
+  test(`${name}: a log that Pi Durable 1.4.0 wrote replays on 1.7.0 to the tables its owner wrote, and an owner continues it`, async (t) => {
     const link = await connect(), epoch = await enroll(link);
     const written = await writtenBy140(link);
     assert.ok(written.every((entry) => entry.versions.pi_durable === "1.4.0" && entry.versions.chord === "1.4.0"));
@@ -43,10 +43,10 @@ for (const [name, connect] of Object.entries(authorities)) {
     await harness.close(context);
 
     const continued = (await logEntries(link)).slice(written.length);
-    assert.ok(continued.length > 0 && continued.every((entry) => entry.versions.pi_durable === "1.6.0"), "the owner continued the log on Pi Durable 1.6.0");
+    assert.ok(continued.length > 0 && continued.every((entry) => entry.versions.pi_durable === "1.7.0"), "the owner continued the log on Pi Durable 1.7.0");
     const head = (await link.record())?.state.head;
     assert.equal(await follow(upgraded, link), head);
-    assert.deepEqual(tables(upgraded), tables(directory), "a standby that replayed the 1.4.0 entries follows the 1.6.0 ones");
+    assert.deepEqual(tables(upgraded), tables(directory), "a standby that replayed the 1.4.0 entries follows the 1.7.0 ones");
     const joined = await stateDirectory(t);
     assert.equal(await follow(joined, link), head);
     assert.deepEqual(tables(joined), tables(directory), "a standby replays the whole mixed log");
@@ -55,7 +55,7 @@ for (const [name, connect] of Object.entries(authorities)) {
       "promotion finds the Pi sequence of the last logged batch");
   });
 
-  test(`${name}: a mixed 1.4.0 and 1.5.2 log replays on 1.6.0 and continues on 1.6.0`, async (t) => {
+  test(`${name}: a mixed 1.4.0, 1.5.2, and 1.6.0 log replays on 1.7.0 and continues on 1.7.0`, async (t) => {
     const seed = await connect(), seedEpoch = await enroll(seed);
     const written = await writtenBy140(seed);
     const seedDirectory = await stateDirectory(t);
@@ -63,17 +63,22 @@ for (const [name, connect] of Object.entries(authorities)) {
     const seedPi = await openPi(seeded.storage);
     seedPi.faux.setResponses(Array.from({ length: 3 }, () => fauxAssistantMessage("Invented: prune the vines at dusk.")));
     await (await seedPi.root.submit({ type: "input", content: "Prune the vines.", requestId: "request-prune" }, context)).wait(context);
+    const afterPrune = (await logEntries(seed)).length;
+    seedPi.faux.setResponses(Array.from({ length: 3 }, () => fauxAssistantMessage("Invented: stake the peas at noon.")));
+    await (await seedPi.root.submit({ type: "input", content: "Stake the peas.", requestId: "request-stake" }, context)).wait(context);
     await seedPi.harness.close(context);
     const seedEntries = await logEntries(seed);
-    const middle152 = seedEntries.slice(written.length).map(({ digest: _, ...rest }) => {
-      const entry = { ...rest, versions: { application: "0.1.0", pi_durable: "1.5.2", chord: "1.5.2" } };
+    const restamp = (entries: readonly LogEntry[], version: string) => entries.map(({ digest: _, ...rest }) => {
+      const entry = { ...rest, versions: { application: "0.1.0", pi_durable: version, chord: version } };
       return { ...entry, digest: logEntryDigest(entry) };
     });
-    assert.ok(middle152.length > 0);
+    const middle152 = restamp(seedEntries.slice(written.length, afterPrune), "1.5.2");
+    const middle160 = restamp(seedEntries.slice(afterPrune), "1.6.0");
+    assert.ok(middle152.length > 0 && middle160.length > 0);
 
     const link = await connect(), epoch = await enroll(link);
     await writtenBy140(link);
-    for (const entry of middle152) {
+    for (const entry of [...middle152, ...middle160]) {
       for (const file of entry.files) await link.putBlob(file.sha256, await seed.getBlob(file.sha256));
       if (entry.batch?.body.kind === "blob") await link.putBlob(entry.batch.body.sha256, await seed.getBlob(entry.batch.body.sha256));
       assert.equal((await link.command({ op: "append", holder: OWNER, entry })).result, "accepted");
@@ -81,24 +86,24 @@ for (const [name, connect] of Object.entries(authorities)) {
 
     const upgraded = await stateDirectory(t);
     assert.equal(await follow(upgraded, link), seedEntries.length);
-    assert.deepEqual(tables(upgraded), tables(seedDirectory), "a 1.6.0 standby replays both 1.4.0 and 1.5.2 entries");
+    assert.deepEqual(tables(upgraded), tables(seedDirectory), "a 1.7.0 standby replays 1.4.0, 1.5.2, and 1.6.0 entries");
 
     const directory = await stateDirectory(t);
     const { storage, log } = await openReplicatedStorage({ database: await openScoped(directory), link, holder: OWNER, epoch, stateDirectory: directory, onFenced: () => {} });
-    assert.equal(log.head, seedEntries.length, "the 1.6.0 owner caught up with 1.4.0 and 1.5.2 entries before Pi opened");
+    assert.equal(log.head, seedEntries.length, "the 1.7.0 owner caught up with 1.4.0, 1.5.2, and 1.6.0 entries before Pi opened");
     const { harness, root, faux } = await openPi(storage);
     faux.setResponses(Array.from({ length: 3 }, () => fauxAssistantMessage("Invented: mulch the beds before frost.")));
     await (await root.submit({ type: "input", content: "Mulch the beds.", requestId: "request-mulch" }, context)).wait(context);
     await harness.close(context);
 
     const continued = (await logEntries(link)).slice(seedEntries.length);
-    assert.ok(continued.length > 0 && continued.every((entry) => entry.versions.pi_durable === "1.6.0"), "the owner continued the log on Pi Durable 1.6.0");
+    assert.ok(continued.length > 0 && continued.every((entry) => entry.versions.pi_durable === "1.7.0"), "the owner continued the log on Pi Durable 1.7.0");
     const head = (await link.record())?.state.head;
     assert.equal(await follow(upgraded, link), head);
     assert.deepEqual(tables(upgraded), tables(directory));
     const joined = await stateDirectory(t);
     assert.equal(await follow(joined, link), head);
-    assert.deepEqual(tables(joined), tables(directory), "a standby replays the whole 1.4.0, 1.5.2, and 1.6.0 log");
+    assert.deepEqual(tables(joined), tables(directory), "a standby replays the whole 1.4.0, 1.5.2, 1.6.0, and 1.7.0 log");
     assert.equal(appliedPosition(joined), head);
   });
 }
