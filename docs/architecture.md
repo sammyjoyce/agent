@@ -725,6 +725,11 @@ path, Git worktree registry and branch independently. Primary clones, dirty or
 active work, unknown ownership, helper refusal and partial deletion stay held
 or partial. Retained submodule archives remain in the receipt.
 
+A worktree removed outside the collector settles as removed with an
+`already_absent` receipt only when its repository still reads as the recorded
+one and Git keeps no checkout, registration, metadata or branch for it. An
+unreadable repository or any surviving piece keeps the record held.
+
 Future cache and artifact collection needs explicit retention classes and size
 budgets. Conversation history, deliverables and recovery evidence remain
 separate from disposable execution caches.

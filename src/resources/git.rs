@@ -696,6 +696,72 @@ async fn absence(identity: &NativeWorktreeIdentity) -> Result<(bool, bool, bool)
     Ok((path_absent, !registered, branch.exit_code == 1))
 }
 
+/// Settles a ready or held worktree that was removed outside the collector.
+/// Removal counts as verified only when its repository is still readable as the
+/// recorded one and Git keeps no checkout, registration, metadata or branch for
+/// it. Anything else, including an unreadable repository, stays held.
+async fn reconcile_absent(mut record: ResourceRecord, error: anyhow::Error) -> ResourceReport {
+    let identity = match &record.state {
+        ResourceState::Ready { identity }
+        | ResourceState::Held {
+            identity: Some(identity),
+            ..
+        } => identity.clone(),
+        _ => return held(record, error.to_string()),
+    };
+    if !record.consumers.is_empty() {
+        return held(record, error.to_string());
+    }
+    match fs::symlink_metadata(&identity.top) {
+        Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return held(record, error.to_string()),
+    }
+    if let Err(unverified) = removed_elsewhere(&identity).await {
+        return held(
+            record,
+            format!("{error}; the checkout is absent, but its removal is unverified: {unverified}"),
+        );
+    }
+    let receipt = CleanupReceipt {
+        status: "already_absent".into(),
+        worktree_removed: false,
+        branch_deleted: None,
+        primary_worktree: Some(identity.primary.clone()),
+        retained_submodules: None,
+        summary: "The checkout, its Git registration and metadata, and its branch were already absent; the collector removed nothing and did not check whether that work was merged".into(),
+    };
+    record.state = ResourceState::Removed { identity };
+    ResourceReport::Collected {
+        record: Box::new(record),
+        receipt: Some(receipt),
+    }
+}
+
+async fn removed_elsewhere(identity: &NativeWorktreeIdentity) -> Result<()> {
+    let root = primary(Path::new(&identity.primary)).await?;
+    let common = fs::canonicalize(
+        value(
+            &root,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .await?,
+    )?;
+    ensure!(
+        path_text(&root)? == identity.primary && path_text(&common)? == identity.common_dir,
+        "The recorded repository no longer matches this worktree"
+    );
+    let (path_absent, registry_absent, branch_absent) = absence(identity).await?;
+    ensure!(path_absent, "The worktree path reappeared");
+    ensure!(registry_absent, "Git still registers this worktree");
+    match fs::symlink_metadata(&identity.git_dir) {
+        Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => anyhow::bail!("Git metadata for this worktree still exists"),
+        Err(other) => return Err(other.into()),
+    }
+    ensure!(branch_absent, "Branch {} still exists", identity.branch);
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl ResourceBackend for GitBackend {
     async fn allocate(&self, request: WorktreeAllocation) -> ResourceReport {
@@ -723,7 +789,7 @@ impl ResourceBackend for GitBackend {
                     record: Box::new(record),
                 }
             }
-            Err(error) => held(record, error.to_string()),
+            Err(error) => reconcile_absent(record, error).await,
         }
     }
 
@@ -979,6 +1045,91 @@ mod tests {
         );
         assert!(Path::new(&identity.top).exists());
         assert!(fixture.repository.exists());
+    }
+
+    fn collected(report: ResourceReport) -> (ResourceRecord, CleanupReceipt) {
+        match report {
+            ResourceReport::Collected {
+                record,
+                receipt: Some(receipt),
+            } => (*record, receipt),
+            other => panic!("Expected a settled resource, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_worktree_removed_outside_the_collector_settles_only_when_verified() {
+        let fixture = Fixture::new();
+        let resource = fixture.allocate().await;
+        let identity = resource.state.identity().unwrap().clone();
+        let primary = &fixture.repository;
+        // The checkout is gone but its branch remains: the allocation is unsettled.
+        command(primary, &["worktree", "remove", &identity.top]);
+        let reason = held_reason(GitBackend::default().inspect(resource.clone()).await);
+        assert!(
+            reason.contains("removal is unverified")
+                && reason.contains(&format!("Branch {} still exists", identity.branch)),
+            "{reason}"
+        );
+        command(primary, &["branch", "-D", &resource.branch]);
+        // A repository that cannot be read is not evidence of removal.
+        let moved = fixture.root.join("moved-checkout");
+        fs::rename(primary, &moved).unwrap();
+        let unavailable = record(GitBackend::default().inspect(resource.clone()).await);
+        assert!(
+            matches!(&unavailable.state, ResourceState::Held { reason, .. } if reason.contains("removal is unverified")),
+            "{unavailable:?}"
+        );
+        fs::rename(&moved, primary).unwrap();
+        // A held row keeps its identity and settles once removal is verified.
+        let ResourceReport::Observed { record: held_row } = held(resource, "Inspection timed out")
+        else {
+            unreachable!()
+        };
+        let (settled, receipt) = collected(GitBackend::default().inspect(*held_row).await);
+        assert!(
+            matches!(&settled.state, ResourceState::Removed { identity: kept } if *kept == identity),
+            "{settled:?}"
+        );
+        assert_eq!(receipt.status, "already_absent");
+        assert!(!receipt.worktree_removed && receipt.branch_deleted.is_none());
+        assert!(primary.join("README.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn an_absent_worktree_with_consumers_or_cleanup_history_is_not_settled() {
+        let fixture = Fixture::new();
+        let resource = fixture.allocate().await;
+        let identity = resource.state.identity().unwrap().clone();
+        command(&fixture.repository, &["worktree", "remove", &identity.top]);
+        command(&fixture.repository, &["branch", "-D", &resource.branch]);
+        let mut consumed = resource.clone();
+        consumed.consumers.push(TaskId::new());
+        held_reason(GitBackend::default().inspect(consumed).await);
+        let mut partial = resource;
+        partial.state = ResourceState::Partial {
+            identity,
+            path_absent: true,
+            registry_absent: true,
+            branch_absent: false,
+            reason: "Earlier cleanup was partial".into(),
+        };
+        let observed = record(GitBackend::default().inspect(partial).await);
+        assert!(
+            matches!(observed.state, ResourceState::Partial { .. }),
+            "{observed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deleted_checkout_that_git_still_registers_stays_held() {
+        let fixture = Fixture::new();
+        let resource = fixture.allocate().await;
+        let identity = resource.state.identity().unwrap().clone();
+        fs::remove_dir_all(&identity.top).unwrap();
+        let reason = held_reason(GitBackend::default().inspect(resource).await);
+        assert!(reason.contains("Git still registers"), "{reason}");
+        assert!(Path::new(&identity.git_dir).join(OWNER_FILE).is_file());
     }
 
     struct Consumer(Child);

@@ -11,7 +11,8 @@ import type { HostCommand } from "./generated/HostCommand.js";
 import { TaskError, TaskStore, type HostCall } from "./tasks.js";
 import { Executions } from "./tools.js";
 
-type OwnedResource = { record: ResourceRecord; plan: CleanupPlan | null; receipt: CleanupReceipt | null };
+// Receipts a later settlement replaced, oldest first, so cleanup history stays auditable.
+type OwnedResource = { record: ResourceRecord; plan: CleanupPlan | null; receipt: CleanupReceipt | null; superseded?: CleanupReceipt[] };
 const Resources = defineDoc<{ resources: OwnedResource[] }>({
   kind: "agent.resources", scope: "session", version: 1,
   initial: () => ({ resources: [] }), checkpointWhen: () => true,
@@ -96,8 +97,21 @@ export class ResourceStore {
             report.record.state.plan_id !== report.plan.id) throw new TaskError("The cleanup plan does not own this resource");
         item.plan = report.plan;
       }
+      if (report.type === "collected" && before.state.state !== "retiring") {
+        // Without a retiring plan, only inspection's verified absence may settle a record. It must be idle and keep its identity.
+        const recorded = before.state.state === "ready" || before.state.state === "held" ? before.state.identity : null;
+        const settled = report.record.state.state === "removed" ? report.record.state.identity : null;
+        if (recorded === null || settled === null || report.receipt?.status !== "already_absent" ||
+            JSON.stringify(recorded) !== JSON.stringify(settled) || before.consumers.length > 0 ||
+            !await this.tasks.canReleaseIn(tx, before.task_id)) {
+          throw new TaskError("The resource changed or acquired a consumer while its absence was verified");
+        }
+      }
       item.record = { ...report.record, consumers: before.consumers };
-      if (report.type === "collected") item.receipt = report.receipt;
+      if (report.type === "collected") {
+        if (item.receipt !== null) item.superseded = [...(item.superseded ?? []), item.receipt];
+        item.receipt = report.receipt;
+      }
     }, BACKGROUND_CONTEXT);
   }
   async collect(hostId: string, call: HostCall, signal?: AbortSignal): Promise<ResourceRecord[]> {

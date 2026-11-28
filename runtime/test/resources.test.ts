@@ -137,6 +137,70 @@ test("waiting tasks, unsettled child consumers and other hosts hold resources; r
   } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("a worktree the host verifies as already absent settles from inspection with its receipt and no cleanup plan", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-resource-absent-")); let app = await open(directory);
+  try {
+    const task = await app.tasks.create({ title: "Review", outcome: "Verify the change" });
+    const request: WorktreeAllocation = { host_id: hostId, task_id: task.id, allocation_id: randomUUID(), repository: identity.primary, branch: "review" };
+    await app.resources.allocate(request, async () => ({ type: "resource", report: { type: "observed", record: ready(request) } }));
+    await app.tasks.update(task.id, (saved) => { saved.state = { state: "resolved", evidence: "Verified" }; });
+    const calls: string[] = [];
+    await app.resources.collect(hostId, async (command) => {
+      calls.push(command.type);
+      if (command.type !== "resource_inspect") throw new Error("An absent worktree needs no cleanup plan or removal");
+      const state = command.record.state.state === "ready" ? command.record.state : undefined;
+      if (state === undefined) throw new Error("Expected the recorded identity");
+      return { type: "resource", report: { type: "collected", record: { ...command.record, state: { state: "removed", identity: state.identity } },
+        receipt: { status: "already_absent", worktree_removed: false, branch_deleted: null, primary_worktree: identity.primary,
+          retained_submodules: null, summary: "Already absent; the collector removed nothing" } } };
+    });
+    assert.deepEqual(calls, ["resource_inspect"]);
+    await app.session.close(BACKGROUND_CONTEXT); app = await open(directory);
+    const saved = (await app.resources.list())[0];
+    assert.equal(saved?.state.state, "removed");
+    assert.equal(saved?.task_id, task.id, "the settled row keeps its owner for audit");
+    await app.resources.collect(hostId, async () => { throw new Error("A settled resource stays settled"); });
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("new work while absence is verified keeps the record unsettled", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-resource-absent-race-")); const app = await open(directory);
+  try {
+    const task = await app.tasks.create({ title: "Review", outcome: "Verify the change" });
+    const request: WorktreeAllocation = { host_id: hostId, task_id: task.id, allocation_id: randomUUID(), repository: identity.primary, branch: "review" };
+    await app.resources.allocate(request, async () => ({ type: "resource", report: { type: "observed", record: ready(request) } }));
+    await app.tasks.update(task.id, (saved) => { saved.state = { state: "resolved", evidence: "Verified" }; });
+    await assert.rejects(app.resources.collect(hostId, async (command) => {
+      if (command.type !== "resource_inspect" || command.record.state.state !== "ready") throw new Error("Expected inspection of the ready record");
+      await app.tasks.enqueue(task.id, "Inspect the new follow-up");
+      return { type: "resource", report: { type: "collected", record: { ...command.record, state: { state: "removed", identity: command.record.state.identity } },
+        receipt: { status: "already_absent", worktree_removed: false, branch_deleted: null, primary_worktree: identity.primary,
+          retained_submodules: null, summary: "Already absent" } } };
+    }), /acquired a consumer/);
+    assert.equal((await app.resources.list())[0]?.state.state, "ready");
+    assert.deepEqual((await app.resources.list())[0]?.consumers, [task.id]);
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("inspection cannot claim a removal it did not verify or swap the recorded identity", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "agent-resource-absent-claim-")); const app = await open(directory);
+  try {
+    const task = await app.tasks.create({ title: "Review", outcome: "Verify the change" });
+    const request: WorktreeAllocation = { host_id: hostId, task_id: task.id, allocation_id: randomUUID(), repository: identity.primary, branch: "review" };
+    await app.resources.allocate(request, async () => ({ type: "resource", report: { type: "observed", record: ready(request) } }));
+    await app.tasks.update(task.id, (saved) => { saved.state = { state: "resolved", evidence: "Verified" }; });
+    const receipt = { worktree_removed: true, branch_deleted: "review", primary_worktree: identity.primary, retained_submodules: null, summary: "Claimed" };
+    for (const claim of [{ status: "completed", identity }, { status: "already_absent", identity: { ...identity, top: "/workspace/elsewhere" } }]) {
+      await assert.rejects(app.resources.collect(hostId, async (command) => {
+        if (command.type !== "resource_inspect") throw new Error("Expected inspection");
+        return { type: "resource", report: { type: "collected", record: { ...command.record, state: { state: "removed", identity: claim.identity } },
+          receipt: { ...receipt, status: claim.status } } };
+      }), /absence was verified/);
+      assert.equal((await app.resources.list())[0]?.state.state, "ready");
+    }
+  } finally { await app.session.close(BACKGROUND_CONTEXT); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("new work during cleanup planning retains the consumer and prevents native collection", async () => {
   const directory = await mkdtemp(join(tmpdir(), "agent-resource-")); const app = await open(directory);
   try {
